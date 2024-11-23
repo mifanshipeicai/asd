@@ -1,1 +1,121 @@
-dfgg 
+防止 SQL 注入是一项关键的安全任务。以下是一种实现方法：使用 正则表达式 和 关键字过滤 检查传入的 SQL 语句是否包含潜在的危险模式。如果检测到可疑内容，直接拒绝请求。
+
+安全 SQL 检查类
+
+package com.example.security;
+
+import org.springframework.stereotype.Component;
+
+@Component
+public class SqlInjectionValidator {
+
+    // 常见的危险 SQL 关键字和模式
+    private static final String[] DANGEROUS_KEYWORDS = {
+        "DROP", "DELETE", "INSERT", "UPDATE", "EXEC", "UNION", "ALTER", "--", ";", 
+        "/*", "*/", "OR", "AND", "1=1", "xp_cmdshell", "sp_", "information_schema", "sysobjects"
+    };
+
+    // 使用正则表达式检测非法字符
+    private static final String SQL_REGEX = ".*(['\";#]+|--|/\\*|\\*/).*";
+
+    /**
+     * 验证 SQL 是否安全
+     *
+     * @param sql 待验证的 SQL
+     * @return true 如果 SQL 安全；false 如果 SQL 包含危险内容
+     */
+    public boolean isSqlSafe(String sql) {
+        if (sql == null || sql.isEmpty()) {
+            return false;
+        }
+
+        // 转为大写以便统一检查
+        String upperSql = sql.toUpperCase();
+
+        // 检查是否包含危险关键字
+        for (String keyword : DANGEROUS_KEYWORDS) {
+            if (upperSql.contains(keyword)) {
+                return false;
+            }
+        }
+
+        // 检查是否匹配危险正则
+        return !upperSql.matches(SQL_REGEX);
+    }
+}
+
+Controller 中的集成
+
+在你的 API 控制器中集成 SqlInjectionValidator，在执行前验证传入的 SQL 参数。
+
+package com.example.controller;
+
+import com.example.security.SqlInjectionValidator;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/sql")
+public class SqlController {
+
+    @Autowired
+    private SqlInjectionValidator sqlInjectionValidator;
+
+    @PostMapping("/execute")
+    public ResponseEntity<String> executeSql(@RequestBody String sql) {
+        // 检查 SQL 是否安全
+        if (!sqlInjectionValidator.isSqlSafe(sql)) {
+            return ResponseEntity.badRequest().body("SQL injection detected! Request rejected.");
+        }
+
+        // 安全的 SQL 执行逻辑
+        // 示例返回
+        return ResponseEntity.ok("SQL is safe and has been processed: " + sql);
+    }
+}
+
+单元测试
+
+为 SqlInjectionValidator 编写单元测试，验证它是否能够有效检测危险 SQL。
+
+package com.example.security;
+
+import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class SqlInjectionValidatorTest {
+
+    private final SqlInjectionValidator validator = new SqlInjectionValidator();
+
+    @Test
+    void testSafeSql() {
+        assertTrue(validator.isSqlSafe("SELECT * FROM users WHERE id = 1"));
+        assertTrue(validator.isSqlSafe("SELECT name FROM products"));
+    }
+
+    @Test
+    void testDangerousSql() {
+        assertFalse(validator.isSqlSafe("DROP TABLE users"));
+        assertFalse(validator.isSqlSafe("SELECT * FROM users WHERE id = 1; DROP TABLE users;"));
+        assertFalse(validator.isSqlSafe("UNION SELECT * FROM admin"));
+        assertFalse(validator.isSqlSafe("-- malicious comment"));
+        assertFalse(validator.isSqlSafe("1=1; SELECT * FROM users"));
+    }
+
+    @Test
+    void testNullAndEmptySql() {
+        assertFalse(validator.isSqlSafe(null));
+        assertFalse(validator.isSqlSafe(""));
+    }
+}
+
+改进建议
+
+	1.	限制用户输入的范围：不直接接收 SQL 语句，而是接收参数化查询或预定义的操作类型。
+	2.	使用参数化查询：结合数据库工具（如 JDBC 或 JPA），确保所有用户输入通过绑定参数。
+	3.	日志记录：在检测到 SQL 注入时记录请求详情以便追踪。
+	4.	更全面的正则和关键字过滤：如果你的业务逻辑复杂，可以定制更严格的规则。
+
+这样实现后，你的 API 就可以有效拦截大部分潜在的 SQL 注入攻击，同时对正常请求保持友好。
