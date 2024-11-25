@@ -1,121 +1,153 @@
-防止 SQL 注入是一项关键的安全任务。以下是一种实现方法：使用 正则表达式 和 关键字过滤 检查传入的 SQL 语句是否包含潜在的危险模式。如果检测到可疑内容，直接拒绝请求。
+在 Java 的 Spark 程序中，可以通过 JDBC 将 Dataset 写入到 ClickHouse。以下是实现的步骤和示例代码：
 
-安全 SQL 检查类
+1. 添加依赖
 
-package com.example.security;
+在你的 Maven 项目中添加 ClickHouse JDBC 驱动和 Spark 的相关依赖。
 
-import org.springframework.stereotype.Component;
+Maven 依赖
 
-@Component
-public class SqlInjectionValidator {
+<dependencies>
+    <!-- Spark Core -->
+    <dependency>
+        <groupId>org.apache.spark</groupId>
+        <artifactId>spark-core_2.12</artifactId>
+        <version>3.4.0</version>
+    </dependency>
+    <dependency>
+        <groupId>org.apache.spark</groupId>
+        <artifactId>spark-sql_2.12</artifactId>
+        <version>3.4.0</version>
+    </dependency>
+    
+    <!-- ClickHouse JDBC -->
+    <dependency>
+        <groupId>com.clickhouse</groupId>
+        <artifactId>clickhouse-jdbc</artifactId>
+        <version>0.4.6</version>
+    </dependency>
+</dependencies>
 
-    // 常见的危险 SQL 关键字和模式
-    private static final String[] DANGEROUS_KEYWORDS = {
-        "DROP", "DELETE", "INSERT", "UPDATE", "EXEC", "UNION", "ALTER", "--", ";", 
-        "/*", "*/", "OR", "AND", "1=1", "xp_cmdshell", "sp_", "information_schema", "sysobjects"
-    };
+2. 编写代码
 
-    // 使用正则表达式检测非法字符
-    private static final String SQL_REGEX = ".*(['\";#]+|--|/\\*|\\*/).*";
+示例代码
 
-    /**
-     * 验证 SQL 是否安全
-     *
-     * @param sql 待验证的 SQL
-     * @return true 如果 SQL 安全；false 如果 SQL 包含危险内容
-     */
-    public boolean isSqlSafe(String sql) {
-        if (sql == null || sql.isEmpty()) {
-            return false;
-        }
+import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Row;
+import org.apache.spark.sql.SparkSession;
+import java.util.Properties;
 
-        // 转为大写以便统一检查
-        String upperSql = sql.toUpperCase();
+public class SparkToClickHouse {
+    public static void main(String[] args) {
+        // 1. 初始化 SparkSession
+        SparkSession spark = SparkSession.builder()
+                .appName("Write to ClickHouse")
+                .master("local[*]") // 本地运行模式
+                .getOrCreate();
 
-        // 检查是否包含危险关键字
-        for (String keyword : DANGEROUS_KEYWORDS) {
-            if (upperSql.contains(keyword)) {
-                return false;
-            }
-        }
+        // 2. 创建示例数据
+        Dataset<Row> dataset = spark.read().json("path/to/input.json"); // 替换为你的数据源
 
-        // 检查是否匹配危险正则
-        return !upperSql.matches(SQL_REGEX);
+        // 打印数据（可选）
+        dataset.show();
+
+        // 3. 定义 ClickHouse 的连接配置
+        String clickhouseUrl = "jdbc:clickhouse://<host>:<port>/<database>";
+        Properties connectionProperties = new Properties();
+        connectionProperties.put("user", "default");
+        connectionProperties.put("password", ""); // 默认密码为空
+        connectionProperties.put("driver", "com.clickhouse.jdbc.ClickHouseDriver");
+
+        // 4. 写入到 ClickHouse
+        String targetTable = "<your_table_name>"; // 目标表名
+        dataset.write()
+                .mode("append") // 写入模式：append, overwrite, etc.
+                .jdbc(clickhouseUrl, targetTable, connectionProperties);
+
+        // 5. 停止 SparkSession
+        spark.stop();
     }
 }
 
-Controller 中的集成
+3. 配置说明
 
-在你的 API 控制器中集成 SqlInjectionValidator，在执行前验证传入的 SQL 参数。
+3.1 数据源
 
-package com.example.controller;
+	•	将 path/to/input.json 替换为实际的数据源路径，例如 JSON 文件、CSV 文件，或者已经加载的 Dataset。
 
-import com.example.security.SqlInjectionValidator;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
+3.2 ClickHouse 连接
 
-@RestController
-@RequestMapping("/api/sql")
-public class SqlController {
+	•	jdbc:clickhouse://<host>:<port>/<database>：
+	•	<host>：ClickHouse 的主机名或 IP。
+	•	<port>：ClickHouse 的端口，默认是 8123。
+	•	<database>：ClickHouse 中的目标数据库。
+	•	user 和 password：替换为 ClickHouse 的用户名和密码。
 
-    @Autowired
-    private SqlInjectionValidator sqlInjectionValidator;
+3.3 写入模式
 
-    @PostMapping("/execute")
-    public ResponseEntity<String> executeSql(@RequestBody String sql) {
-        // 检查 SQL 是否安全
-        if (!sqlInjectionValidator.isSqlSafe(sql)) {
-            return ResponseEntity.badRequest().body("SQL injection detected! Request rejected.");
-        }
+	•	.mode("append")：追加数据到表中。
+	•	.mode("overwrite")：覆盖目标表中的数据。
+	•	.mode("ignore")：如果目标表已存在，忽略当前操作。
 
-        // 安全的 SQL 执行逻辑
-        // 示例返回
-        return ResponseEntity.ok("SQL is safe and has been processed: " + sql);
-    }
-}
+3.4 ClickHouse 表结构
 
-单元测试
+确保目标表的结构与 Dataset 的 schema 匹配，例如字段名和数据类型一致。
 
-为 SqlInjectionValidator 编写单元测试，验证它是否能够有效检测危险 SQL。
+4. 注意事项
 
-package com.example.security;
+4.1 性能优化
 
-import org.junit.jupiter.api.Test;
+ClickHouse 是为批量写入优化的数据库，建议：
+	•	将数据分区写入以提高性能。
+	•	调整 Spark 的分区数：
 
-import static org.junit.jupiter.api.Assertions.*;
+dataset.repartition(10); // 例如分成 10 个分区
 
-class SqlInjectionValidatorTest {
 
-    private final SqlInjectionValidator validator = new SqlInjectionValidator();
 
-    @Test
-    void testSafeSql() {
-        assertTrue(validator.isSqlSafe("SELECT * FROM users WHERE id = 1"));
-        assertTrue(validator.isSqlSafe("SELECT name FROM products"));
-    }
+4.2 类型匹配
 
-    @Test
-    void testDangerousSql() {
-        assertFalse(validator.isSqlSafe("DROP TABLE users"));
-        assertFalse(validator.isSqlSafe("SELECT * FROM users WHERE id = 1; DROP TABLE users;"));
-        assertFalse(validator.isSqlSafe("UNION SELECT * FROM admin"));
-        assertFalse(validator.isSqlSafe("-- malicious comment"));
-        assertFalse(validator.isSqlSafe("1=1; SELECT * FROM users"));
-    }
+Spark 和 ClickHouse 的数据类型需要匹配，常见类型映射：
 
-    @Test
-    void testNullAndEmptySql() {
-        assertFalse(validator.isSqlSafe(null));
-        assertFalse(validator.isSqlSafe(""));
-    }
-}
+Spark 数据类型	ClickHouse 数据类型
+String	String
+Integer	Int32
+Long	Int64
+Double	Float64
+Timestamp	DateTime
 
-改进建议
+如果有不匹配，可以使用 Spark 的 withColumn 方法转换列类型。
 
-	1.	限制用户输入的范围：不直接接收 SQL 语句，而是接收参数化查询或预定义的操作类型。
-	2.	使用参数化查询：结合数据库工具（如 JDBC 或 JPA），确保所有用户输入通过绑定参数。
-	3.	日志记录：在检测到 SQL 注入时记录请求详情以便追踪。
-	4.	更全面的正则和关键字过滤：如果你的业务逻辑复杂，可以定制更严格的规则。
+4.3 错误处理
 
-这样实现后，你的 API 就可以有效拦截大部分潜在的 SQL 注入攻击，同时对正常请求保持友好。
+	•	如果出现 Connection refused：
+	•	检查 ClickHouse 是否启动，端口是否正确。
+	•	如果表不存在：
+	•	在 ClickHouse 中手动创建表，或者通过 Spark SQL 创建表。
+
+5. 测试示例
+
+假设我们有以下 JSON 数据文件 data.json：
+
+[
+  {"id": 1, "name": "Alice", "age": 30},
+  {"id": 2, "name": "Bob", "age": 25}
+]
+
+在 ClickHouse 中创建表：
+
+CREATE TABLE my_table (
+    id Int32,
+    name String,
+    age Int32
+) ENGINE = MergeTree()
+ORDER BY id;
+
+运行上述程序后，数据将被写入 ClickHouse 的 my_table 中。
+
+6. 总结
+
+	•	使用 dataset.write().jdbc() 可以轻松将 Spark 数据写入 ClickHouse。
+	•	优化写入性能时，需调整 Spark 的分区数和写入模式。
+	•	确保数据的 schema 和 ClickHouse 表结构匹配，避免类型不一致导致的错误。
+
+如果遇到问题，可以提供日志信息，进一步排查。
