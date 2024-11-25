@@ -1,153 +1,127 @@
-在 Java 的 Spark 程序中，可以通过 JDBC 将 Dataset 写入到 ClickHouse。以下是实现的步骤和示例代码：
+从错误信息来看，问题的根本原因是 Spark JDBC 无法将 Map<String, Float> 类型映射到 JDBC 支持的类型。Spark 默认支持的 JDBC 类型中没有 Map 类型的直接对应类型，因此在保存到数据库时会抛出 SparkIllegalArgumentException。
 
-1. 添加依赖
+以下是解决此问题的几种方法：
 
-在你的 Maven 项目中添加 ClickHouse JDBC 驱动和 Spark 的相关依赖。
+1. 转换 Map 列为 JSON 格式
 
-Maven 依赖
+Map 类型无法直接存储到数据库，但可以将其转换为 JSON 字符串，然后存储为 String 类型。示例如下：
 
-<dependencies>
-    <!-- Spark Core -->
-    <dependency>
-        <groupId>org.apache.spark</groupId>
-        <artifactId>spark-core_2.12</artifactId>
-        <version>3.4.0</version>
-    </dependency>
-    <dependency>
-        <groupId>org.apache.spark</groupId>
-        <artifactId>spark-sql_2.12</artifactId>
-        <version>3.4.0</version>
-    </dependency>
-    
-    <!-- ClickHouse JDBC -->
-    <dependency>
-        <groupId>com.clickhouse</groupId>
-        <artifactId>clickhouse-jdbc</artifactId>
-        <version>0.4.6</version>
-    </dependency>
-</dependencies>
-
-2. 编写代码
-
-示例代码
+代码实现
 
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
-import java.util.Properties;
+import org.apache.spark.sql.functions;
 
 public class SparkToClickHouse {
     public static void main(String[] args) {
-        // 1. 初始化 SparkSession
         SparkSession spark = SparkSession.builder()
-                .appName("Write to ClickHouse")
-                .master("local[*]") // 本地运行模式
+                .appName("Write to ClickHouse with Map")
+                .master("local[*]")
                 .getOrCreate();
 
-        // 2. 创建示例数据
-        Dataset<Row> dataset = spark.read().json("path/to/input.json"); // 替换为你的数据源
+        // 假设数据已经加载到 Dataset 中
+        Dataset<Row> dataset = spark.read().json("path/to/input.json");
 
-        // 打印数据（可选）
-        dataset.show();
+        // 将 Map 列转换为 JSON 字符串列
+        Dataset<Row> transformedDataset = dataset.withColumn(
+                "map_as_json",
+                functions.to_json(dataset.col("map_column")) // 替换 map_column 为实际列名
+        );
 
-        // 3. 定义 ClickHouse 的连接配置
+        // 移除原始的 Map 列，或者重命名 JSON 列
+        transformedDataset = transformedDataset.drop("map_column");
+
+        // 写入到 ClickHouse
         String clickhouseUrl = "jdbc:clickhouse://<host>:<port>/<database>";
-        Properties connectionProperties = new Properties();
-        connectionProperties.put("user", "default");
-        connectionProperties.put("password", ""); // 默认密码为空
-        connectionProperties.put("driver", "com.clickhouse.jdbc.ClickHouseDriver");
+        String targetTable = "<your_table_name>";
 
-        // 4. 写入到 ClickHouse
-        String targetTable = "<your_table_name>"; // 目标表名
-        dataset.write()
-                .mode("append") // 写入模式：append, overwrite, etc.
-                .jdbc(clickhouseUrl, targetTable, connectionProperties);
+        transformedDataset.write()
+                .mode("append")
+                .jdbc(clickhouseUrl, targetTable, getJdbcProperties());
+    }
 
-        // 5. 停止 SparkSession
-        spark.stop();
+    private static java.util.Properties getJdbcProperties() {
+        java.util.Properties properties = new java.util.Properties();
+        properties.put("user", "default");
+        properties.put("password", "");
+        properties.put("driver", "com.clickhouse.jdbc.ClickHouseDriver");
+        return properties;
     }
 }
 
-3. 配置说明
+2. 修改 ClickHouse 表的字段类型
 
-3.1 数据源
+在 ClickHouse 表中将目标字段定义为 String 类型（例如存储 JSON）或其他可以接受的格式。示例：
 
-	•	将 path/to/input.json 替换为实际的数据源路径，例如 JSON 文件、CSV 文件，或者已经加载的 Dataset。
-
-3.2 ClickHouse 连接
-
-	•	jdbc:clickhouse://<host>:<port>/<database>：
-	•	<host>：ClickHouse 的主机名或 IP。
-	•	<port>：ClickHouse 的端口，默认是 8123。
-	•	<database>：ClickHouse 中的目标数据库。
-	•	user 和 password：替换为 ClickHouse 的用户名和密码。
-
-3.3 写入模式
-
-	•	.mode("append")：追加数据到表中。
-	•	.mode("overwrite")：覆盖目标表中的数据。
-	•	.mode("ignore")：如果目标表已存在，忽略当前操作。
-
-3.4 ClickHouse 表结构
-
-确保目标表的结构与 Dataset 的 schema 匹配，例如字段名和数据类型一致。
-
-4. 注意事项
-
-4.1 性能优化
-
-ClickHouse 是为批量写入优化的数据库，建议：
-	•	将数据分区写入以提高性能。
-	•	调整 Spark 的分区数：
-
-dataset.repartition(10); // 例如分成 10 个分区
-
-
-
-4.2 类型匹配
-
-Spark 和 ClickHouse 的数据类型需要匹配，常见类型映射：
-
-Spark 数据类型	ClickHouse 数据类型
-String	String
-Integer	Int32
-Long	Int64
-Double	Float64
-Timestamp	DateTime
-
-如果有不匹配，可以使用 Spark 的 withColumn 方法转换列类型。
-
-4.3 错误处理
-
-	•	如果出现 Connection refused：
-	•	检查 ClickHouse 是否启动，端口是否正确。
-	•	如果表不存在：
-	•	在 ClickHouse 中手动创建表，或者通过 Spark SQL 创建表。
-
-5. 测试示例
-
-假设我们有以下 JSON 数据文件 data.json：
-
-[
-  {"id": 1, "name": "Alice", "age": 30},
-  {"id": 2, "name": "Bob", "age": 25}
-]
-
-在 ClickHouse 中创建表：
+ClickHouse 表结构
 
 CREATE TABLE my_table (
     id Int32,
-    name String,
-    age Int32
+    map_column String -- 用于存储 JSON 格式的 Map 数据
 ) ENGINE = MergeTree()
 ORDER BY id;
 
-运行上述程序后，数据将被写入 ClickHouse 的 my_table 中。
+解释
 
-6. 总结
+	•	将 Map<String, Float> 转换为 JSON 字符串后，存储为 String 类型。
+	•	在查询时，ClickHouse 提供函数如 JSONExtract 来解析 JSON 数据：
 
-	•	使用 dataset.write().jdbc() 可以轻松将 Spark 数据写入 ClickHouse。
-	•	优化写入性能时，需调整 Spark 的分区数和写入模式。
-	•	确保数据的 schema 和 ClickHouse 表结构匹配，避免类型不一致导致的错误。
+SELECT JSONExtract(map_column, 'key', 'Float32') FROM my_table;
 
-如果遇到问题，可以提供日志信息，进一步排查。
+3. 转换为结构化列
+
+如果 Map 数据是固定的（即键的集合已知且数量有限），可以将其拆分成多个单独的列。
+
+代码实现
+
+import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Row;
+import org.apache.spark.sql.SparkSession;
+import static org.apache.spark.sql.functions.col;
+
+public class SparkToClickHouse {
+    public static void main(String[] args) {
+        SparkSession spark = SparkSession.builder()
+                .appName("Write to ClickHouse with Map to Columns")
+                .master("local[*]")
+                .getOrCreate();
+
+        // 假设数据已经加载到 Dataset 中
+        Dataset<Row> dataset = spark.read().json("path/to/input.json");
+
+        // 将 Map 转换为单独的列
+        Dataset<Row> transformedDataset = dataset
+                .withColumn("key1", col("map_column.key1"))
+                .withColumn("key2", col("map_column.key2"))
+                .drop("map_column"); // 删除原始 Map 列
+
+        // 写入到 ClickHouse
+        String clickhouseUrl = "jdbc:clickhouse://<host>:<port>/<database>";
+        String targetTable = "<your_table_name>";
+
+        transformedDataset.write()
+                .mode("append")
+                .jdbc(clickhouseUrl, targetTable, getJdbcProperties());
+    }
+
+    private static java.util.Properties getJdbcProperties() {
+        java.util.Properties properties = new java.util.Properties();
+        properties.put("user", "default");
+        properties.put("password", "");
+        properties.put("driver", "com.clickhouse.jdbc.ClickHouseDriver");
+        return properties;
+    }
+}
+
+4. 配置自定义数据类型支持
+
+如果使用 Map 是必需的（例如动态键值对），可以通过实现 Spark 自定义数据类型映射来支持。但这需要深入了解 Spark 和 JDBC 的类型转换机制，一般来说复杂度较高且不推荐。
+
+总结
+
+	•	推荐方法 1： 将 Map 转换为 JSON 字符串（通用且简单）。
+	•	推荐方法 2： 如果 Map 的键是固定的，可以拆分为单独的列。
+	•	注意： 数据库的表结构需与转换后的数据结构匹配。
+
+如问题依然存在，可提供具体的 Map 数据和目标表结构，我可以进一步协助解决。
