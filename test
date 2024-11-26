@@ -1,181 +1,41 @@
-如果不改变表结构，且需要解决 Can't get JDBC type for map<string, float> 的问题，可以通过将 Map<String, Float> 列转换为一种支持的类型，比如 String（JSON 格式） 或 Struct，来绕过 Spark JDBC 的类型映射限制。
-
-以下是具体解决方案：
-
-方案 1：将 Map 列转换为 JSON 格式（推荐）
-
-将 Map<String, Float> 转换为 JSON 字符串，然后写入到数据库的 String 类型字段中。
-
-代码示例
-
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
-import org.apache.spark.sql.functions;
+import org.apache.spark.sql.Encoders;
+import org.apache.spark.sql.types.DataTypes;
 
-public class MapToJson {
+import java.util.Arrays;
+
+public class CreateJsonFieldDataset {
     public static void main(String[] args) {
+        // 初始化 SparkSession
         SparkSession spark = SparkSession.builder()
-                .appName("Map to JSON")
+                .appName("Create JSON Field Dataset")
                 .master("local[*]")
                 .getOrCreate();
 
-        // 示例数据
-        Dataset<Row> dataset = spark.read().json("path/to/input.json");
+        // 准备 JSON 字符串数据
+        String json1 = "{\"name\": \"Alice\", \"age\": 25}";
+        String json2 = "{\"name\": \"Bob\", \"age\": 30}";
+        String json3 = "{\"name\": \"Charlie\", \"age\": 35}";
 
-        // 将 Map 列转换为 JSON 格式的字符串列
-        Dataset<Row> transformedDataset = dataset.withColumn(
-                "map_as_json",
-                functions.to_json(dataset.col("map_column")) // 替换 map_column 为实际的 Map 列名
+        // 创建 Dataset，初始字段名称默认为 "value"
+        Dataset<String> jsonDataset = spark.createDataset(
+                Arrays.asList(json1, json2, json3),
+                Encoders.STRING()
         );
 
-        // 删除原始 Map 列（如果需要）
-        transformedDataset = transformedDataset.drop("map_column");
+        // 重命名字段为 "column A"
+        Dataset<Row> renamedDataset = jsonDataset
+                .withColumnRenamed("value", "column A");
 
-        // 配置 JDBC 连接信息
-        String jdbcUrl = "jdbc:clickhouse://<host>:<port>/<database>";
-        String tableName = "<your_table_name>";
-        java.util.Properties connectionProperties = new java.util.Properties();
-        connectionProperties.put("user", "default");
-        connectionProperties.put("password", "");
-        connectionProperties.put("driver", "com.clickhouse.jdbc.ClickHouseDriver");
+        // 展示 Dataset
+        renamedDataset.show(false);
 
-        // 写入到数据库
-        transformedDataset.write()
-                .mode("append")
-                .jdbc(jdbcUrl, tableName, connectionProperties);
+        // 打印模式（Schema）
+        renamedDataset.printSchema();
 
+        // 停止 SparkSession
         spark.stop();
     }
 }
-
-优点
-
-	•	避免修改表结构。
-	•	使用 JSON 字符串便于后续解析。
-
-查询 ClickHouse
-
-写入后可以通过 ClickHouse 的 JSON 函数解析内容：
-
-SELECT JSONExtract(map_as_json, 'key', 'Float32') FROM your_table;
-
-方案 2：将 Map 列转换为多列（拆解 Map）
-
-如果 Map<String, Float> 的键是固定的，可以将 Map 展平（Flatten）为多个单独的列。这样，每个键对应一个字段。
-
-代码示例
-
-import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Row;
-import org.apache.spark.sql.SparkSession;
-import org.apache.spark.sql.functions;
-
-public class FlattenMap {
-    public static void main(String[] args) {
-        SparkSession spark = SparkSession.builder()
-                .appName("Flatten Map")
-                .master("local[*]")
-                .getOrCreate();
-
-        // 示例数据
-        Dataset<Row> dataset = spark.read().json("path/to/input.json");
-
-        // 将 Map 列拆分为多列
-        Dataset<Row> flattenedDataset = dataset
-                .withColumn("key1", functions.col("map_column.key1"))
-                .withColumn("key2", functions.col("map_column.key2"))
-                .drop("map_column"); // 删除原始 Map 列（可选）
-
-        // 配置 JDBC 连接信息
-        String jdbcUrl = "jdbc:clickhouse://<host>:<port>/<database>";
-        String tableName = "<your_table_name>";
-        java.util.Properties connectionProperties = new java.util.Properties();
-        connectionProperties.put("user", "default");
-        connectionProperties.put("password", "");
-        connectionProperties.put("driver", "com.clickhouse.jdbc.ClickHouseDriver");
-
-        // 写入到数据库
-        flattenedDataset.write()
-                .mode("append")
-                .jdbc(jdbcUrl, tableName, connectionProperties);
-
-        spark.stop();
-    }
-}
-
-优点
-
-	•	数据可以按键直接存储在单独的列中，便于查询。
-	•	性能较高，无需解析。
-
-局限
-
-	•	仅适用于 Map 的键是固定的情况。
-	•	如果键的数量较多，可能导致表的列数量大幅增加。
-
-方案 3：将 Map 转换为 Struct（结构体）
-
-Struct 类型可以直接映射到 JDBC 支持的嵌套结构。如果 Map<String, Float> 的键是固定的，可以将其转换为 StructType。
-
-代码示例
-
-import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Row;
-import org.apache.spark.sql.SparkSession;
-import org.apache.spark.sql.types.DataTypes;
-import org.apache.spark.sql.types.StructType;
-import org.apache.spark.sql.functions;
-
-public class MapToStruct {
-    public static void main(String[] args) {
-        SparkSession spark = SparkSession.builder()
-                .appName("Map to Struct")
-                .master("local[*]")
-                .getOrCreate();
-
-        // 示例数据
-        Dataset<Row> dataset = spark.read().json("path/to/input.json");
-
-        // 将 Map 转换为 StructType（手动映射键）
-        Dataset<Row> structDataset = dataset
-                .withColumn("map_as_struct", functions.struct(
-                        functions.col("map_column.key1").alias("key1"),
-                        functions.col("map_column.key2").alias("key2")
-                ))
-                .drop("map_column"); // 删除原始 Map 列（可选）
-
-        // 配置 JDBC 连接信息
-        String jdbcUrl = "jdbc:clickhouse://<host>:<port>/<database>";
-        String tableName = "<your_table_name>";
-        java.util.Properties connectionProperties = new java.util.Properties();
-        connectionProperties.put("user", "default");
-        connectionProperties.put("password", "");
-        connectionProperties.put("driver", "com.clickhouse.jdbc.ClickHouseDriver");
-
-        // 写入到数据库
-        structDataset.write()
-                .mode("append")
-                .jdbc(jdbcUrl, tableName, connectionProperties);
-
-        spark.stop();
-    }
-}
-
-优点
-
-	•	Struct 类型与 Map 的语义相近。
-	•	无需修改表结构。
-
-局限
-
-	•	键的集合需要在代码中显式定义。
-
-总结
-
-在不改变表结构的情况下：
-	1.	推荐方案 1（JSON 格式）： 将 Map 转换为 JSON 字符串，适合键动态变化的场景。
-	2.	方案 2（展平 Map）： 将 Map 转换为多列，适合键固定的场景，查询性能更优。
-	3.	方案 3（转换为 Struct）： 保持 Map 的语义，但需要显式定义键。
-
-根据实际需求选择合适的方案。如果 Map 的键数量和结构非常复杂，推荐使用 JSON 格式作为通用解决方法。
