@@ -1,154 +1,104 @@
-在 ClickHouse 表中，Map<String, Float> 类型是支持的，你可以使用 Spark 和 ClickHouse 原生 JDBC 驱动完成写入。以下是一个完整的 Java 示例，演示如何创建一个包含 Map<String, Float> 类型的 Dataset，并将其写入到 ClickHouse 表中。
+在使用 Ant Design 的 Table 组件时，你可以通过设置 dataSource 属性将从后端服务获取的数据填充到表格中。以下是具体步骤和代码示例：
 
-1. 前提条件
+1. 安装所需依赖
 
-ClickHouse 表定义
+确保你的项目已经安装了 Axios（或其他 HTTP 客户端）用于请求后端数据：
 
-假设 ClickHouse 表的结构如下：
+npm install axios
 
-CREATE TABLE your_table (
-    id UInt32,
-    map_column Map(String, Float)
-) ENGINE = MergeTree()
-ORDER BY id;
+2. 后端数据请求逻辑
 
-依赖
+在 React 组件中使用 useEffect 钩子来请求数据，并将其存储到组件的状态中。
 
-添加以下 Maven 依赖到你的 pom.xml：
+3. 代码示例
 
-<dependencies>
-    <!-- Spark Core -->
-    <dependency>
-        <groupId>org.apache.spark</groupId>
-        <artifactId>spark-core_2.12</artifactId>
-        <version>3.4.0</version> <!-- 替换为你的 Spark 版本 -->
-    </dependency>
-    <!-- Spark SQL -->
-    <dependency>
-        <groupId>org.apache.spark</groupId>
-        <artifactId>spark-sql_2.12</artifactId>
-        <version>3.4.0</version>
-    </dependency>
-    <!-- ClickHouse JDBC -->
-    <dependency>
-        <groupId>com.clickhouse</groupId>
-        <artifactId>clickhouse-jdbc</artifactId>
-        <version>0.4.6</version>
-    </dependency>
-</dependencies>
+import React, { useEffect, useState } from "react";
+import { Table } from "antd";
+import axios from "axios";
 
-2. Java Spark 示例代码
+const MyTable = () => {
+  // 定义状态存储表格数据和加载状态
+  const [data, setData] = useState([]);
+  const [loading, setLoading] = useState(false);
 
-完整代码
+  // 定义列配置
+  const columns = [
+    {
+      title: "Name",
+      dataIndex: "name",
+      key: "name",
+    },
+    {
+      title: "Age",
+      dataIndex: "age",
+      key: "age",
+    },
+    {
+      title: "Address",
+      dataIndex: "address",
+      key: "address",
+    },
+  ];
 
-import org.apache.spark.sql.*;
-import org.apache.spark.sql.types.*;
-import java.util.*;
+  // 获取后端数据
+  useEffect(() => {
+    const fetchData = async () => {
+      setLoading(true); // 开始加载
+      try {
+        const response = await axios.get("https://your-api-endpoint.com/data"); // 替换为你的后端 API 地址
+        setData(response.data); // 假设后端返回的数据是数组格式
+      } catch (error) {
+        console.error("Error fetching data:", error);
+      } finally {
+        setLoading(false); // 加载结束
+      }
+    };
 
-public class ClickHouseMapExample {
-    public static void main(String[] args) {
-        // 初始化 SparkSession
-        SparkSession spark = SparkSession.builder()
-                .appName("Write Map to ClickHouse")
-                .master("local[*]")
-                .getOrCreate();
+    fetchData();
+  }, []);
 
-        // 创建示例数据
-        List<Row> data = Arrays.asList(
-                RowFactory.create(1, new HashMap<String, Float>() {{
-                    put("key1", 1.1f);
-                    put("key2", 2.2f);
-                }}),
-                RowFactory.create(2, new HashMap<String, Float>() {{
-                    put("keyA", 3.3f);
-                    put("keyB", 4.4f);
-                }})
-        );
+  return (
+    <Table
+      columns={columns} // 列配置
+      dataSource={data} // 数据源
+      loading={loading} // 加载状态
+      rowKey="id" // 使用唯一字段作为行 key
+    />
+  );
+};
 
-        // 定义表结构
-        StructType schema = new StructType()
-                .add("id", DataTypes.IntegerType)
-                .add("map_column", DataTypes.createMapType(DataTypes.StringType, DataTypes.FloatType));
+export default MyTable;
 
-        // 创建 Dataset
-        Dataset<Row> dataset = spark.createDataFrame(data, schema);
+4. 关键点说明
 
-        // 显示数据
-        dataset.show(false);
-        dataset.printSchema();
+	1.	dataSource 数据格式：
+	•	dataSource 应该是一个数组，每一项代表一行数据。比如：
 
-        // 配置 ClickHouse JDBC 信息
-        String jdbcUrl = "jdbc:clickhouse://<host>:<port>/<database>";
-        String tableName = "your_table";
-        Properties connectionProperties = new Properties();
-        connectionProperties.put("user", "default");
-        connectionProperties.put("password", "");
-        connectionProperties.put("driver", "com.clickhouse.jdbc.ClickHouseDriver");
-
-        // 写入到 ClickHouse
-        dataset.write()
-                .format("jdbc")
-                .option("url", jdbcUrl)
-                .option("dbtable", tableName)
-                .options(connectionProperties)
-                .mode(SaveMode.Append)
-                .save();
-
-        spark.stop();
-    }
-}
-
-3. 代码解析
-
-	1.	示例数据的创建
-	•	使用 RowFactory.create() 创建一组包含 Map<String, Float> 的数据。
-	•	使用 HashMap 手动构造 Map<String, Float> 数据类型。
-	2.	表结构的定义
-	•	使用 StructType 和 createMapType 定义 Map<String, Float> 类型的列。
-	3.	写入 ClickHouse
-	•	使用 Spark 的 DataFrame.write().format("jdbc") 方法通过 JDBC 写入 ClickHouse。
-	•	配置 JDBC URL 和表名，同时传递用户认证信息。
-	4.	测试数据
-数据示例：
-
-+---+-------------------------+
-|id |map_column               |
-+---+-------------------------+
-|1  |{key1 -> 1.1, key2 -> 2.2}|
-|2  |{keyA -> 3.3, keyB -> 4.4}|
-+---+-------------------------+
-
-4. 注意事项
-
-	1.	JDBC 驱动问题
-	•	Spark 的默认 JDBC 写入可能无法直接支持复杂类型（如 Map）。使用 ClickHouse 原生 JDBC 驱动可以避免此问题。
-	2.	分区与批量写入
-	•	如果数据量较大，可以调整分区数以提高性能：
-
-dataset.repartition(10).write().jdbc(...);
+[
+  { "id": 1, "name": "John", "age": 32, "address": "New York" },
+  { "id": 2, "name": "Jane", "age": 28, "address": "London" }
+]
 
 
-	3.	ClickHouse 数据类型匹配
-	•	确保 ClickHouse 表的字段类型与 Spark 数据类型一致，特别是 Map<String, Float> 类型。
+	•	确保每条数据有唯一的 id 或其他字段作为 rowKey。
 
-5. 测试验证
+	2.	API 异步调用：
+	•	使用 axios 发送 HTTP 请求。如果后端返回分页数据，请参考 Ant Design 的 pagination 属性。
+	3.	分页和排序支持：
+如果后端支持分页、排序等操作，你可以使用 Table 的 onChange 回调并传递参数给后端：
 
-	1.	插入后的数据
-使用 ClickHouse 客户端查询：
+const handleTableChange = (pagination, filters, sorter) => {
+  console.log(pagination, filters, sorter); // 根据这些参数请求后端数据
+};
 
-SELECT * FROM your_table;
+<Table
+  columns={columns}
+  dataSource={data}
+  loading={loading}
+  rowKey="id"
+  onChange={handleTableChange} // 处理表格变化
+/>
 
-输出示例：
-
-┌─id─┬─map_column───────────────┐
-│  1 │ {'key1':1.1,'key2':2.2}  │
-│  2 │ {'keyA':3.3,'keyB':4.4}  │
-└────┴──────────────────────────┘
 
 
-	2.	数据查询
-ClickHouse 支持从 Map 字段提取数据：
-
-SELECT id, map_column['key1'] AS value1 FROM your_table;
-
-通过以上代码，你可以将包含 Map<String, Float> 数据类型的 Spark Dataset 写入到 ClickHouse 表中，确保数据一致性和高效性。
+这样就可以实现从后端服务获取数据并动态填充到 Ant Design 的表格中！
