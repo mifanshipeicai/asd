@@ -1,160 +1,160 @@
-是的，您可以不直接创建 Map 类型的 Dataset，而是使用其他方式将数据插入 ClickHouse 表中。以下是几种替代方法：
+要在 React 前端工程中设计一个健康检查的 Dashboard，通过表格显示指定接口的调用状态，可以参考以下步骤：
 
-方法 1：使用 JSON 格式插入数据
+功能需求
 
-ClickHouse 支持 Map 类型的 JSON 表示形式，因此可以将数据转换为 JSON 格式，然后插入到表中。
+	1.	表格列内容：
+	•	接口名称
+	•	调用状态（成功/失败）
+	•	最近调用时间
+	•	响应时间
+	•	错误信息（如果有）
+	2.	实现逻辑：
+	•	定期调用指定接口，检查状态。
+	•	根据接口返回结果更新表格状态。
+	3.	设计样式：
+	•	使用组件库（如 Ant Design 或 Material-UI）来快速构建表格。
+	•	状态列使用颜色标注（如绿色表示成功，红色表示失败）。
 
-示例代码
+实现步骤
 
-import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Row;
-import org.apache.spark.sql.SparkSession;
-import org.apache.spark.sql.types.DataTypes;
-import org.apache.spark.sql.types.StructType;
+1. 创建健康检查数据结构
 
-import java.util.Arrays;
-import java.util.List;
+定义一个接口列表，每个接口的健康状态存储在状态管理中：
 
-public class InsertJsonToClickHouse {
-    public static void main(String[] args) {
-        // 初始化 SparkSession
-        SparkSession spark = SparkSession.builder()
-                .appName("Insert JSON to ClickHouse")
-                .master("local[*]")
-                .getOrCreate();
+const initialApiStatus = [
+  { name: "User API", url: "/api/users", status: "unknown", lastChecked: null, responseTime: null, errorMessage: null },
+  { name: "Order API", url: "/api/orders", status: "unknown", lastChecked: null, responseTime: null, errorMessage: null },
+  { name: "Product API", url: "/api/products", status: "unknown", lastChecked: null, responseTime: null, errorMessage: null },
+];
 
-        // 创建示例数据
-        List<Row> data = Arrays.asList(
-                RowFactory.create(1, "{\"key1\": 1.1, \"key2\": 2.2}"),
-                RowFactory.create(2, "{\"keyA\": 3.3, \"keyB\": 4.4}")
-        );
+2. 定期调用接口
 
-        // 定义表结构
-        StructType schema = new StructType()
-                .add("id", DataTypes.IntegerType)
-                .add("map_column", DataTypes.StringType);
+使用 useEffect 和 setInterval 定期检查接口状态：
 
-        // 创建 Dataset
-        Dataset<Row> dataset = spark.createDataFrame(data, schema);
+import React, { useState, useEffect } from "react";
 
-        // 显示数据
-        dataset.show(false);
+function HealthCheckDashboard() {
+  const [apiStatus, setApiStatus] = useState(initialApiStatus);
 
-        // 写入到 ClickHouse
-        dataset.write()
-                .format("jdbc")
-                .option("url", "jdbc:clickhouse://<host>:<port>/<database>")
-                .option("dbtable", "your_table")
-                .option("user", "default")
-                .option("password", "")
-                .mode("append")
-                .save();
+  useEffect(() => {
+    const interval = setInterval(() => {
+      checkApis();
+    }, 60000); // 每分钟检查一次
+    return () => clearInterval(interval); // 清除定时器
+  }, []);
 
-        spark.stop();
-    }
+  const checkApis = async () => {
+    const updatedStatus = await Promise.all(
+      apiStatus.map(async (api) => {
+        const startTime = Date.now();
+        try {
+          const response = await fetch(api.url);
+          const responseTime = Date.now() - startTime;
+          return {
+            ...api,
+            status: response.ok ? "success" : "failed",
+            lastChecked: new Date().toLocaleString(),
+            responseTime: `${responseTime}ms`,
+            errorMessage: response.ok ? null : `Error: ${response.status}`,
+          };
+        } catch (error) {
+          return {
+            ...api,
+            status: "failed",
+            lastChecked: new Date().toLocaleString(),
+            responseTime: null,
+            errorMessage: error.message,
+          };
+        }
+      })
+    );
+    setApiStatus(updatedStatus);
+  };
+
+  return (
+    <div>
+      <h1>API Health Check Dashboard</h1>
+      <HealthCheckTable apiStatus={apiStatus} />
+    </div>
+  );
 }
 
-数据格式
+3. 表格组件
 
-在此代码中，map_column 被视为字符串并存储为 JSON 格式，ClickHouse 会自动解析 JSON 数据到 Map 类型。
+使用表格显示接口状态，可以通过 Ant Design 或手写表格：
 
-插入后的数据示例：
+使用 Ant Design 表格
 
-┌─id─┬─map_column───────────────┐
-│  1 │ {'key1':1.1,'key2':2.2}  │
-│  2 │ {'keyA':3.3,'keyB':4.4}  │
-└────┴──────────────────────────┘
+import { Table, Tag } from "antd";
 
-方法 2：使用 INSERT INTO 查询插入
+function HealthCheckTable({ apiStatus }) {
+  const columns = [
+    { title: "API Name", dataIndex: "name", key: "name" },
+    {
+      title: "Status",
+      dataIndex: "status",
+      key: "status",
+      render: (status) => (
+        <Tag color={status === "success" ? "green" : "red"}>
+          {status.toUpperCase()}
+        </Tag>
+      ),
+    },
+    { title: "Last Checked", dataIndex: "lastChecked", key: "lastChecked" },
+    { title: "Response Time", dataIndex: "responseTime", key: "responseTime" },
+    {
+      title: "Error Message",
+      dataIndex: "errorMessage",
+      key: "errorMessage",
+      render: (errorMessage) => errorMessage || "None",
+    },
+  ];
 
-可以直接通过 SparkSession 的 sql 方法执行 INSERT INTO SQL 语句，将数据插入到 ClickHouse 表中。
-
-示例代码
-
-import org.apache.spark.sql.SparkSession;
-
-public class InsertWithSQL {
-    public static void main(String[] args) {
-        SparkSession spark = SparkSession.builder()
-                .appName("Insert using SQL")
-                .master("local[*]")
-                .getOrCreate();
-
-        // 定义 SQL 插入语句
-        String insertSQL = "INSERT INTO your_table (id, map_column) VALUES " +
-                           "(1, {'key1': 1.1, 'key2': 2.2}), " +
-                           "(2, {'keyA': 3.3, 'keyB': 4.4})";
-
-        // 执行 SQL
-        spark.sql(insertSQL);
-
-        spark.stop();
-    }
+  return <Table dataSource={apiStatus} columns={columns} rowKey="name" />;
 }
 
-优点
+手写表格 (不使用组件库)
 
-	•	灵活性更高。
-	•	适合动态生成的 SQL。
-
-注意
-
-	•	需要确保 ClickHouse 的 JDBC 驱动支持 INSERT INTO。
-
-方法 3：通过 CSV 或 JSON 文件加载
-
-如果数据量较大，可以将数据写入到文件（CSV/JSON），然后通过 ClickHouse 的 HTTP 接口 或 clickhouse-client 加载。
-
-示例代码（保存为 JSON 文件）
-
-import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Row;
-import org.apache.spark.sql.SparkSession;
-
-public class SaveAsJsonFile {
-    public static void main(String[] args) {
-        SparkSession spark = SparkSession.builder()
-                .appName("Save as JSON")
-                .master("local[*]")
-                .getOrCreate();
-
-        // 创建示例数据
-        Dataset<Row> dataset = spark.sql("SELECT 1 AS id, '{\"key1\": 1.1, \"key2\": 2.2}' AS map_column");
-
-        // 保存为 JSON 文件
-        dataset.write()
-                .format("json")
-                .save("path/to/output.json");
-
-        spark.stop();
-    }
+function HealthCheckTable({ apiStatus }) {
+  return (
+    <table border="1" style={{ width: "100%", textAlign: "left" }}>
+      <thead>
+        <tr>
+          <th>API Name</th>
+          <th>Status</th>
+          <th>Last Checked</th>
+          <th>Response Time</th>
+          <th>Error Message</th>
+        </tr>
+      </thead>
+      <tbody>
+        {apiStatus.map((api) => (
+          <tr key={api.name}>
+            <td>{api.name}</td>
+            <td style={{ color: api.status === "success" ? "green" : "red" }}>
+              {api.status.toUpperCase()}
+            </td>
+            <td>{api.lastChecked || "Not Checked Yet"}</td>
+            <td>{api.responseTime || "N/A"}</td>
+            <td>{api.errorMessage || "None"}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
 }
 
-使用 ClickHouse 导入 JSON 文件
+4. 样式优化
 
-clickhouse-client --query="INSERT INTO your_table FORMAT JSONEachRow" < path/to/output.json
+结合 CSS 或 Ant Design 内置的样式，可以让表格更直观，状态用颜色和图标标示成功/失败。
 
-方法 4：使用 Apache Kafka 和 ClickHouse Sink
+运行结果
 
-如果你的数据是流式生成的，可以通过 Kafka 作为中间层，将数据写入到 ClickHouse 表中。
-	1.	将 Spark 的 Dataset 转换为 Kafka 消息：
+你将得到一个可以实时显示 API 健康状况的 Dashboard 表格，包括以下信息：
+	•	接口名称。
+	•	当前状态（成功/失败）。
+	•	最近检查时间。
+	•	响应时间。
+	•	错误信息（若有）。
 
-dataset.write()
-        .format("kafka")
-        .option("kafka.bootstrap.servers", "<kafka_host>:<port>")
-        .option("topic", "your_topic")
-        .save();
-
-
-	2.	配置 Kafka Connect：
-	•	使用 Kafka Connect 的 ClickHouse Sink 插件，将数据从 Kafka 写入到 ClickHouse 表中。
-
-总结
-
-方法	特点	适用场景
-JSON 格式插入	数据转换为 JSON，简化 Map 类型处理	适合小批量数据插入
-直接 SQL 插入	使用动态 SQL 灵活插入	适合简单插入场景
-通过文件加载	适合大批量数据处理	离线批量处理
-Kafka + ClickHouse Sink	流式写入，实时处理	实时数据场景
-
-推荐根据数据量和实时性需求选择合适的方式。如果只是需要临时解决问题，推荐 方法 1（JSON 格式插入） 或 方法 2（直接 SQL 插入），它们实现简单且兼容性较好。
+是否需要进一步优化或添加额外功能？
