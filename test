@@ -1,92 +1,43 @@
-在 Java 和 Spark 中，Dataset 的字段类型可以通过结构化数据模式（StructType）定义为 JSON。以下是一个示例，展示如何创建一个字段 a，其类型是 JSON（嵌套结构）的 Dataset：
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowMapper;
 
-代码示例
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.stream.Stream;
 
-import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Row;
-import org.apache.spark.sql.SparkSession;
-import org.apache.spark.sql.types.DataTypes;
-import org.apache.spark.sql.types.StructField;
-import org.apache.spark.sql.types.StructType;
-import org.apache.spark.sql.Encoders;
+public class StreamQueryExample {
 
-import java.util.Arrays;
+    private final JdbcTemplate jdbcTemplate;
+    private final ObjectMapper objectMapper;
 
-public class CreateJsonTypedDataset {
-    public static void main(String[] args) {
-        // 初始化 SparkSession
-        SparkSession spark = SparkSession.builder()
-                .appName("Create Dataset with JSON Type")
-                .master("local[*]")
-                .getOrCreate();
+    public StreamQueryExample(JdbcTemplate jdbcTemplate) {
+        this.jdbcTemplate = jdbcTemplate;
+        this.objectMapper = new ObjectMapper(); // 初始化 Jackson 的 ObjectMapper
+    }
 
-        // 准备 JSON 数据
-        String json1 = "{\"name\": \"Alice\", \"age\": 25}";
-        String json2 = "{\"name\": \"Bob\", \"age\": 30}";
-        String json3 = "{\"name\": \"Charlie\", \"age\": 35}";
+    public void streamQuery(String sql) {
+        try (Stream<String> stream = jdbcTemplate.queryForStream(sql, rowMapper())) {
+            stream.forEach(System.out::println); // 输出 JSON 格式字符串
+        }
+    }
 
-        // 创建一个初始 Dataset，包含 JSON 字符串
-        Dataset<String> jsonDataset = spark.createDataset(
-                Arrays.asList(json1, json2, json3),
-                Encoders.STRING()
-        );
-
-        // 定义 Schema，其中字段 `a` 是 JSON 类型
-        StructType schema = new StructType(new StructField[]{
-                DataTypes.createStructField("a", DataTypes.StringType, true)
-        });
-
-        // 将字符串 Dataset 转为 Row Dataset，并解析为 JSON 类型
-        Dataset<Row> parsedDataset = spark.read()
-                .schema(schema)
-                .json(jsonDataset);
-
-        // 展示结果
-        parsedDataset.show(false);
-        parsedDataset.printSchema();
-
-        // 停止 SparkSession
-        spark.stop();
+    private RowMapper<String> rowMapper() {
+        return (rs, rowNum) -> {
+            try {
+                // 将 ResultSet 当前行转换为 Map
+                int columnCount = rs.getMetaData().getColumnCount();
+                Map<String, Object> rowMap = new LinkedHashMap<>();
+                for (int i = 1; i <= columnCount; i++) {
+                    String columnName = rs.getMetaData().getColumnName(i);
+                    Object columnValue = rs.getObject(i);
+                    rowMap.put(columnName, columnValue);
+                }
+                // 使用 ObjectMapper 转换为 JSON
+                return objectMapper.writeValueAsString(rowMap);
+            } catch (Exception e) {
+                throw new RuntimeException("Error converting ResultSet to JSON", e);
+            }
+        };
     }
 }
-
-代码解析
-
-	1.	准备 JSON 数据:
-	•	JSON 字符串存储在 List 中，并通过 spark.createDataset 创建一个 Dataset<String>。
-	2.	定义 Schema:
-	•	使用 StructType 定义模式，指定字段 a 的数据类型为 String（后续会被解析为 JSON 结构）。
-	3.	解析 JSON:
-	•	使用 spark.read().schema(schema).json() 方法解析 JSON 数据，并将其与指定的 Schema 匹配。
-	4.	展示结果:
-	•	使用 show(false) 完整展示内容，printSchema() 展示字段类型。
-
-输出示例
-
-数据内容:
-
-+-------------------------+
-|a                        |
-+-------------------------+
-|{"name": "Alice", "age": 25}|
-|{"name": "Bob", "age": 30}  |
-|{"name": "Charlie", "age": 35}|
-+-------------------------+
-
-Schema:
-
-root
- |-- a: string (nullable = true)
-
-如果希望将字段 a 解析为嵌套 JSON 结构，可以使用以下代码对 Dataset 再次读取：
-
-Dataset<Row> jsonAsNestedStructure = parsedDataset.selectExpr("from_json(a, 'name STRING, age INT') as a");
-jsonAsNestedStructure.show(false);
-jsonAsNestedStructure.printSchema();
-
-输出的 Schema 将变为：
-
-root
- |-- a: struct (nullable = true)
- |    |-- name: string (nullable = true)
- |    |-- age: integer (nullable = true)
