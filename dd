@@ -1,209 +1,106 @@
-除了使用 Spark 的 JDBC 写入方式外，还有多种方式可以将数据写入 ClickHouse，具体方法取决于你的需求和技术栈。以下是几种常用的替代方法：
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
+import org.springframework.jdbc.core.JdbcTemplate;
+import reactor.core.publisher.Flux;
+import reactor.test.StepVerifier;
 
-1. 使用 ClickHouse Native JDBC Driver
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.stream.Stream;
 
-Spark 默认的 JDBC 方式可能存在类型兼容性问题，建议尝试使用 ClickHouse 原生 JDBC 驱动，其针对 ClickHouse 进行了优化。
+import static org.mockito.Mockito.*;
 
-配置步骤
+class ReactiveStreamQueryExampleTest {
 
-	1.	添加 ClickHouse JDBC Driver 依赖：
+    private JdbcTemplate jdbcTemplate;
+    private ReactiveStreamQueryExample example;
 
-<dependency>
-    <groupId>com.clickhouse</groupId>
-    <artifactId>clickhouse-jdbc</artifactId>
-    <version>0.4.6</version> <!-- 请使用最新版本 -->
-</dependency>
+    @BeforeEach
+    void setUp() {
+        jdbcTemplate = mock(JdbcTemplate.class); // 使用 Mockito 模拟 JdbcTemplate
+        example = new ReactiveStreamQueryExample(jdbcTemplate);
+    }
 
+    @Test
+    void queryForJsonFlux_ShouldReturnCorrectJsonStrings() {
+        // 模拟数据库查询返回的 Stream
+        Stream<Map<String, Object>> mockStream = Stream.of(
+                Map.of("id", 1, "name", "Alice", "age", 25),
+                Map.of("id", 2, "name", "Bob", "age", 30)
+        );
 
-	2.	使用原生 ClickHouse JDBC Driver：
+        // 模拟 JdbcTemplate 的 queryForStream 方法行为
+        when(jdbcTemplate.queryForStream(anyString(), any())).thenAnswer(invocation -> 
+            mockStream.map(row -> {
+                try {
+                    return new ObjectMapper().writeValueAsString(row); // 将 Map 转换为 JSON
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            })
+        );
 
-import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Row;
-import java.util.Properties;
+        // 测试 Flux 的结果
+        String sql = "SELECT * FROM test_table";
+        Flux<String> resultFlux = example.queryForJsonFlux(sql);
 
-// 配置 JDBC URL
-String jdbcUrl = "jdbc:clickhouse://<host>:<port>/<database>";
-Properties properties = new Properties();
-properties.setProperty("user", "default");
-properties.setProperty("password", "");
-properties.setProperty("driver", "com.clickhouse.jdbc.ClickHouseDriver");
+        // 使用 StepVerifier 验证结果
+        StepVerifier.create(resultFlux)
+                .expectNext("{\"id\":1,\"name\":\"Alice\",\"age\":25}")
+                .expectNext("{\"id\":2,\"name\":\"Bob\",\"age\":30}")
+                .verifyComplete();
 
-// 将 Dataset 写入 ClickHouse
-dataset.write()
-        .mode("append")
-        .jdbc(jdbcUrl, "your_table", properties);
+        // 验证 JdbcTemplate 的方法调用
+        verify(jdbcTemplate, times(1)).queryForStream(sql, example.rowMapper());
+    }
 
+    @Test
+    void queryForJsonFlux_ShouldHandleEmptyStream() {
+        // 模拟空的 Stream
+        Stream<Map<String, Object>> emptyStream = Stream.empty();
 
+        when(jdbcTemplate.queryForStream(anyString(), any())).thenReturn(emptyStream);
 
-优点
+        // 测试 Flux 的结果
+        String sql = "SELECT * FROM empty_table";
+        Flux<String> resultFlux = example.queryForJsonFlux(sql);
 
-	•	原生支持 ClickHouse，性能和兼容性更好。
-	•	更容易处理复杂类型如 Map 或 Array。
+        // 使用 StepVerifier 验证 Flux 返回结果为空
+        StepVerifier.create(resultFlux)
+                .verifyComplete();
 
-2. 使用 clickhouse-spark-connector
+        // 验证 JdbcTemplate 的方法调用
+        verify(jdbcTemplate, times(1)).queryForStream(sql, example.rowMapper());
+    }
 
-ClickHouse 提供了专用的 Spark Connector，可以直接与 Spark 集成，支持批量写入和高性能操作。
+    @Test
+    void queryForJsonFlux_ShouldHandleExceptionInMapping() {
+        // 模拟有异常的 Stream
+        Stream<Map<String, Object>> mockStream = Stream.of(
+                Map.of("id", 1, "name", "Alice", "age", 25),
+                Map.of("id", 2, "name", "Bob", "age", 30)
+        );
 
-配置步骤
+        // 模拟 JdbcTemplate 返回的 Stream，手动引入异常
+        when(jdbcTemplate.queryForStream(anyString(), any())).thenAnswer(invocation -> 
+            mockStream.map(row -> {
+                throw new RuntimeException("Simulated exception");
+            })
+        );
 
-	1.	添加依赖：
+        // 测试 Flux 的结果
+        String sql = "SELECT * FROM error_table";
+        Flux<String> resultFlux = example.queryForJsonFlux(sql);
 
-<dependency>
-    <groupId>cc.blynk.clickhouse</groupId>
-    <artifactId>clickhouse-spark-connector</artifactId>
-    <version>0.5.0</version> <!-- 请使用最新版本 -->
-</dependency>
+        // 使用 StepVerifier 验证 Flux 捕获异常
+        StepVerifier.create(resultFlux)
+                .expectErrorMatches(throwable -> throwable instanceof RuntimeException
+                        && throwable.getMessage().equals("Simulated exception"))
+                .verify();
 
-
-	2.	使用 Spark Connector 写入：
-
-import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Row;
-
-dataset.write()
-        .format("clickhouse")
-        .option("url", "clickhouse://<host>:<port>/<database>")
-        .option("user", "default")
-        .option("password", "")
-        .option("table", "your_table")
-        .save();
-
-
-
-优点
-
-	•	专为 ClickHouse 设计，性能比 JDBC 更优。
-	•	直接支持分布式批量写入，避免分区冲突。
-
-3. 使用 HTTP 接口
-
-ClickHouse 提供了基于 HTTP 的 REST 接口，可以通过 HTTP 请求将数据批量插入。Spark 可以通过 DataFrame 转换为 CSV 或 JSON，然后用 HTTP 写入。
-
-示例
-
-	1.	将 Dataset 转换为 CSV：
-
-dataset.write()
-        .format("csv")
-        .option("header", "true")
-        .save("path/to/output.csv");
-
-
-	2.	使用 HTTP 请求插入数据：
-
-import java.io.File;
-import java.nio.file.Files;
-import java.nio.file.Paths;
-import org.apache.http.client.methods.HttpPost;
-import org.apache.http.entity.StringEntity;
-import org.apache.http.impl.client.CloseableHttpClient;
-import org.apache.http.impl.client.HttpClients;
-
-String data = new String(Files.readAllBytes(Paths.get("path/to/output.csv")));
-String clickhouseUrl = "http://<host>:<port>/?query=INSERT INTO your_table FORMAT CSV";
-
-try (CloseableHttpClient client = HttpClients.createDefault()) {
-    HttpPost post = new HttpPost(clickhouseUrl);
-    post.setEntity(new StringEntity(data));
-    client.execute(post);
+        // 验证 JdbcTemplate 的方法调用
+        verify(jdbcTemplate, times(1)).queryForStream(sql, example.rowMapper());
+    }
 }
-
-
-
-优点
-
-	•	HTTP 插入接口支持多种数据格式（CSV、JSON、TabSeparated）。
-	•	无需依赖额外的库。
-
-4. 使用 ClickHouse Client
-
-通过命令行工具（clickhouse-client），将数据写入 ClickHouse：
-	1.	将 Dataset 写成文件：
-
-dataset.write()
-        .format("csv")
-        .option("header", "true")
-        .save("path/to/output.csv");
-
-
-	2.	使用 clickhouse-client 命令写入：
-
-clickhouse-client --query="INSERT INTO your_table FORMAT CSV" < path/to/output.csv
-
-
-
-优点
-
-	•	简单高效，适合已有 ClickHouse 部署环境。
-	•	支持大文件和批量操作。
-
-5. 使用 Apache Kafka 和 ClickHouse Sink
-
-如果你的数据需要流式处理，可以通过 Kafka 将数据传递给 ClickHouse。
-	1.	配置 Kafka 生产者：
-	•	使用 Spark 将数据发送到 Kafka：
-
-dataset.write()
-        .format("kafka")
-        .option("kafka.bootstrap.servers", "<kafka_host>:<port>")
-        .option("topic", "your_topic")
-        .save();
-
-
-	2.	配置 ClickHouse Sink：
-	•	使用 Kafka 和 ClickHouse 的集成插件（如 Kafka Connect）。
-	•	插件会将 Kafka 中的数据自动写入 ClickHouse。
-
-优点
-
-	•	适合实时流式数据写入。
-	•	解耦数据管道，便于扩展。
-
-6. 使用 Batch File with Native Protocol
-
-ClickHouse 的 Native Protocol 支持高效的批量数据写入，可以通过 Java 或 Python 使用 Native 驱动完成。
-
-示例：Java 原生协议
-
-	1.	添加依赖：
-
-<dependency>
-    <groupId>com.clickhouse</groupId>
-    <artifactId>clickhouse-client</artifactId>
-    <version>0.3.2</version> <!-- 请使用最新版本 -->
-</dependency>
-
-
-	2.	使用批量插入：
-
-import com.clickhouse.client.ClickHouseClient;
-import com.clickhouse.client.ClickHouseRequest;
-import com.clickhouse.client.ClickHouseResponse;
-
-try (ClickHouseClient client = ClickHouseClient.newInstance()) {
-    ClickHouseRequest<?> request = client.connect("clickhouse://<host>:<port>")
-            .write()
-            .table("your_table")
-            .format("CSV");
-
-    request.data("<csv_data>").execute();
-}
-
-
-
-优点
-
-	•	性能极高，原生协议支持压缩和批量写入。
-	•	适合大规模、高性能场景。
-
-总结
-
-方法	优点	适用场景
-JDBC	简单易用，适合小规模数据	小规模数据迁移
-ClickHouse Spark Connector	性能高，直接支持分布式批量写入	大规模分布式写入
-HTTP 接口	灵活，支持多种数据格式	临时解决方案或轻量级数据集
-ClickHouse Client	简单高效，无需额外编程	本地环境数据导入
-Kafka + ClickHouse Sink	实时流式数据写入	数据流场景
-Native Protocol	高性能，支持批量和压缩	超大规模数据写入
-
-根据你的具体需求，推荐选择 ClickHouse Spark Connector 或 HTTP 插入 作为首选方案。如果追求性能极致，可以尝试 Native Protocol。
