@@ -1,8 +1,8 @@
-在 Spring Boot 中，允许跨域访问（CORS，Cross-Origin Resource Sharing）可以通过以下几种方式进行配置：
+在 Spring WebFlux 中，配置跨域（CORS）可以通过以下方法进行：
 
 1. 使用 @CrossOrigin 注解（局部配置）
 
-可以在具体的控制器或方法上添加 @CrossOrigin 注解来允许跨域：
+在特定的控制器或方法上直接使用 @CrossOrigin 注解：
 
 import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -14,109 +14,117 @@ public class MyController {
     @CrossOrigin(origins = "http://example.com") // 允许来自 http://example.com 的跨域请求
     @GetMapping("/api/data")
     public String getData() {
-        return "Hello, CORS!";
+        return "Hello, CORS in WebFlux!";
     }
 }
 
-如果希望允许所有来源的跨域请求，可以使用 *：
+如果需要允许所有来源，可以使用：
 
 @CrossOrigin(origins = "*")
 @GetMapping("/api/data")
 public String getData() {
-    return "Hello, CORS!";
+    return "Hello, CORS in WebFlux!";
 }
 
 2. 全局配置 CORS
 
-如果需要对整个应用的所有接口统一配置跨域规则，可以使用 WebMvcConfigurer 进行全局配置：
+在 WebFlux 中，可以使用 CorsConfiguration 和 WebFluxConfigurer 来进行全局跨域配置：
 
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.web.servlet.config.annotation.CorsRegistry;
-import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
-
-@Configuration
-public class WebConfig implements WebMvcConfigurer {
-
-    @Override
-    public void addCorsMappings(CorsRegistry registry) {
-        registry.addMapping("/**") // 匹配所有路径
-                .allowedOrigins("http://example.com") // 允许的来源
-                .allowedMethods("GET", "POST", "PUT", "DELETE", "OPTIONS") // 允许的 HTTP 方法
-                .allowedHeaders("*") // 允许的请求头
-                .allowCredentials(true) // 是否允许发送 Cookie
-                .maxAge(3600); // 设置预检请求的缓存时间（秒）
-    }
-}
-
-3. 在 Spring Security 中配置 CORS
-
-如果你的项目使用了 Spring Security，需要在安全配置中明确允许 CORS：
-
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.security.config.annotation.web.builders.HttpSecurity;
-import org.springframework.security.web.SecurityFilterChain;
-
-@Configuration
-public class SecurityConfig {
-
-    @Bean
-    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
-        http.cors() // 启用 CORS
-            .and()
-            .csrf().disable() // 根据需要禁用 CSRF
-            .authorizeRequests()
-            .anyRequest().permitAll(); // 配置其他安全规则
-
-        return http.build();
-    }
-}
-
-同时，确保定义了一个全局的 CorsConfigurationSource：
-
-import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.web.cors.CorsConfiguration;
-import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
-import org.springframework.web.filter.CorsFilter;
+import org.springframework.web.cors.reactive.UrlBasedCorsConfigurationSource;
+import org.springframework.web.cors.reactive.CorsWebFilter;
+import org.springframework.context.annotation.Bean;
 
 @Configuration
 public class CorsConfig {
 
     @Bean
-    public CorsFilter corsFilter() {
+    public CorsWebFilter corsWebFilter() {
         CorsConfiguration config = new CorsConfiguration();
         config.addAllowedOrigin("http://example.com"); // 允许的来源
-        config.addAllowedHeader("*"); // 允许的请求头
-        config.addAllowedMethod("*"); // 允许的 HTTP 方法
+        config.addAllowedMethod("*"); // 允许所有的 HTTP 方法
+        config.addAllowedHeader("*"); // 允许所有的请求头
         config.setAllowCredentials(true); // 是否允许发送 Cookie
 
         UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
         source.registerCorsConfiguration("/**", config); // 匹配所有路径
 
-        return new CorsFilter(source);
+        return new CorsWebFilter(source);
     }
 }
 
-4. 使用 Spring Boot 配置文件
+3. 在 WebFlux 和 Security 配合下的 CORS 配置
 
-在某些情况下，也可以通过配置文件进行跨域设置，但功能有限：
+如果使用了 Spring Security，需要在安全配置中显式允许 CORS。
 
-在 application.properties 中：
+示例代码：
 
-# 允许跨域的路径
-spring.web.cors.allowed-paths=/**
-# 允许的来源
-spring.web.cors.allowed-origins=http://example.com
-# 允许的 HTTP 方法
-spring.web.cors.allowed-methods=GET,POST,PUT,DELETE,OPTIONS
-# 允许的请求头
-spring.web.cors.allowed-headers=*
-# 是否允许发送 Cookie
-spring.web.cors.allow-credentials=true
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.web.reactive.EnableWebFluxSecurity;
+import org.springframework.security.config.web.server.ServerHttpSecurity;
+import org.springframework.security.web.server.SecurityWebFilterChain;
 
-总结
-	•	如果只需要对某些接口允许跨域，可以使用 @CrossOrigin 注解。
-	•	如果需要全局配置跨域，使用 WebMvcConfigurer 或 CorsFilter。
-	•	如果启用了 Spring Security，需要在安全配置中显式允许 CORS。
+@Configuration
+@EnableWebFluxSecurity
+public class SecurityConfig {
+
+    @Bean
+    public SecurityWebFilterChain securityWebFilterChain(ServerHttpSecurity http) {
+        http.cors().and().csrf().disable()
+            .authorizeExchange()
+            .anyExchange().permitAll(); // 根据需要配置权限规则
+
+        return http.build();
+    }
+}
+
+同时，需要确保全局 CORS 配置已生效（如前述的 CorsWebFilter 配置）。
+
+4. 使用 RouterFunction 的跨域配置
+
+如果你使用的是函数式路由而不是注解路由，可以使用 CorsWebFilter 为路由提供跨域支持：
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.reactive.UrlBasedCorsConfigurationSource;
+import org.springframework.web.cors.reactive.CorsWebFilter;
+import org.springframework.web.reactive.function.server.RouterFunction;
+import org.springframework.web.reactive.function.server.RouterFunctions;
+import org.springframework.web.reactive.function.server.ServerResponse;
+
+import static org.springframework.web.reactive.function.server.RequestPredicates.GET;
+import static org.springframework.web.reactive.function.server.RequestPredicates.path;
+
+@Configuration
+public class RouterConfig {
+
+    @Bean
+    public RouterFunction<ServerResponse> router() {
+        return RouterFunctions
+                .route(GET("/api/data"), request -> ServerResponse.ok().bodyValue("Hello, CORS with RouterFunction!"))
+                .filter(corsWebFilter().filter());
+    }
+
+    @Bean
+    public CorsWebFilter corsWebFilter() {
+        CorsConfiguration config = new CorsConfiguration();
+        config.addAllowedOrigin("http://example.com");
+        config.addAllowedMethod("*");
+        config.addAllowedHeader("*");
+        config.setAllowCredentials(true);
+
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", config);
+        return new CorsWebFilter(source);
+    }
+}
+
+注意事项
+	1.	优先级：如果同时配置了全局 CORS 和局部 @CrossOrigin，局部配置会覆盖全局配置。
+	2.	预检请求：确保支持 OPTIONS 方法，特别是在跨域配置中涉及到复杂请求时。
+	3.	调试跨域：浏览器控制台中查看是否有 CORS 相关的错误日志，确保配置的来源、方法和头部与请求一致。
+
+通过以上方法，你可以根据实际需求配置跨域规则，从而满足 WebFlux 项目的跨域访问需求。
