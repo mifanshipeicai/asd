@@ -1,104 +1,122 @@
-在使用 Ant Design 的 Table 组件时，你可以通过设置 dataSource 属性将从后端服务获取的数据填充到表格中。以下是具体步骤和代码示例：
+在 Spring Boot 中，允许跨域访问（CORS，Cross-Origin Resource Sharing）可以通过以下几种方式进行配置：
 
-1. 安装所需依赖
+1. 使用 @CrossOrigin 注解（局部配置）
 
-确保你的项目已经安装了 Axios（或其他 HTTP 客户端）用于请求后端数据：
+可以在具体的控制器或方法上添加 @CrossOrigin 注解来允许跨域：
 
-npm install axios
+import org.springframework.web.bind.annotation.CrossOrigin;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
 
-2. 后端数据请求逻辑
+@RestController
+public class MyController {
 
-在 React 组件中使用 useEffect 钩子来请求数据，并将其存储到组件的状态中。
+    @CrossOrigin(origins = "http://example.com") // 允许来自 http://example.com 的跨域请求
+    @GetMapping("/api/data")
+    public String getData() {
+        return "Hello, CORS!";
+    }
+}
 
-3. 代码示例
+如果希望允许所有来源的跨域请求，可以使用 *：
 
-import React, { useEffect, useState } from "react";
-import { Table } from "antd";
-import axios from "axios";
+@CrossOrigin(origins = "*")
+@GetMapping("/api/data")
+public String getData() {
+    return "Hello, CORS!";
+}
 
-const MyTable = () => {
-  // 定义状态存储表格数据和加载状态
-  const [data, setData] = useState([]);
-  const [loading, setLoading] = useState(false);
+2. 全局配置 CORS
 
-  // 定义列配置
-  const columns = [
-    {
-      title: "Name",
-      dataIndex: "name",
-      key: "name",
-    },
-    {
-      title: "Age",
-      dataIndex: "age",
-      key: "age",
-    },
-    {
-      title: "Address",
-      dataIndex: "address",
-      key: "address",
-    },
-  ];
+如果需要对整个应用的所有接口统一配置跨域规则，可以使用 WebMvcConfigurer 进行全局配置：
 
-  // 获取后端数据
-  useEffect(() => {
-    const fetchData = async () => {
-      setLoading(true); // 开始加载
-      try {
-        const response = await axios.get("https://your-api-endpoint.com/data"); // 替换为你的后端 API 地址
-        setData(response.data); // 假设后端返回的数据是数组格式
-      } catch (error) {
-        console.error("Error fetching data:", error);
-      } finally {
-        setLoading(false); // 加载结束
-      }
-    };
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.servlet.config.annotation.CorsRegistry;
+import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 
-    fetchData();
-  }, []);
+@Configuration
+public class WebConfig implements WebMvcConfigurer {
 
-  return (
-    <Table
-      columns={columns} // 列配置
-      dataSource={data} // 数据源
-      loading={loading} // 加载状态
-      rowKey="id" // 使用唯一字段作为行 key
-    />
-  );
-};
+    @Override
+    public void addCorsMappings(CorsRegistry registry) {
+        registry.addMapping("/**") // 匹配所有路径
+                .allowedOrigins("http://example.com") // 允许的来源
+                .allowedMethods("GET", "POST", "PUT", "DELETE", "OPTIONS") // 允许的 HTTP 方法
+                .allowedHeaders("*") // 允许的请求头
+                .allowCredentials(true) // 是否允许发送 Cookie
+                .maxAge(3600); // 设置预检请求的缓存时间（秒）
+    }
+}
 
-export default MyTable;
+3. 在 Spring Security 中配置 CORS
 
-4. 关键点说明
+如果你的项目使用了 Spring Security，需要在安全配置中明确允许 CORS：
 
-	1.	dataSource 数据格式：
-	•	dataSource 应该是一个数组，每一项代表一行数据。比如：
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.web.SecurityFilterChain;
 
-[
-  { "id": 1, "name": "John", "age": 32, "address": "New York" },
-  { "id": 2, "name": "Jane", "age": 28, "address": "London" }
-]
+@Configuration
+public class SecurityConfig {
 
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http.cors() // 启用 CORS
+            .and()
+            .csrf().disable() // 根据需要禁用 CSRF
+            .authorizeRequests()
+            .anyRequest().permitAll(); // 配置其他安全规则
 
-	•	确保每条数据有唯一的 id 或其他字段作为 rowKey。
+        return http.build();
+    }
+}
 
-	2.	API 异步调用：
-	•	使用 axios 发送 HTTP 请求。如果后端返回分页数据，请参考 Ant Design 的 pagination 属性。
-	3.	分页和排序支持：
-如果后端支持分页、排序等操作，你可以使用 Table 的 onChange 回调并传递参数给后端：
+同时，确保定义了一个全局的 CorsConfigurationSource：
 
-const handleTableChange = (pagination, filters, sorter) => {
-  console.log(pagination, filters, sorter); // 根据这些参数请求后端数据
-};
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+import org.springframework.web.filter.CorsFilter;
 
-<Table
-  columns={columns}
-  dataSource={data}
-  loading={loading}
-  rowKey="id"
-  onChange={handleTableChange} // 处理表格变化
-/>
+@Configuration
+public class CorsConfig {
 
+    @Bean
+    public CorsFilter corsFilter() {
+        CorsConfiguration config = new CorsConfiguration();
+        config.addAllowedOrigin("http://example.com"); // 允许的来源
+        config.addAllowedHeader("*"); // 允许的请求头
+        config.addAllowedMethod("*"); // 允许的 HTTP 方法
+        config.setAllowCredentials(true); // 是否允许发送 Cookie
 
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", config); // 匹配所有路径
 
-这样就可以实现从后端服务获取数据并动态填充到 Ant Design 的表格中！
+        return new CorsFilter(source);
+    }
+}
+
+4. 使用 Spring Boot 配置文件
+
+在某些情况下，也可以通过配置文件进行跨域设置，但功能有限：
+
+在 application.properties 中：
+
+# 允许跨域的路径
+spring.web.cors.allowed-paths=/**
+# 允许的来源
+spring.web.cors.allowed-origins=http://example.com
+# 允许的 HTTP 方法
+spring.web.cors.allowed-methods=GET,POST,PUT,DELETE,OPTIONS
+# 允许的请求头
+spring.web.cors.allowed-headers=*
+# 是否允许发送 Cookie
+spring.web.cors.allow-credentials=true
+
+总结
+	•	如果只需要对某些接口允许跨域，可以使用 @CrossOrigin 注解。
+	•	如果需要全局配置跨域，使用 WebMvcConfigurer 或 CorsFilter。
+	•	如果启用了 Spring Security，需要在安全配置中显式允许 CORS。
