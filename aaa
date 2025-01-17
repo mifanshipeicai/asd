@@ -1,130 +1,64 @@
-在 Spring WebFlux 中，配置跨域（CORS）可以通过以下方法进行：
+import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestTemplate;
 
-1. 使用 @CrossOrigin 注解（局部配置）
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.locks.ReentrantLock;
 
-在特定的控制器或方法上直接使用 @CrossOrigin 注解：
+@Service
+public class CustomQueueService {
 
-import org.springframework.web.bind.annotation.CrossOrigin;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.RestController;
+    private final LinkedBlockingQueue<String> queue = new LinkedBlockingQueue<>();
+    private final ReentrantLock lock = new ReentrantLock();
+    private final RestTemplate restTemplate = new RestTemplate();
+    private volatile boolean running = true;
 
-@RestController
-public class MyController {
-
-    @CrossOrigin(origins = "http://example.com") // 允许来自 http://example.com 的跨域请求
-    @GetMapping("/api/data")
-    public String getData() {
-        return "Hello, CORS in WebFlux!";
-    }
-}
-
-如果需要允许所有来源，可以使用：
-
-@CrossOrigin(origins = "*")
-@GetMapping("/api/data")
-public String getData() {
-    return "Hello, CORS in WebFlux!";
-}
-
-2. 全局配置 CORS
-
-在 WebFlux 中，可以使用 CorsConfiguration 和 WebFluxConfigurer 来进行全局跨域配置：
-
-import org.springframework.context.annotation.Configuration;
-import org.springframework.web.cors.CorsConfiguration;
-import org.springframework.web.cors.reactive.UrlBasedCorsConfigurationSource;
-import org.springframework.web.cors.reactive.CorsWebFilter;
-import org.springframework.context.annotation.Bean;
-
-@Configuration
-public class CorsConfig {
-
-    @Bean
-    public CorsWebFilter corsWebFilter() {
-        CorsConfiguration config = new CorsConfiguration();
-        config.addAllowedOrigin("http://example.com"); // 允许的来源
-        config.addAllowedMethod("*"); // 允许所有的 HTTP 方法
-        config.addAllowedHeader("*"); // 允许所有的请求头
-        config.setAllowCredentials(true); // 是否允许发送 Cookie
-
-        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
-        source.registerCorsConfiguration("/**", config); // 匹配所有路径
-
-        return new CorsWebFilter(source);
-    }
-}
-
-3. 在 WebFlux 和 Security 配合下的 CORS 配置
-
-如果使用了 Spring Security，需要在安全配置中显式允许 CORS。
-
-示例代码：
-
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.security.config.annotation.web.reactive.EnableWebFluxSecurity;
-import org.springframework.security.config.web.server.ServerHttpSecurity;
-import org.springframework.security.web.server.SecurityWebFilterChain;
-
-@Configuration
-@EnableWebFluxSecurity
-public class SecurityConfig {
-
-    @Bean
-    public SecurityWebFilterChain securityWebFilterChain(ServerHttpSecurity http) {
-        http.cors().and().csrf().disable()
-            .authorizeExchange()
-            .anyExchange().permitAll(); // 根据需要配置权限规则
-
-        return http.build();
-    }
-}
-
-同时，需要确保全局 CORS 配置已生效（如前述的 CorsWebFilter 配置）。
-
-4. 使用 RouterFunction 的跨域配置
-
-如果你使用的是函数式路由而不是注解路由，可以使用 CorsWebFilter 为路由提供跨域支持：
-
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.web.cors.CorsConfiguration;
-import org.springframework.web.cors.reactive.UrlBasedCorsConfigurationSource;
-import org.springframework.web.cors.reactive.CorsWebFilter;
-import org.springframework.web.reactive.function.server.RouterFunction;
-import org.springframework.web.reactive.function.server.RouterFunctions;
-import org.springframework.web.reactive.function.server.ServerResponse;
-
-import static org.springframework.web.reactive.function.server.RequestPredicates.GET;
-import static org.springframework.web.reactive.function.server.RequestPredicates.path;
-
-@Configuration
-public class RouterConfig {
-
-    @Bean
-    public RouterFunction<ServerResponse> router() {
-        return RouterFunctions
-                .route(GET("/api/data"), request -> ServerResponse.ok().bodyValue("Hello, CORS with RouterFunction!"))
-                .filter(corsWebFilter().filter());
+    // 初始化消费者线程
+    public CustomQueueService() {
+        startConsumer();
     }
 
-    @Bean
-    public CorsWebFilter corsWebFilter() {
-        CorsConfiguration config = new CorsConfiguration();
-        config.addAllowedOrigin("http://example.com");
-        config.addAllowedMethod("*");
-        config.addAllowedHeader("*");
-        config.setAllowCredentials(true);
+    // 添加数据到队列
+    public void addData(String data) {
+        lock.lock();
+        try {
+            queue.offer(data); // 添加数据到队列
+        } finally {
+            lock.unlock();
+        }
+    }
 
-        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
-        source.registerCorsConfiguration("/**", config);
-        return new CorsWebFilter(source);
+    // 消费者线程
+    private void startConsumer() {
+        Thread consumerThread = new Thread(() -> {
+            while (running || !queue.isEmpty()) {
+                try {
+                    // 从队列中取出数据
+                    String data = queue.take();
+                    sendHttpRequest(data); // 发送 HTTP 请求
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        });
+        consumerThread.setDaemon(true); // 设置为守护线程
+        consumerThread.start();
+    }
+
+    // 发送 HTTP 请求
+    private void sendHttpRequest(String data) {
+        String targetUrl = "http://example.com/endpoint"; // 目标服务 URL
+        try {
+            // 根据需要修改请求逻辑
+            String response = restTemplate.postForObject(targetUrl, data, String.class);
+            System.out.println("发送成功: " + response);
+        } catch (Exception e) {
+            System.err.println("发送失败: " + e.getMessage());
+        }
+    }
+
+    // 停止消费者线程
+    public void stopService() {
+        running = false;
     }
 }
-
-注意事项
-	1.	优先级：如果同时配置了全局 CORS 和局部 @CrossOrigin，局部配置会覆盖全局配置。
-	2.	预检请求：确保支持 OPTIONS 方法，特别是在跨域配置中涉及到复杂请求时。
-	3.	调试跨域：浏览器控制台中查看是否有 CORS 相关的错误日志，确保配置的来源、方法和头部与请求一致。
-
-通过以上方法，你可以根据实际需求配置跨域规则，从而满足 WebFlux 项目的跨域访问需求。
