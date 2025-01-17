@@ -1,3 +1,14 @@
+可以通过以下方式实现一个自定义队列，用于顺序发送 HTTP 请求。你可以使用 Java 的 LinkedBlockingQueue 配合多线程，确保数据按照顺序被消费和发送。以下是完整的实现思路和代码示例：
+
+实现步骤
+	1.	定义数据队列：使用 LinkedBlockingQueue 来存储待发送的数据。
+	2.	生产者：通过一个方法，将数据添加到队列中。需要使用锁（如 ReentrantLock）来确保线程安全。
+	3.	消费者：启动一个独立线程，持续从队列中取出数据，并通过 HTTP 请求发送到目标服务。
+	4.	发送 HTTP 请求：使用 RestTemplate 或其他 HTTP 客户端（如 OkHttp 或 WebClient）。
+	5.	优雅关闭：在服务关闭时，确保消费者线程能够正确退出。
+
+代码实现
+
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
@@ -62,3 +73,39 @@ public class CustomQueueService {
         running = false;
     }
 }
+
+使用说明
+	1.	启动消费者线程：服务初始化时会自动启动消费者线程。
+	2.	添加数据到队列：
+
+@RestController
+@RequestMapping("/queue")
+public class QueueController {
+
+    private final CustomQueueService customQueueService;
+
+    public QueueController(CustomQueueService customQueueService) {
+        this.customQueueService = customQueueService;
+    }
+
+    @PostMapping("/add")
+    public String addToQueue(@RequestBody String data) {
+        customQueueService.addData(data);
+        return "Data added to queue";
+    }
+}
+
+
+	3.	优雅关闭：在 Spring Boot 应用停止时，调用 stopService() 方法：
+
+@PreDestroy
+public void onDestroy() {
+    customQueueService.stopService();
+}
+
+注意事项
+	•	线程安全：通过 ReentrantLock 确保数据写入的线程安全性。
+	•	队列满的处理：LinkedBlockingQueue 默认容量是 Integer.MAX_VALUE，可以在初始化时设置合理的大小。
+	•	重试机制：如果需要处理发送失败的情况，可以添加重试逻辑或将失败数据重新放回队列。
+
+这种方式可以灵活实现一个简单的自定义队列，无需依赖第三方消息队列。
