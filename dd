@@ -1,106 +1,139 @@
-import com.fasterxml.jackson.databind.ObjectMapper;
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
-import org.mockito.Mockito;
-import org.springframework.jdbc.core.JdbcTemplate;
-import reactor.core.publisher.Flux;
-import reactor.test.StepVerifier;
+在Spring Boot中，可以通过AWS SDK与Amazon S3交互，从指定目录下获取文件名并将文件读取为字节流。以下是详细的实现步骤和代码示例：
 
-import java.util.LinkedHashMap;
-import java.util.Map;
-import java.util.stream.Stream;
+1. 添加依赖
 
-import static org.mockito.Mockito.*;
+在你的pom.xml中添加AWS SDK的依赖：
 
-class ReactiveStreamQueryExampleTest {
+<dependency>
+    <groupId>software.amazon.awssdk</groupId>
+    <artifactId>s3</artifactId>
+    <version>2.20.50</version>
+</dependency>
 
-    private JdbcTemplate jdbcTemplate;
-    private ReactiveStreamQueryExample example;
+2. 配置AWS客户端
 
-    @BeforeEach
-    void setUp() {
-        jdbcTemplate = mock(JdbcTemplate.class); // 使用 Mockito 模拟 JdbcTemplate
-        example = new ReactiveStreamQueryExample(jdbcTemplate);
-    }
+配置一个S3Client实例，建议使用依赖注入：
 
-    @Test
-    void queryForJsonFlux_ShouldReturnCorrectJsonStrings() {
-        // 模拟数据库查询返回的 Stream
-        Stream<Map<String, Object>> mockStream = Stream.of(
-                Map.of("id", 1, "name", "Alice", "age", 25),
-                Map.of("id", 2, "name", "Bob", "age", 30)
-        );
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.*;
 
-        // 模拟 JdbcTemplate 的 queryForStream 方法行为
-        when(jdbcTemplate.queryForStream(anyString(), any())).thenAnswer(invocation -> 
-            mockStream.map(row -> {
-                try {
-                    return new ObjectMapper().writeValueAsString(row); // 将 Map 转换为 JSON
-                } catch (Exception e) {
-                    throw new RuntimeException(e);
-                }
-            })
-        );
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
 
-        // 测试 Flux 的结果
-        String sql = "SELECT * FROM test_table";
-        Flux<String> resultFlux = example.queryForJsonFlux(sql);
+@Configuration
+public class AwsS3Config {
 
-        // 使用 StepVerifier 验证结果
-        StepVerifier.create(resultFlux)
-                .expectNext("{\"id\":1,\"name\":\"Alice\",\"age\":25}")
-                .expectNext("{\"id\":2,\"name\":\"Bob\",\"age\":30}")
-                .verifyComplete();
-
-        // 验证 JdbcTemplate 的方法调用
-        verify(jdbcTemplate, times(1)).queryForStream(sql, example.rowMapper());
-    }
-
-    @Test
-    void queryForJsonFlux_ShouldHandleEmptyStream() {
-        // 模拟空的 Stream
-        Stream<Map<String, Object>> emptyStream = Stream.empty();
-
-        when(jdbcTemplate.queryForStream(anyString(), any())).thenReturn(emptyStream);
-
-        // 测试 Flux 的结果
-        String sql = "SELECT * FROM empty_table";
-        Flux<String> resultFlux = example.queryForJsonFlux(sql);
-
-        // 使用 StepVerifier 验证 Flux 返回结果为空
-        StepVerifier.create(resultFlux)
-                .verifyComplete();
-
-        // 验证 JdbcTemplate 的方法调用
-        verify(jdbcTemplate, times(1)).queryForStream(sql, example.rowMapper());
-    }
-
-    @Test
-    void queryForJsonFlux_ShouldHandleExceptionInMapping() {
-        // 模拟有异常的 Stream
-        Stream<Map<String, Object>> mockStream = Stream.of(
-                Map.of("id", 1, "name", "Alice", "age", 25),
-                Map.of("id", 2, "name", "Bob", "age", 30)
-        );
-
-        // 模拟 JdbcTemplate 返回的 Stream，手动引入异常
-        when(jdbcTemplate.queryForStream(anyString(), any())).thenAnswer(invocation -> 
-            mockStream.map(row -> {
-                throw new RuntimeException("Simulated exception");
-            })
-        );
-
-        // 测试 Flux 的结果
-        String sql = "SELECT * FROM error_table";
-        Flux<String> resultFlux = example.queryForJsonFlux(sql);
-
-        // 使用 StepVerifier 验证 Flux 捕获异常
-        StepVerifier.create(resultFlux)
-                .expectErrorMatches(throwable -> throwable instanceof RuntimeException
-                        && throwable.getMessage().equals("Simulated exception"))
-                .verify();
-
-        // 验证 JdbcTemplate 的方法调用
-        verify(jdbcTemplate, times(1)).queryForStream(sql, example.rowMapper());
+    @Bean
+    public S3Client s3Client() {
+        return S3Client.builder()
+                .region(software.amazon.awssdk.regions.Region.YOUR_REGION) // 替换为你的Region
+                .build();
     }
 }
+
+3. 读取指定目录下的文件名
+
+通过listObjectsV2方法列举指定目录下的文件：
+
+import org.springframework.stereotype.Service;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
+import software.amazon.awssdk.services.s3.model.S3Object;
+
+import java.util.ArrayList;
+import java.util.List;
+
+@Service
+public class S3Service {
+
+    private final S3Client s3Client;
+
+    public S3Service(S3Client s3Client) {
+        this.s3Client = s3Client;
+    }
+
+    public List<String> listFiles(String bucketName, String prefix) {
+        List<String> fileNames = new ArrayList<>();
+
+        ListObjectsV2Request request = ListObjectsV2Request.builder()
+                .bucket(bucketName)
+                .prefix(prefix) // 指定目录前缀
+                .build();
+
+        ListObjectsV2Response result = s3Client.listObjectsV2(request);
+
+        for (S3Object s3Object : result.contents()) {
+            fileNames.add(s3Object.key());
+        }
+
+        return fileNames;
+    }
+}
+
+4. 读取指定文件为字节流
+
+通过getObject方法读取文件并将其转为字节流：
+
+import software.amazon.awssdk.core.ResponseBytes;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+
+@Service
+public class S3Service {
+
+    private final S3Client s3Client;
+
+    public S3Service(S3Client s3Client) {
+        this.s3Client = s3Client;
+    }
+
+    // 获取文件内容为字节流
+    public byte[] readFile(String bucketName, String key) {
+        GetObjectRequest request = GetObjectRequest.builder()
+                .bucket(bucketName)
+                .key(key)
+                .build();
+
+        ResponseBytes<GetObjectResponse> objectBytes = s3Client.getObjectAsBytes(request);
+
+        return objectBytes.asByteArray();
+    }
+}
+
+5. 示例调用
+
+在控制器或其他服务中调用：
+
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.util.List;
+
+@RestController
+public class S3Controller {
+
+    private final S3Service s3Service;
+
+    public S3Controller(S3Service s3Service) {
+        this.s3Service = s3Service;
+    }
+
+    @GetMapping("/list-files")
+    public List<String> listFiles(@RequestParam String bucketName, @RequestParam String prefix) {
+        return s3Service.listFiles(bucketName, prefix);
+    }
+
+    @GetMapping("/read-file")
+    public byte[] readFile(@RequestParam String bucketName, @RequestParam String key) {
+        return s3Service.readFile(bucketName, key);
+    }
+}
+
+6. 注意事项
+	•	权限：确保S3的访问密钥和策略授予了所需权限（例如ListBucket和GetObject）。
+	•	Region设置：将YOUR_REGION替换为实际使用的区域。
+	•	错误处理：添加异常处理逻辑以捕获网络问题或权限错误。
+
+这样，你可以通过REST API访问S3上的文件列表并读取文件为字节流。
