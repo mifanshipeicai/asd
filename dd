@@ -1,70 +1,60 @@
-在Spring Boot中，可以通过AWS SDK与Amazon S3交互，从指定目录下获取文件名并将文件读取为字节流。以下是详细的实现步骤和代码示例：
+aws-java-sdk-bundle 是一个打包版本的 AWS SDK，它包含了所有 AWS 服务的依赖和模块，适合对依赖版本要求不敏感的小型项目。以下是如何使用它的步骤和示例：
 
 1. 添加依赖
 
-在你的pom.xml中添加AWS SDK的依赖：
+在 pom.xml 中引入 aws-java-sdk-bundle 的依赖：
 
 <dependency>
-    <groupId>software.amazon.awssdk</groupId>
-    <artifactId>s3</artifactId>
-    <version>2.20.50</version>
+    <groupId>com.amazonaws</groupId>
+    <artifactId>aws-java-sdk-bundle</artifactId>
+    <version>1.12.569</version> <!-- 确保使用最新版本 -->
 </dependency>
 
-2. 配置AWS客户端
+2. 配置 AmazonS3 客户端
 
-配置一个S3Client实例，建议使用依赖注入：
+使用 AmazonS3Client 配置 S3 客户端：
 
-import software.amazon.awssdk.services.s3.S3Client;
-import software.amazon.awssdk.services.s3.model.*;
+import com.amazonaws.auth.AWSStaticCredentialsProvider;
+import com.amazonaws.auth.BasicAWSCredentials;
+import com.amazonaws.services.s3.AmazonS3;
+import com.amazonaws.services.s3.AmazonS3ClientBuilder;
 
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
+public class S3Config {
 
-@Configuration
-public class AwsS3Config {
-
-    @Bean
-    public S3Client s3Client() {
-        return S3Client.builder()
-                .region(software.amazon.awssdk.regions.Region.YOUR_REGION) // 替换为你的Region
+    public AmazonS3 s3Client(String accessKey, String secretKey, String region) {
+        BasicAWSCredentials awsCredentials = new BasicAWSCredentials(accessKey, secretKey);
+        return AmazonS3ClientBuilder.standard()
+                .withRegion(region)
+                .withCredentials(new AWSStaticCredentialsProvider(awsCredentials))
                 .build();
     }
 }
 
-3. 读取指定目录下的文件名
+3. 列出指定目录下的文件
 
-通过listObjectsV2方法列举指定目录下的文件：
+使用 S3 客户端的 listObjects 方法获取指定目录的文件列表：
 
-import org.springframework.stereotype.Service;
-import software.amazon.awssdk.services.s3.S3Client;
-import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
-import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
-import software.amazon.awssdk.services.s3.model.S3Object;
+import com.amazonaws.services.s3.AmazonS3;
+import com.amazonaws.services.s3.model.ObjectListing;
+import com.amazonaws.services.s3.model.S3ObjectSummary;
 
 import java.util.ArrayList;
 import java.util.List;
 
-@Service
 public class S3Service {
 
-    private final S3Client s3Client;
+    private final AmazonS3 s3Client;
 
-    public S3Service(S3Client s3Client) {
+    public S3Service(AmazonS3 s3Client) {
         this.s3Client = s3Client;
     }
 
     public List<String> listFiles(String bucketName, String prefix) {
         List<String> fileNames = new ArrayList<>();
 
-        ListObjectsV2Request request = ListObjectsV2Request.builder()
-                .bucket(bucketName)
-                .prefix(prefix) // 指定目录前缀
-                .build();
-
-        ListObjectsV2Response result = s3Client.listObjectsV2(request);
-
-        for (S3Object s3Object : result.contents()) {
-            fileNames.add(s3Object.key());
+        ObjectListing objectListing = s3Client.listObjects(bucketName, prefix);
+        for (S3ObjectSummary summary : objectListing.getObjectSummaries()) {
+            fileNames.add(summary.getKey());
         }
 
         return fileNames;
@@ -73,67 +63,58 @@ public class S3Service {
 
 4. 读取指定文件为字节流
 
-通过getObject方法读取文件并将其转为字节流：
+使用 getObject 方法读取文件内容并转为字节流：
 
-import software.amazon.awssdk.core.ResponseBytes;
-import software.amazon.awssdk.services.s3.model.GetObjectRequest;
-import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import com.amazonaws.services.s3.AmazonS3;
+import com.amazonaws.services.s3.model.S3Object;
 
-@Service
+import java.io.IOException;
+import java.io.InputStream;
+
 public class S3Service {
 
-    private final S3Client s3Client;
+    private final AmazonS3 s3Client;
 
-    public S3Service(S3Client s3Client) {
+    public S3Service(AmazonS3 s3Client) {
         this.s3Client = s3Client;
     }
 
-    // 获取文件内容为字节流
-    public byte[] readFile(String bucketName, String key) {
-        GetObjectRequest request = GetObjectRequest.builder()
-                .bucket(bucketName)
-                .key(key)
-                .build();
+    public byte[] readFile(String bucketName, String key) throws IOException {
+        S3Object s3Object = s3Client.getObject(bucketName, key);
+        InputStream inputStream = s3Object.getObjectContent();
 
-        ResponseBytes<GetObjectResponse> objectBytes = s3Client.getObjectAsBytes(request);
-
-        return objectBytes.asByteArray();
+        return inputStream.readAllBytes();
     }
 }
 
 5. 示例调用
 
-在控制器或其他服务中调用：
+可以通过以下代码实例化服务并调用方法：
 
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
+public class Main {
+    public static void main(String[] args) throws IOException {
+        String accessKey = "your-access-key";
+        String secretKey = "your-secret-key";
+        String region = "your-region";
 
-import java.util.List;
+        S3Config config = new S3Config();
+        AmazonS3 s3Client = config.s3Client(accessKey, secretKey, region);
 
-@RestController
-public class S3Controller {
+        S3Service service = new S3Service(s3Client);
 
-    private final S3Service s3Service;
+        // 列出文件
+        List<String> files = service.listFiles("your-bucket-name", "your-directory-prefix/");
+        files.forEach(System.out::println);
 
-    public S3Controller(S3Service s3Service) {
-        this.s3Service = s3Service;
-    }
-
-    @GetMapping("/list-files")
-    public List<String> listFiles(@RequestParam String bucketName, @RequestParam String prefix) {
-        return s3Service.listFiles(bucketName, prefix);
-    }
-
-    @GetMapping("/read-file")
-    public byte[] readFile(@RequestParam String bucketName, @RequestParam String key) {
-        return s3Service.readFile(bucketName, key);
+        // 读取文件
+        byte[] fileContent = service.readFile("your-bucket-name", "your-file-key");
+        System.out.println(new String(fileContent));
     }
 }
 
 6. 注意事项
-	•	权限：确保S3的访问密钥和策略授予了所需权限（例如ListBucket和GetObject）。
-	•	Region设置：将YOUR_REGION替换为实际使用的区域。
-	•	错误处理：添加异常处理逻辑以捕获网络问题或权限错误。
+	•	凭证管理：避免在代码中硬编码访问密钥，建议使用 AWS 的环境变量、配置文件或 IAM 角色。
+	•	权限：确保 AWS S3 存储桶和文件的权限正确设置。
+	•	适用性：aws-java-sdk-bundle 包含了完整的 AWS SDK，包体积较大，仅适合对体积不敏感的小型项目。
 
-这样，你可以通过REST API访问S3上的文件列表并读取文件为字节流。
+如果项目较大或需要更精细的依赖管理，建议直接使用模块化版本的 AWS SDK，例如 software.amazon.awssdk:s3。
