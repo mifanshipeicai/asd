@@ -1,46 +1,391 @@
-import com.fasterxml.jackson.databind.ObjectMapper;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.jdbc.core.RowMapper;
-import reactor.core.publisher.Flux;
+在设计全面的错误处理机制时，需要覆盖从请求入口到数据持久化的全链路错误处理，以下是一个系统化的设计框架和实现方案：
 
-import java.util.LinkedHashMap;
-import java.util.Map;
-import java.util.stream.Stream;
+---
 
-public class ReactiveStreamQueryExample {
+### 一、错误处理分层架构
+```
+┌─────────────────────────────┐
+│       全局统一异常处理       │  ← 处理未捕获的全局异常
+├─────────────────────────────┤
+│      业务逻辑层异常处理      │  ← 处理业务规则校验异常
+├─────────────────────────────┤
+│  数据访问层异常转换处理      │  ← 转换数据库/缓存异常
+├─────────────────────────────┤
+│  WebFlux框架级错误处理       │  ← 处理路由/参数绑定异常
+├─────────────────────────────┤
+│  Reactive流错误传播机制      │  ← 处理响应式流中的错误
+└─────────────────────────────┘
+```
 
-    private final JdbcTemplate jdbcTemplate;
-    private final ObjectMapper objectMapper;
+---
 
-    public ReactiveStreamQueryExample(JdbcTemplate jdbcTemplate) {
-        this.jdbcTemplate = jdbcTemplate;
-        this.objectMapper = new ObjectMapper(); // 初始化 Jackson 的 ObjectMapper
+### 二、核心组件设计
+
+#### 1. 统一错误响应格式
+```java
+public record ErrorResponse(
+    String traceId,       // 请求唯一标识
+    Instant timestamp,    // 错误发生时间
+    String code,          // 业务错误码
+    String message,       // 用户友好提示
+    String detail,        // 技术细节（开发环境可见）
+    List<FieldError> errors // 字段校验错误
+) {
+    public record FieldError(String field, String message) {}
+}
+```
+
+#### 2. 全局异常处理器
+```java
+@ControllerAdvice
+public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHandler {
+
+    private static final ErrorAttributeOptions ERROR_ATTRIBUTE_OPTIONS = 
+        ErrorAttributeOptions.of(ErrorAttributeOptions.Include.MESSAGE, 
+                                ErrorAttributeOptions.Include.EXCEPTION);
+
+    @Override
+    public RouterFunction<ServerResponse> getRoutingFunction(ErrorAttributes errorAttributes) {
+        return RouterFunctions.route(RequestPredicates.all(), this::renderErrorResponse);
     }
 
-    public Flux<String> queryForJsonFlux(String sql) {
-        return Flux.using(
-                () -> jdbcTemplate.queryForStream(sql, rowMapper()), // 打开资源（Stream）
-                Flux::fromStream,                                    // 将 Stream 转为 Flux
-                Stream::close                                        // 关闭资源（Stream）
+    private Mono<ServerResponse> renderErrorResponse(ServerRequest request) {
+        Map<String, Object> errorProperties = getErrorAttributes(request, ERROR_ATTRIBUTE_OPTIONS);
+        
+        return ServerResponse.status(getHttpStatus(errorProperties))
+            .contentType(MediaType.APPLICATION_JSON)
+            .body(BodyInserters.fromValue(
+                new ErrorResponse(
+                    (String)errorProperties.get("requestId"),
+                    Instant.now(),
+                    resolveErrorCode(errorProperties.get("error")),
+                    (String)errorProperties.get("message"),
+                    (String)errorProperties.get("trace"),
+                    resolveFieldErrors(errorProperties)
+                )
+            ));
+    }
+
+    private HttpStatus getHttpStatus(Map<String, Object> errorProperties) {
+        return Optional.ofNullable(errorProperties.get("status"))
+            .map(status -> HttpStatus.valueOf((Integer)status))
+            .orElse(HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+}
+```
+
+#### 3. 业务异常体系
+```java
+// 基础业务异常
+public abstract class BusinessException extends RuntimeException {
+    private final ErrorCode errorCode;
+    
+    protected BusinessException(ErrorCode errorCode, String message) {
+        super(message);
+        this.errorCode = errorCode;
+    }
+}
+
+// 具体业务异常示例
+public class ResourceNotFoundException extends BusinessException {
+    public ResourceNotFoundException(String resourceName, Object identifier) {
+        super(ErrorCode.RESOURCE_NOT_FOUND, 
+            String.format("%s with id %s not found", resourceName, identifier));
+    }
+}
+
+// 错误码枚举
+public enum ErrorCode {
+    RESOURCE_NOT_FOUND("RESOURCE_404"),
+    VALIDATION_FAILED("VALIDATION_400"),
+    UNAUTHORIZED("AUTH_401");
+    
+    private final String code;
+}
+```
+
+---
+
+### 三、关键处理场景实现
+
+#### 1. 参数校验错误处理
+```java
+@Configuration
+@EnableWebFlux
+public class ValidationConfig implements WebFluxConfigurer {
+
+    @Override
+    public void configureHttpMessageCodecs(ServerCodecConfigurer configurer) {
+        configurer.defaultCodecs().enableLoggingRequestDetails(true);
+    }
+
+    @Bean
+    public Validator validator() {
+        return new LocalValidatorFactoryBean();
+    }
+
+    @ExceptionHandler(WebExchangeBindException.class)
+    public Mono<ServerResponse> handleValidationExceptions(WebExchangeBindException ex) {
+        return ServerResponse.badRequest()
+            .bodyValue(ErrorResponse.builder()
+                .code(ErrorCode.VALIDATION_FAILED.getCode())
+                .errors(convertFieldErrors(ex.getFieldErrors()))
+                .build());
+    }
+    
+    private List<FieldError> convertFieldErrors(List<org.springframework.validation.FieldError> errors) {
+        return errors.stream()
+            .map(e -> new FieldError(e.getField(), e.getDefaultMessage()))
+            .toList();
+    }
+}
+```
+
+#### 2. 响应式流错误处理
+```java
+public Mono<User> getUserWithFallback(String userId) {
+    return userRepository.findById(userId)
+        .onErrorResume(DataAccessResourceFailureException.class, 
+            ex -> cachedUserService.getFromCache(userId))
+        .onErrorResume(NoSuchElementException.class, 
+            ex -> Mono.error(new ResourceNotFoundException("User", userId)))
+        .retryWhen(Retry.backoff(3, Duration.ofMillis(100))
+            .filter(ex -> ex instanceof TransientDataAccessException))
+        .doOnError(ex -> log.error("Failed to retrieve user {}", userId, ex));
+}
+```
+
+#### 3. 安全相关异常处理
+```java
+@Bean
+public SecurityWebFilterChain securityFilterChain(ServerHttpSecurity http) {
+    return http
+        .exceptionHandling()
+            .authenticationEntryPoint((exchange, ex) -> 
+                ServerResponse.status(HttpStatus.UNAUTHORIZED)
+                    .bodyValue(ErrorResponse.from(ex)))
+            .accessDeniedHandler((exchange, ex) -> 
+                ServerResponse.status(HttpStatus.FORBIDDEN)
+                    .bodyValue(ErrorResponse.from(ex)))
+        .and()
+        // ...其他安全配置
+        .build();
+}
+```
+
+---
+
+### 四、高级处理策略
+
+#### 1. 错误日志标准化
+```java
+@Aspect
+@Component
+@Slf4j
+public class ErrorLoggingAspect {
+
+    @AfterThrowing(pointcut = "execution(* com.example..*.*(..))", throwing = "ex")
+    public void logError(JoinPoint joinPoint, Throwable ex) {
+        StructuredLogMessage logMessage = new StructuredLogMessage()
+            .with("method", joinPoint.getSignature().getName())
+            .with("class", joinPoint.getTarget().getClass().getName())
+            .with("exceptionType", ex.getClass().getName())
+            .with("errorCode", ex instanceof BusinessException ? 
+                ((BusinessException)ex).getErrorCode() : "SYSTEM_ERROR");
+        
+        if (ex instanceof BusinessException) {
+            log.warn("Business exception occurred: {}", logMessage);
+        } else {
+            log.error("System error occurred: {}", logMessage, ex);
+        }
+    }
+}
+```
+
+#### 2. 熔断降级机制
+```java
+@Bean
+public Customizer<ReactiveResilience4JCircuitBreakerFactory> circuitBreakerFactory() {
+    return factory -> factory.configureDefault(id -> new Resilience4JConfigBuilder(id)
+        .circuitBreakerConfig(CircuitBreakerConfig.custom()
+            .failureRateThreshold(50)
+            .waitDurationInOpenState(Duration.ofSeconds(30))
+            .slidingWindowType(SlidingWindowType.COUNT_BASED)
+            .slidingWindowSize(10)
+            .build())
+        .timeLimiterConfig(TimeLimiterConfig.custom()
+            .timeoutDuration(Duration.ofSeconds(5))
+            .build())
+        .build());
+}
+
+// 使用示例
+@CircuitBreaker(name = "userService", fallbackMethod = "fallbackGetUser")
+public Mono<User> getUser(String id) {
+    return userRepository.findById(id);
+}
+
+private Mono<User> fallbackGetUser(String id, Throwable ex) {
+    return cachedUserService.getFromCache(id)
+        .switchIfEmpty(Mono.error(new ServiceDegradedException("User service unavailable")));
+}
+```
+
+#### 3. 错误追踪集成
+```java
+@Component
+public class ErrorTraceFilter implements WebFilter {
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
+        String traceId = UUID.randomUUID().toString();
+        MDC.put("traceId", traceId);
+        exchange.getResponse().getHeaders().add("X-Trace-Id", traceId);
+        
+        return chain.filter(exchange)
+            .doFinally(signalType -> MDC.clear());
+    }
+}
+```
+
+---
+
+### 五、监控与告警
+
+#### 1. 错误指标采集
+```java
+@Configuration
+public class ErrorMetricsConfig {
+
+    @Bean
+    public MeterRegistryCustomizer<MeterRegistry> metricsCommonTags() {
+        return registry -> registry.config().commonTags(
+            "application", "webflux-app",
+            "environment", System.getenv("APP_ENV")
         );
     }
 
-    private RowMapper<String> rowMapper() {
-        return (rs, rowNum) -> {
-            try {
-                // 将 ResultSet 当前行转换为 Map
-                int columnCount = rs.getMetaData().getColumnCount();
-                Map<String, Object> rowMap = new LinkedHashMap<>();
-                for (int i = 1; i <= columnCount; i++) {
-                    String columnName = rs.getMetaData().getColumnName(i);
-                    Object columnValue = rs.getObject(i);
-                    rowMap.put(columnName, columnValue);
-                }
-                // 使用 ObjectMapper 转换为 JSON
-                return objectMapper.writeValueAsString(rowMap);
-            } catch (Exception e) {
-                throw new RuntimeException("Error converting ResultSet to JSON", e);
-            }
-        };
+    @Bean
+    public Counter errorCounter(MeterRegistry registry) {
+        return Counter.builder("api.errors")
+            .description("Total API errors")
+            .tags("type", "business")
+            .register(registry);
     }
 }
+
+// 在异常处理中记录指标
+@ExceptionHandler(BusinessException.class)
+public Mono<ServerResponse> handleBusinessException(BusinessException ex) {
+    errorCounter.increment();
+    // ...其他处理逻辑
+}
+```
+
+#### 2. Prometheus告警规则示例
+```yaml
+groups:
+- name: webflux-errors
+  rules:
+  - alert: HighErrorRate
+    expr: rate(api_errors_total{environment="production"}[5m]) > 10
+    for: 10m
+    labels:
+      severity: critical
+    annotations:
+      summary: "High error rate detected"
+      description: "Error rate exceeded 10 errors per second"
+```
+
+---
+
+### 六、测试验证方案
+
+#### 1. 异常测试工具类
+```java
+public class ErrorAssertions {
+
+    public static void assertBusinessError(ErrorResponse response, ErrorCode expectedCode) {
+        assertThat(response.code()).isEqualTo(expectedCode.getCode());
+        assertThat(response.message()).isNotBlank();
+    }
+
+    public static StepVerifier.FirstStep<ErrorResponse> expectError(Mono<?> mono) {
+        return StepVerifier.create(mono)
+            .expectErrorSatisfies(ex -> {
+                assertThat(ex).isInstanceOf(WebClientResponseException.class);
+                WebClientResponseException wcre = (WebClientResponseException)ex;
+                ErrorResponse error = parseError(wcre);
+                assertThat(error.code()).isNotNull();
+            });
+    }
+}
+```
+
+#### 2. 集成测试示例
+```java
+@SpringBootTest(webEnvironment = WebEnvironment.RANDOM_PORT)
+class ErrorHandlingIntegrationTest {
+
+    @Autowired
+    private WebTestClient webTestClient;
+
+    @Test
+    void shouldReturnValidationError() {
+        webTestClient.post().uri("/users")
+            .contentType(MediaType.APPLICATION_JSON)
+            .bodyValue("{}")
+            .exchange()
+            .expectStatus().isBadRequest()
+            .expectBody(ErrorResponse.class)
+            .value(response -> {
+                assertThat(response.code()).isEqualTo("VALIDATION_400");
+                assertThat(response.errors()).isNotEmpty();
+            });
+    }
+}
+```
+
+---
+
+### 七、错误处理最佳实践
+
+1. **错误分类策略**：
+   - 可恢复错误：网络超时、数据库连接中断等，应启用重试机制
+   - 不可恢复错误：数据校验失败、权限不足等，直接返回客户端
+   - 系统级错误：内存溢出、磁盘空间不足等，触发系统告警
+
+2. **上下文保留原则**：
+   - 始终携带请求唯一标识（traceId）
+   - 保持错误堆栈的完整传递
+   - 区分用户可见消息和技术细节
+
+3. **防御性编程技巧**：
+   ```java
+   public Mono<User> safeUpdateUser(String userId, UserUpdateRequest request) {
+       return Mono.just(request)
+           .filter(req -> req.name() != null && !req.name().isBlank())
+           .switchIfEmpty(Mono.error(new InvalidRequestException("Name cannot be empty")))
+           .flatMap(req -> userRepository.findById(userId))
+           .switchIfEmpty(Mono.error(new ResourceNotFoundException("User", userId)))
+           .flatMap(existing -> validateBusinessRules(existing, request))
+           .flatMap(userRepository::save);
+   }
+   ```
+
+4. **错误传播控制**：
+   - 使用`onErrorMap`转换异常类型
+   - 使用`onErrorResume`提供备用值
+   - 使用`onErrorContinue`跳过错误元素（适用于Flux）
+
+---
+
+通过这种分层设计的错误处理机制，可以实现：
+- 统一的错误响应规范
+- 精准的错误分类处理
+- 完整的错误追踪能力
+- 智能的错误恢复机制
+- 可视化的错误监控体系
+- 可验证的错误处理逻辑
+
+系统可根据不同环境（开发/生产）动态调整错误信息暴露程度，同时保证在高压场景下错误处理不会成为性能瓶颈。
