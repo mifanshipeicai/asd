@@ -1,0 +1,107 @@
+在Spring Boot WebFlux中实现服务A追踪服务B的数据插入状态，可采用Server-Sent Events (SSE) 实现实时状态推送。以下是分步解决方案：
+
+### 1. 服务B 暴露SSE端点推送状态
+**Controller:**
+```java
+@RestController
+public class ServiceBController {
+
+    @Autowired
+    private ReactiveRepository repository; // 假设使用R2DBC
+
+    @PostMapping("/insert")
+    public Flux<ServerSentEvent<String>> insertData(@RequestBody Data data) {
+        return Flux.create(sink -> {
+            // 开始事件
+            sink.next(createEvent("start", "插入开始"));
+
+            // 执行插入操作
+            repository.insert(data)
+                .doOnSuccess(v -> 
+                    sink.next(createEvent("success", "插入成功")))
+                .doOnError(e -> 
+                    sink.next(createEvent("error", "失败: " + e.getMessage())))
+                .doFinally(signal -> sink.complete())
+                .subscribe();
+        });
+    }
+
+    private ServerSentEvent<String> createEvent(String event, String data) {
+        return ServerSentEvent.builder()
+            .event(event)
+            .data(data)
+            .build();
+    }
+}
+```
+
+### 2. 服务A 使用WebClient订阅SSE流
+**调用服务B并处理事件:**
+```java
+@Service
+public class ServiceA {
+
+    private static final Logger log = LoggerFactory.getLogger(ServiceA.class);
+
+    public void callServiceBAndMonitor(Data data) {
+        WebClient.create("http://service-b")
+            .post()
+            .uri("/insert")
+            .bodyValue(data)
+            .retrieve()
+            .bodyToFlux(ServerSentEvent.class)
+            .subscribe(
+                event -> {
+                    switch (event.event()) {
+                        case "start":
+                            log.info("插入开始: {}", event.data());
+                            break;
+                        case "success":
+                            log.info("插入成功: {}", event.data());
+                            break;
+                        case "error":
+                            log.error("插入失败: {}", event.data());
+                            break;
+                    }
+                },
+                error -> log.error("SSE连接错误", error),
+                () -> log.info("SSE流结束")
+            );
+    }
+}
+```
+
+### 3. 配置数据库反应式访问（示例使用R2DBC）
+**Repository:**
+```java
+public interface ReactiveRepository extends ReactiveCrudRepository<Data, Long> {
+}
+```
+
+**application.properties:**
+```properties
+spring.r2dbc.url=r2dbc:mysql://localhost:3306/mydb
+spring.r2dbc.username=user
+spring.r2dbc.password=pass
+```
+
+### 4. 运行流程说明
+1. **服务A调用服务B**：通过POST请求触发插入操作。
+2. **服务B立即返回SSE流**：在处理的不同阶段（开始、成功、失败）发送事件。
+3. **服务A实时接收事件**：通过订阅SSE流，记录每个状态到日志。
+4. **非阻塞处理**：所有操作基于Reactive Streams，确保高并发下的资源高效利用。
+
+### 其他方案对比
+| 方案               | 优点                          | 缺点                         |
+|--------------------|-------------------------------|------------------------------|
+| **SSE (推荐)**     | 实时性强，纯HTTP无需中间件    | 需处理长连接稳定性           |
+| 消息队列           | 高可靠，支持断线重传          | 需额外组件，系统复杂度增加   |
+| 轮询状态API        | 实现简单                      | 实时性差，资源消耗较高       |
+
+### 注意事项
+- **错误处理**：确保服务B中所有异常都被捕获并发送error事件。
+- **背压管理**：WebClient默认会根据消费能力处理背压。
+- **超时控制**：可配置SSE客户端超时时间，避免僵尸连接。
+- **生产环境建议**：考虑结合Spring Cloud CircuitBreaker增加容错能力。
+
+此方案利用WebFlux的响应式特性，通过SSE实现服务间实时状态通知，确保服务A能准确记录数据插入全过程状态。
