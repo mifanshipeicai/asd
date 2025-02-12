@@ -1,0 +1,199 @@
+以下是 **Spring WebFlux Flux API 使用大全**，完整罗列 `Flux` 的核心操作和方法，涵盖数据流创建、转换、组合、背压控制、错误处理等场景，并提供示例说明。
+
+---
+
+### **1. 创建 Flux**
+| 方法 | 描述 | 示例 |
+|------|------|------|
+| `Flux.just(T...)` | 创建包含确定值的 Flux | `Flux.just("A", "B", "C")` |
+| `Flux.fromIterable(Iterable)` | 从集合（如 List、Set）创建 Flux | `Flux.fromIterable(List.of(1, 2, 3))` |
+| `Flux.fromArray(T[])` | 从数组创建 Flux | `Flux.fromArray(new String[]{"a", "b"})` |
+| `Flux.fromStream(Stream)` | 从 Java Stream 创建 Flux（需注意 Stream 只能消费一次） | `Flux.fromStream(Stream.of(1, 2))` |
+| `Flux.range(start, count)` | 生成整数序列 | `Flux.range(1, 5)` |
+| `Flux.interval(Duration)` | 周期性生成递增数字（0, 1, 2...） | `Flux.interval(Duration.ofSeconds(1))` |
+| `Flux.generate(...)` | 同步生成复杂数据流（通过 `SynchronousSink` 控制） | 见下方示例 |
+| `Flux.create(sink -> {})` | 异步生成数据流（支持多线程发射数据） | 见下方示例 |
+| `Flux.defer(() -> Flux)` | 延迟创建 Flux（每次订阅时生成新 Flux） | `Flux.defer(() -> fetchFlux())` |
+| `Flux.empty()` | 创建空 Flux（仅发送完成信号） | `Flux.empty()` |
+| `Flux.error(Throwable)` | 创建直接发送错误的 Flux | `Flux.error(new RuntimeException())` |
+| `Flux.never()` | 创建永不发送数据的 Flux | `Flux.never()` |
+| `Flux.concat(Flux1, Flux2)` | 按顺序连接多个 Flux | `Flux.concat(fluxA, fluxB)` |
+| `Flux.merge(Flux1, Flux2)` | 合并多个 Flux（数据交叉发射） | `Flux.merge(fluxA, fluxB)` |
+
+**示例：`Flux.generate`**
+```java
+Flux.generate(
+    () -> 0, // 初始状态
+    (state, sink) -> {
+        sink.next("Value: " + state);
+        if (state == 10) sink.complete();
+        return state + 1; // 更新状态
+    }
+);
+```
+
+**示例：`Flux.create`（多线程发射）**
+```java
+Flux.create(sink -> {
+    new Thread(() -> {
+        for (int i = 0; i < 10; i++) {
+            sink.next("Data-" + i);
+        }
+        sink.complete();
+    }).start();
+});
+```
+
+---
+
+### **2. 转换与处理数据流**
+| 方法 | 描述 | 示例 |
+|------|------|------|
+| `map(Function<T, R>)` | 同步转换每个元素 | `.map(s -> s.toUpperCase())` |
+| `flatMap(Function<T, Flux<R>>)` | 异步转换元素（返回新 Flux） | `.flatMap(id -> queryFromDB(id))` |
+| `concatMap(Function<T, Flux<R>>)` | 顺序执行 `flatMap`（保留顺序） | `.concatMap(request -> sendSequentially(request))` |
+| `flatMapSequential(Function<T, Flux<R>>)` | 并行执行但保留结果顺序 | `.flatMapSequential(request -> asyncCall(request))` |
+| `handle((T, SynchronousSink<R>) -> {})` | 过滤或转换元素（可选择性发射） | 见下方示例 |
+| `scan((initial, BiFunction))` | 累积计算（类似 `reduce` 但逐步发射） | `.scan(0, (sum, val) -> sum + val)` |
+| `buffer(int)` | 将元素分组为集合（按数量） | `.buffer(3)` → `List<T>` 流 |
+| `bufferTimeout(int, Duration)` | 按数量或时间分组 | `.bufferTimeout(10, Duration.ofMillis(100))` |
+| `window(int)` | 将 Flux 拆分为多个子 Flux（按数量） | `.window(2)` → `Flux<Flux<T>>` |
+| `window(Duration)` | 按时间窗口拆分 | `.window(Duration.ofSeconds(1))` |
+| `groupBy(Function<T, K>)` | 按键分组 | `.groupBy(User::getRole)` |
+
+**示例：`handle` 过滤无效数据**
+```java
+Flux.range(1, 5)
+    .handle((num, sink) -> {
+        if (num % 2 == 0) sink.next(num);
+    }); // 输出 2, 4
+```
+
+---
+
+### **3. 过滤与条件操作**
+| 方法 | 描述 | 示例 |
+|------|------|------|
+| `filter(Predicate<T>)` | 过滤不符合条件的元素 | `.filter(s -> s.length() > 3)` |
+| `take(long)` | 取前 N 个元素 | `.take(3)` |
+| `take(Duration)` | 取指定时间内的元素 | `.take(Duration.ofSeconds(5))` |
+| `takeUntil(Predicate<T>)` | 取元素直到条件为真 | `.takeUntil(s -> s.equals("STOP"))` |
+| `takeLast(int)` | 取最后 N 个元素 | `.takeLast(2)` |
+| `skip(long)` | 跳过前 N 个元素 | `.skip(2)` |
+| `distinct()` | 去重 | `.distinct()` |
+| `defaultIfEmpty(T)` | 如果流为空，发射默认值 | `.defaultIfEmpty("N/A")` |
+| `switchIfEmpty(Flux)` | 如果流为空，切换到另一个 Flux | `.switchIfEmpty(Flux.just("fallback"))` |
+
+---
+
+### **4. 组合与合并数据流**
+| 方法 | 描述 | 示例 |
+|------|------|------|
+| `mergeWith(Flux)` | 合并两个 Flux（数据交叉） | `fluxA.mergeWith(fluxB)` |
+| `zipWith(Flux)` | 一对一合并为元组 | `flux1.zipWith(flux2)` |
+| `Flux.zip(Flux1, Flux2, ...)` | 静态方法合并多个 Flux | `Flux.zip(fluxA, fluxB, fluxC)` |
+| `concatWith(Flux)` | 顺序连接两个 Flux | `fluxA.concatWith(fluxB)` |
+| `combineLatest(Flux1, Flux2, combinator)` | 合并最新数据 | 见下方示例 |
+| `join(Flux, overlap, period)` | 时间窗口内关联两个 Flux | 高级场景使用 |
+
+**示例：`combineLatest`**
+```java
+Flux.combineLatest(
+    fluxA, 
+    fluxB, 
+    (a, b) -> a + "-" + b
+); // 每当任一 Flux 发射新数据时合并
+```
+
+---
+
+### **5. 错误处理**
+| 方法 | 描述 | 示例 |
+|------|------|------|
+| `onErrorReturn(T)` | 遇到错误时返回默认值 | `.onErrorReturn("fallback")` |
+| `onErrorResume(Function)` | 遇到错误时切换到备用 Flux | `.onErrorResume(ex -> fallbackFlux())` |
+| `onErrorMap(Function)` | 转换错误类型 | `.onErrorMap(ex -> new CustomException(ex))` |
+| `onErrorContinue()` | 忽略错误并继续处理后续数据 | `.onErrorContinue((ex, obj) -> log.error(ex))` |
+| `retry()` | 重试整个流（立即重试） | `.retry(3)` |
+| `retryWhen(Retry)` | 自定义重试策略 | 见下方示例 |
+
+**示例：`retryWhen` 指数退避重试**
+```java
+Flux.interval(Duration.ofMillis(100))
+    .retryWhen(Retry.backoff(3, Duration.ofSeconds(1)));
+```
+
+---
+
+### **6. 背压控制与流量控制**
+| 方法 | 描述 | 示例 |
+|------|------|------|
+| `onBackpressureBuffer()` | 缓冲溢出的数据（默认无界） | `.onBackpressureBuffer(100)` |
+| `onBackpressureDrop()` | 丢弃无法处理的数据 | `.onBackpressureDrop(dropped -> log.warn("Dropped"))` |
+| `onBackpressureLatest()` | 只保留最新数据 | `.onBackpressureLatest()` |
+| `limitRate(int)` | 限制请求速率 | `.limitRate(10)` |
+| `limitRequest(long)` | 限制总请求数量 | `.limitRequest(100)` |
+
+---
+
+### **7. 调度与线程控制**
+| 方法 | 描述 | 示例 |
+|------|------|------|
+| `subscribeOn(Scheduler)` | 指定订阅时的调度器 | `.subscribeOn(Schedulers.parallel())` |
+| `publishOn(Scheduler)` | 切换后续操作的调度器 | `.publishOn(Schedulers.boundedElastic())` |
+| `parallel(int)` | 并行处理数据流 | `.parallel(4).runOn(Schedulers.parallel())` |
+
+---
+
+### **8. 调试与日志**
+| 方法 | 描述 | 示例 |
+|------|------|------|
+| `log()` | 输出流的事件日志 | `.log("flux.logger")` |
+| `doOnNext(Consumer)` | 元素到达时执行操作 | `.doOnNext(System.out::println)` |
+| `doOnError(Consumer)` | 错误发生时执行操作 | `.doOnError(ex -> log.error(ex))` |
+| `doOnComplete(Runnable)` | 流完成时执行操作 | `.doOnComplete(() -> log.info("Done"))` |
+| `doOnCancel(Runnable)` | 取消订阅时执行操作 | `.doOnCancel(() -> cleanup())` |
+
+---
+
+### **9. 其他实用操作**
+| 方法 | 描述 | 示例 |
+|------|------|------|
+| `cache()` | 缓存流数据（重复订阅时复用） | `.cache(Duration.ofMinutes(5))` |
+| `timeout(Duration)` | 设置超时时间 | `.timeout(Duration.ofSeconds(10))` |
+| `elapsed()` | 记录元素到达的时间间隔 | `.elapsed().map(tuple -> tuple.getT1())` |
+| `index()` | 为元素添加索引 | `.index().map(tuple -> tuple.getT1() + ": " + tuple.getT2())` |
+| `collectList()` | 收集所有元素到 `Mono<List<T>>` | `.collectList()` |
+| `collectMap(Function<T, K>)` | 收集为 `Mono<Map<K, T>>` | `.collectMap(User::getId)` |
+| `reduce(BiFunction)` | 聚合所有元素 | `.reduce(0, (sum, val) -> sum + val)` |
+
+---
+
+### **完整示例场景**
+```java
+Flux.fromIterable(fetchIds())
+    .flatMap(id -> queryFromDatabase(id)) // 异步查询
+    .filter(result -> result.isValid())
+    .take(100) // 最多取 100 条
+    .timeout(Duration.ofSeconds(5)) // 超时控制
+    .onErrorResume(ex -> fallbackFlux()) // 错误回退
+    .publishOn(Schedulers.parallel()) // 切换线程
+    .doOnNext(data -> process(data)) // 处理数据
+    .subscribe(
+        data -> log.info("Received: {}", data),
+        ex -> log.error("Error: {}", ex),
+        () -> log.info("Completed")
+    );
+```
+
+---
+
+### **注意事项**
+1. **背压策略**：根据场景选择 `onBackpressureBuffer`、`onBackpressureDrop` 或 `onBackpressureLatest`。
+2. **线程安全**：`create` 和 `generate` 方法中的 `Sink` 可能涉及多线程操作，需确保线程安全。
+3. **资源释放**：使用 `doFinally` 或 `doOnCancel` 确保资源释放。
+4. **调试技巧**：使用 `log()` 和 `doOnNext` 跟踪数据流状态。
+
+参考文档：
+- [Reactor 官方文档](https://projectreactor.io/docs/core/release/reference/)
+- [Spring WebFlux 指南](https://docs.spring.io/spring-framework/reference/web/webflux.html)
