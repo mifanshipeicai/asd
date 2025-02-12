@@ -1,0 +1,158 @@
+以下是 **Spring WebFlux Mono API 使用大全**，完整罗列了 `Mono` 的核心操作和方法，涵盖创建、转换、组合、错误处理等场景。结合示例代码说明其用法。
+
+---
+
+### **1. 创建 Mono**
+| 方法 | 描述 | 示例 |
+|------|------|------|
+| `Mono.just(T)` | 创建一个包含确定值的 Mono | `Mono.just("Hello")` |
+| `Mono.empty()` | 创建一个空 Mono（无数据，仅完成信号） | `Mono.empty()` |
+| `Mono.error(Throwable)` | 创建一个包含错误的 Mono | `Mono.error(new RuntimeException())` |
+| `Mono.fromSupplier(Supplier)` | 延迟生成值（订阅时执行） | `Mono.fromSupplier(() -> "data")` |
+| `Mono.fromCallable(Callable)` | 类似 `fromSupplier`，但支持受检异常 | `Mono.fromCallable(() -> fetchData())` |
+| `Mono.fromFuture(CompletableFuture)` | 从 `CompletableFuture` 创建 Mono | `Mono.fromFuture(future)` |
+| `Mono.create(sink -> {})` | 手动控制数据发射（最灵活的方式） | 见下方示例 |
+| `Mono.defer(() -> Mono)` | 延迟创建 Mono（每次订阅时生成新 Mono） | `Mono.defer(() -> createMono())` |
+| `Mono.never()` | 创建一个永不发射数据的 Mono | `Mono.never()` |
+| `Mono.delay(Duration)` | 延迟一段时间后发射 `0L` | `Mono.delay(Duration.ofSeconds(1))` |
+
+**示例：`Mono.create`**
+```java
+Mono.create(sink -> {
+    asyncService.getData(result -> {
+        if (result.success()) {
+            sink.success(result.data());
+        } else {
+            sink.error(result.error());
+        }
+    });
+});
+```
+
+---
+
+### **2. 转换操作**
+| 方法 | 描述 | 示例 |
+|------|------|------|
+| `map(Function<T, R>)` | 同步转换数据 | `.map(s -> s.toUpperCase())` |
+| `flatMap(Function<T, Mono<R>>)` | 异步转换数据（返回新 Mono） | `.flatMap(s -> callAsync(s))` |
+| `flatMapMany(Function<T, Flux<R>>)` | 将 Mono 转换为 Flux | `.flatMapMany(s -> Flux.just(s.split("")))` |
+| `flatMapIterable(Function<T, Iterable>)` | 将值转换为 `Iterable` 并展开为 Flux | `.flatMapIterable(list -> list)` |
+| `handle((T, SynchronousSink<R>) -> {})` | 复杂转换（可选择性发射数据） | 见下方示例 |
+
+**示例：`handle` 过滤无效数据**
+```java
+Mono.just(-1)
+    .handle((num, sink) -> {
+        if (num > 0) sink.next(num);
+    }); // 结果为空
+```
+
+---
+
+### **3. 过滤与条件操作**
+| 方法 | 描述 | 示例 |
+|------|------|------|
+| `filter(Predicate<T>)` | 过滤不符合条件的数据 | `.filter(s -> s.length() > 5)` |
+| `defaultIfEmpty(T)` | 如果为空，发射默认值 | `.defaultIfEmpty("default")` |
+| `switchIfEmpty(Mono)` | 如果为空，切换到另一个 Mono | `.switchIfEmpty(Mono.just("fallback"))` |
+| `take(Duration)` | 在指定时间内取数据，超时则完成 | `.take(Duration.ofSeconds(2))` |
+
+---
+
+### **4. 组合操作**
+| 方法 | 描述 | 示例 |
+|------|------|------|
+| `zipWith(Mono)` | 与另一个 Mono 组合，返回元组 | `mono1.zipWith(mono2)` |
+| `Mono.zip(Mono1, Mono2)` | 静态方法组合多个 Mono | `Mono.zip(monoA, monoB)` |
+| `then(Mono)` | 忽略当前结果，返回另一个 Mono | `.then(Mono.just("done"))` |
+| `thenEmpty(Mono<Void>)` | 返回一个空 Mono | `.thenEmpty(Mono.empty())` |
+| `thenMany(Flux)` | 转换为 Flux | `.thenMany(Flux.range(1, 3))` |
+| `when(Mono...)` | 等待多个 Mono 完成（不关心数据） | `Mono.when(task1, task2)` |
+
+---
+
+### **5. 错误处理**
+| 方法 | 描述 | 示例 |
+|------|------|------|
+| `onErrorReturn(T)` | 遇到错误时返回默认值 | `.onErrorReturn("fallback")` |
+| `onErrorResume(Function)` | 遇到错误时切换到备用 Mono | `.onErrorResume(ex -> fallbackMono())` |
+| `onErrorMap(Function)` | 将错误转换为另一种异常 | `.onErrorMap(ex -> new CustomException(ex))` |
+| `onErrorContinue()` | 遇到错误后继续处理后续数据（适用于 Flux） | 需谨慎使用 |
+| `retry()` | 重试订阅（立即重试） | `.retry(3)` |
+| `retryWhen(Retry)` | 自定义重试策略 | 见下方示例 |
+
+**示例：`retryWhen` 自定义重试**
+```java
+Mono.just("data")
+    .retryWhen(Retry.backoff(3, Duration.ofMillis(100)));
+```
+
+---
+
+### **6. 调度与线程**
+| 方法 | 描述 | 示例 |
+|------|------|------|
+| `subscribeOn(Scheduler)` | 指定订阅时的调度器 | `.subscribeOn(Schedulers.parallel())` |
+| `publishOn(Scheduler)` | 切换后续操作的调度器 | `.publishOn(Schedulers.boundedElastic())` |
+
+---
+
+### **7. 阻塞操作（谨慎使用）**
+| 方法 | 描述 | 示例 |
+|------|------|------|
+| `block()` | 阻塞直到数据到达（或超时） | `String data = mono.block()` |
+| `blockOptional()` | 返回 `Optional<T>` | `mono.blockOptional()` |
+| `block(Duration)` | 阻塞指定时间 | `mono.block(Duration.ofSeconds(5))` |
+
+---
+
+### **8. 重复与空值处理**
+| 方法 | 描述 | 示例 |
+|------|------|------|
+| `repeat()` | 重复订阅（无限次） | `.repeat(3)` |
+| `repeatWhenEmpty()` | 当 Mono 为空时重复订阅 | `.repeatWhenEmpty(5)` |
+
+---
+
+### **9. 日志与调试**
+| 方法 | 描述 | 示例 |
+|------|------|------|
+| `log()` | 打印事件日志 | `.log("mono.logger")` |
+| `doOnNext(Consumer)` | 数据到达时执行操作 | `.doOnNext(System.out::println)` |
+| `doOnError(Consumer)` | 错误发生时执行操作 | `.doOnError(ex -> log.error(ex))` |
+| `doOnSuccess(Consumer)` | 成功完成时执行操作 | `.doOnSuccess(v -> cleanup())` |
+
+---
+
+### **10. 其他实用操作**
+| 方法 | 描述 | 示例 |
+|------|------|------|
+| `cache()` | 缓存结果（重复订阅时复用） | `.cache(Duration.ofMinutes(5))` |
+| `timeout(Duration)` | 超时设置 | `.timeout(Duration.ofSeconds(10))` |
+| `elapsed()` | 记录数据到达的时间间隔 | `.elapsed().map(tuple -> tuple.getT1())` |
+| `toFuture()` | 将 Mono 转换为 `CompletableFuture` | `CompletableFuture<String> future = mono.toFuture()` |
+
+---
+
+### **完整示例场景**
+```java
+Mono.fromCallable(() -> fetchFromDatabase())
+    .subscribeOn(Schedulers.boundedElastic())
+    .timeout(Duration.ofSeconds(3))
+    .retryWhen(Retry.fixedDelay(2, Duration.ofSeconds(1)))
+    .onErrorResume(ex -> Mono.just("fallback"))
+    .doOnNext(value -> System.out.println("Received: " + value))
+    .flatMap(result -> sendToRemoteService(result))
+    .subscribe();
+```
+
+---
+
+### **注意事项**
+1. **延迟执行**：Mono 是延迟执行的，只有订阅（`subscribe()`）时才会触发操作。
+2. **避免阻塞**：在响应式链中避免使用 `block()`，确保非阻塞。
+3. **错误处理**：合理使用 `onError` 系列方法处理异常。
+4. **线程调度**：使用 `publishOn`/`subscribeOn` 管理线程切换。
+
+如需更详细说明，请参考 [Reactor 官方文档](https://projectreactor.io/docs/core/release/reference/) 或 [Spring WebFlux 指南](https://docs.spring.io/spring-framework/reference/web/webflux.html)。
