@@ -1,0 +1,56 @@
+在响应式编程中，要确保事务 ID 在整个数据流中共享且只获取一次，可以通过以下步骤实现：
+
+### 解决方案步骤：
+1. **提前获取事务 ID**：将事务 ID 转换为一个缓存的 `Mono`，确保后续操作复用同一个值。
+2. **将事务 ID 与数据流绑定**：在 `flatMap` 中复用事务 ID 处理每个文件。
+3. **统一提交事务**：在所有文件插入完成后，使用同一个事务 ID 提交。
+4. **异常处理**：发生错误时回滚事务。
+
+### 示例代码：
+```java
+// 假设这是获取事务 ID 的方法
+Mono<String> fetchTransactionId() {
+    return Mono.fromCallable(() -> externalSystem.createTransaction());
+}
+
+// 插入单个文件的方法（使用事务 ID）
+Mono<Void> insertFile(FileData file, String transactionId) {
+    return Mono.fromRunnable(() -> externalSystem.insert(file, transactionId));
+}
+
+// 提交事务的方法
+Mono<Void> commitTransaction(String transactionId) {
+    return Mono.fromRunnable(() -> externalSystem.commit(transactionId));
+}
+
+// 回滚事务的方法（异常处理用）
+Mono<Void> rollbackTransaction(String transactionId) {
+    return Mono.fromRunnable(() -> externalSystem.rollback(transactionId));
+}
+
+// 主处理流程
+public Mono<Void> processFiles(Flux<FileData> filesFlux) {
+    // 1. 提前获取并缓存事务 ID（确保只调用一次）
+    Mono<String> txIdMono = fetchTransactionId().cache(); 
+
+    return txIdMono.flatMap(txId -> 
+        filesFlux
+            // 2. 对每个文件，复用事务 ID 执行插入
+            .flatMap(file -> insertFile(file, txId)) 
+            // 3. 全部插入完成后提交事务
+            .then(commitTransaction(txId)) 
+            // 4. 异常时回滚
+            .onErrorResume(e -> 
+                rollbackTransaction(txId).then(Mono.error(e))
+            )
+    );
+}
+```
+
+### 关键点说明：
+- **缓存事务 ID**：通过 `.cache()` 确保 `Mono` 被订阅时仅执行一次，后续复用结果。
+- **统一提交**：使用 `.then()` 在所有 `flatMap` 完成后触发提交。
+- **错误回滚**：在 `onErrorResume` 中捕获异常并执行回滚，确保事务一致性。
+- **原子性保证**：所有插入操作使用同一事务 ID，最终一次提交，符合原子性需求。
+
+这种方法确保了事务 ID 在整个数据流处理过程中只获取一次，且所有文件插入操作在同一个事务上下文中完成，最后统一提交，避免多次获取 ID 的问题。
