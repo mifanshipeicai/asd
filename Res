@@ -1,0 +1,36 @@
+@Data
+@Accessors(chain = true)
+@ApiModel("通用响应体")
+public class Result<T> implements Serializable {
+    @ApiModelProperty(value = "状态码", example = "200")
+    private Integer code;
+    
+    @ApiModelProperty(value = "业务消息", example = "操作成功")
+    private String message;
+    
+    @ApiModelProperty("业务数据负载")
+    private T data;
+    
+    @ApiModelProperty(value = "响应时间戳", example = "2025-02-14T08:30:45.123Z")
+    private LocalDateTime timestamp;
+    
+    @ApiModelProperty(value = "请求路径", example = "/api/v1/users")
+    private String path;
+
+    // 成功构造器
+    public static <T> Result<T> success(T data) {
+        return new Result<T>()
+                .setCode(HttpStatus.OK.value())
+                .setMessage("Success")
+                .setData(data)
+                .setTimestamp(LocalDateTime.now());
+    }
+
+    // 错误构造器
+    public static Result<?> error(int code, String msg) {
+        return new Result<>()
+                .setCode(code)
+                .setMessage(msg)
+                .setTimestamp(LocalDateTime.now());
+    }
+}
