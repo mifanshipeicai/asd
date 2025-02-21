@@ -1,12 +1,33 @@
-@Bean
-public RestTemplate insecureRestTemplate() throws Exception {
-    SSLContext sslContext = new SSLContextBuilder()
-        .loadTrustMaterial(null, (cert, authType) -> true).build();
-    
-    HttpClient client = HttpClients.custom()
-        .setSSLContext(sslContext)
-        .setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE)
-        .build();
+import org.apache.http.conn.ssl.*;
+import org.apache.http.impl.client.*;
+import org.apache.http.ssl.SSLContextBuilder;
+import org.springframework.context.annotation.*;
+import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
+import javax.net.ssl.*;
+import java.security.KeyManagementException;
+import java.security.KeyStoreException;
+import java.security.NoSuchAlgorithmException;
 
-    return new RestTemplate(new HttpComponentsClientHttpRequestFactory(client));
+@Configuration
+public class InsecureSSLConfig {
+
+    @Bean("insecureRestTemplate")
+    public RestTemplate insecureRestTemplate() throws Exception {
+        return new RestTemplate(insecureRequestFactory());
+    }
+
+    private ClientHttpRequestFactory insecureRequestFactory() throws Exception {
+        return new HttpComponentsClientHttpRequestFactory(
+            HttpClients.custom()
+                .setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE)
+                .setSSLContext(createInsecureSSLContext())
+                .build()
+        );
+    }
+
+    private SSLContext createInsecureSSLContext() throws NoSuchAlgorithmException, KeyManagementException, KeyStoreException {
+        return new SSLContextBuilder()
+            .loadTrustMaterial(null, (chain, authType) -> true) // 信任所有证书
+            .build();
+    }
 }
