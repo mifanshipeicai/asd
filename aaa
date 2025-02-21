@@ -1,111 +1,12 @@
-可以通过以下方式实现一个自定义队列，用于顺序发送 HTTP 请求。你可以使用 Java 的 LinkedBlockingQueue 配合多线程，确保数据按照顺序被消费和发送。以下是完整的实现思路和代码示例：
+@Bean
+public RestTemplate insecureRestTemplate() throws Exception {
+    SSLContext sslContext = new SSLContextBuilder()
+        .loadTrustMaterial(null, (cert, authType) -> true).build();
+    
+    HttpClient client = HttpClients.custom()
+        .setSSLContext(sslContext)
+        .setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE)
+        .build();
 
-实现步骤
-	1.	定义数据队列：使用 LinkedBlockingQueue 来存储待发送的数据。
-	2.	生产者：通过一个方法，将数据添加到队列中。需要使用锁（如 ReentrantLock）来确保线程安全。
-	3.	消费者：启动一个独立线程，持续从队列中取出数据，并通过 HTTP 请求发送到目标服务。
-	4.	发送 HTTP 请求：使用 RestTemplate 或其他 HTTP 客户端（如 OkHttp 或 WebClient）。
-	5.	优雅关闭：在服务关闭时，确保消费者线程能够正确退出。
-
-代码实现
-
-import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestTemplate;
-
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.locks.ReentrantLock;
-
-@Service
-public class CustomQueueService {
-
-    private final LinkedBlockingQueue<String> queue = new LinkedBlockingQueue<>();
-    private final ReentrantLock lock = new ReentrantLock();
-    private final RestTemplate restTemplate = new RestTemplate();
-    private volatile boolean running = true;
-
-    // 初始化消费者线程
-    public CustomQueueService() {
-        startConsumer();
-    }
-
-    // 添加数据到队列
-    public void addData(String data) {
-        lock.lock();
-        try {
-            queue.offer(data); // 添加数据到队列
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    // 消费者线程
-    private void startConsumer() {
-        Thread consumerThread = new Thread(() -> {
-            while (running || !queue.isEmpty()) {
-                try {
-                    // 从队列中取出数据
-                    String data = queue.take();
-                    sendHttpRequest(data); // 发送 HTTP 请求
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
-        });
-        consumerThread.setDaemon(true); // 设置为守护线程
-        consumerThread.start();
-    }
-
-    // 发送 HTTP 请求
-    private void sendHttpRequest(String data) {
-        String targetUrl = "http://example.com/endpoint"; // 目标服务 URL
-        try {
-            // 根据需要修改请求逻辑
-            String response = restTemplate.postForObject(targetUrl, data, String.class);
-            System.out.println("发送成功: " + response);
-        } catch (Exception e) {
-            System.err.println("发送失败: " + e.getMessage());
-        }
-    }
-
-    // 停止消费者线程
-    public void stopService() {
-        running = false;
-    }
+    return new RestTemplate(new HttpComponentsClientHttpRequestFactory(client));
 }
-
-使用说明
-	1.	启动消费者线程：服务初始化时会自动启动消费者线程。
-	2.	添加数据到队列：
-
-@RestController
-@RequestMapping("/queue")
-public class QueueController {
-
-    private final CustomQueueService customQueueService;
-
-    public QueueController(CustomQueueService customQueueService) {
-        this.customQueueService = customQueueService;
-    }
-
-    @PostMapping("/add")
-    public String addToQueue(@RequestBody String data) {
-        customQueueService.addData(data);
-        return "Data added to queue";
-    }
-}
-
-
-	3.	优雅关闭：在 Spring Boot 应用停止时，调用 stopService() 方法：
-
-@PreDestroy
-public void onDestroy() {
-    customQueueService.stopService();
-}
-
-注意事项
-	•	线程安全：通过 ReentrantLock 确保数据写入的线程安全性。
-	•	队列满的处理：LinkedBlockingQueue 默认容量是 Integer.MAX_VALUE，可以在初始化时设置合理的大小。
-	•	重试机制：如果需要处理发送失败的情况，可以添加重试逻辑或将失败数据重新放回队列。
-
-这种方式可以灵活实现一个简单的自定义队列，无需依赖第三方消息队列。
