@@ -1,33 +1,38 @@
-import org.apache.http.conn.ssl.*;
-import org.apache.http.impl.client.*;
+import org.apache.http.conn.ssl.NoopHostnameVerifier;
+import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClients;
 import org.apache.http.ssl.SSLContextBuilder;
-import org.springframework.context.annotation.*;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
 import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
-import javax.net.ssl.*;
-import java.security.KeyManagementException;
-import java.security.KeyStoreException;
-import java.security.NoSuchAlgorithmException;
+import org.springframework.web.client.RestTemplate;
+
+import javax.net.ssl.SSLContext;
 
 @Configuration
-public class InsecureSSLConfig {
+public class RestTemplateConfig {
 
-    @Bean("insecureRestTemplate")
-    public RestTemplate insecureRestTemplate() throws Exception {
-        return new RestTemplate(insecureRequestFactory());
-    }
+    @Bean
+    public RestTemplate restTemplate() throws Exception {
+        // 创建SSLContext，信任所有证书
+        SSLContext sslContext = new SSLContextBuilder()
+                .loadTrustMaterial(null, (certificate, authType) -> true)
+                .build();
 
-    private ClientHttpRequestFactory insecureRequestFactory() throws Exception {
-        return new HttpComponentsClientHttpRequestFactory(
-            HttpClients.custom()
-                .setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE)
-                .setSSLContext(createInsecureSSLContext())
-                .build()
-        );
-    }
+        // 配置不验证主机名
+        SSLConnectionSocketFactory socketFactory = 
+            new SSLConnectionSocketFactory(sslContext, NoopHostnameVerifier.INSTANCE);
 
-    private SSLContext createInsecureSSLContext() throws NoSuchAlgorithmException, KeyManagementException, KeyStoreException {
-        return new SSLContextBuilder()
-            .loadTrustMaterial(null, (chain, authType) -> true) // 信任所有证书
-            .build();
+        // 创建自定义HttpClient
+        CloseableHttpClient httpClient = HttpClients.custom()
+                .setSSLSocketFactory(socketFactory)
+                .build();
+
+        // 将HttpClient设置到RestTemplate
+        HttpComponentsClientHttpRequestFactory factory =
+            new HttpComponentsClientHttpRequestFactory(httpClient);
+
+        return new RestTemplate(factory);
     }
 }
