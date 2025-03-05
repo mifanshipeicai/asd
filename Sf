@@ -1,0 +1,37 @@
+@Configuration
+public class SftpConfig {
+
+    @Value("${sftp.host}")
+    private String host;
+
+    @Value("${sftp.port}")
+    private int port;
+
+    @Value("${sftp.username}")
+    private String username;
+
+    @Value("${sftp.password}")
+    private String password;
+
+    @Value("${sftp.timeout}")
+    private int timeout;
+
+    @Bean
+    public Session sftpSession() throws JSchException {
+        JSch jsch = new JSch();
+        Session session = jsch.getSession(username, host, port);
+        session.setPassword(password);
+        session.setConfig("StrictHostKeyChecking", "no");
+        session.setTimeout(timeout);
+        session.connect();
+        return session;
+    }
+
+    @Bean
+    @Scope("prototype")
+    public ChannelSftp sftpChannel(Session session) throws JSchException {
+        ChannelSftp channel = (ChannelSftp) session.openChannel("sftp");
+        channel.connect();
+        return channel;
+    }
+}
