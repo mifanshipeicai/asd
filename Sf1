@@ -1,0 +1,41 @@
+@Component
+public class SftpDownloader {
+
+    private final Session session;
+    private final String rootPath;
+
+    @Autowired
+    public SftpDownloader(Session session, @Value("${sftp.root-path}") String rootPath) {
+        this.session = session;
+        this.rootPath = rootPath;
+    }
+
+    public byte[] downloadFile(String remoteFilePath) throws IOException, JSchException, SftpException {
+        ChannelSftp channel = null;
+        try (ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
+            channel = (ChannelSftp) session.openChannel("sftp");
+            channel.connect();
+            channel.cd(rootPath);
+            channel.get(remoteFilePath, outputStream);
+            return outputStream.toByteArray();
+        } finally {
+            if (channel != null && channel.isConnected()) {
+                channel.disconnect();
+            }
+        }
+    }
+
+    public void downloadToLocal(String remoteFilePath, String localFilePath) throws JSchException, SftpException, IOException {
+        ChannelSftp channel = null;
+        try {
+            channel = (ChannelSftp) session.openChannel("sftp");
+            channel.connect();
+            channel.cd(rootPath);
+            channel.get(remoteFilePath, localFilePath);
+        } finally {
+            if (channel != null && channel.isConnected()) {
+                channel.disconnect();
+            }
+        }
+    }
+}
