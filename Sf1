@@ -59,10 +59,58 @@ public class DeleteDirectory {
             deleteDirectory(dir);
             System.out.println("目录已成功删除！");
         } catch (IOException e) {
-            System.err.println("错误: " + e.getMessage());
-        }
+            System.err.println("错误: " + e.import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import java.io.IOException;
+import java.nio.file.*;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class DeleteDirectoryTest {
+
+    @Test
+    void testDeleteNonEmptyDirectory(@TempDir Path tempDir) throws IOException {
+        // 创建测试目录结构
+        Path subDir = Files.createDirectory(tempDir.resolve("subdir"));
+        Files.write(tempDir.resolve("file1.txt"), "test".getBytes());
+        Files.write(subDir.resolve("file2.txt"), "test".getBytes());
+
+        // 执行删除
+        DeleteDirectory.deleteDirectory(tempDir);
+
+        // 验证目录已删除
+        assertFalse(Files.exists(tempDir), "目录应被成功删除");
+    }
+
+    @Test
+    void testDeleteEmptyDirectory(@TempDir Path tempDir) throws IOException {
+        DeleteDirectory.deleteDirectory(tempDir);
+        assertFalse(Files.exists(tempDir), "空目录应被删除");
+    }
+
+    @Test
+    void testDeleteNonExistentDirectory() {
+        Path nonExistentDir = Paths.get("non_existent_directory");
+        
+        // 验证不会抛出异常
+        assertDoesNotThrow(() -> DeleteDirectory.deleteDirectory(nonExistentDir));
+    }
+
+    @Test
+    void testDeleteReadOnlyFile(@TempDir Path tempDir) throws IOException {
+        Path readOnlyFile = Files.createFile(tempDir.resolve("readonly.txt"));
+        readOnlyFile.toFile().setReadOnly(); // 设置文件为只读
+
+        // 执行删除（可能需要处理权限问题）
+        assertThrows(IOException.class, () -> DeleteDirectory.deleteDirectory(tempDir));
+
+        // 清理（确保测试后恢复权限）
+        readOnlyFile.toFile().setWritable(true);
     }
 }
+
+
+
 
 
 
