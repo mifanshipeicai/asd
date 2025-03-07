@@ -34,8 +34,35 @@ public class SftpDownloader {
             channel.get(remoteFilePath, localFilePath);
         } finally {
             if (channel != null && channel.isConnected()) {
-                channel.disconnect();
-            }
+                channel.import java.io.IOException;
+import java.nio.file.*;
+import java.util.Comparator;
+
+public class DeleteDirectory {
+    public static void deleteDirectory(Path path) throws IOException {
+        if (Files.exists(path)) {
+            Files.walk(path)
+                .sorted(Comparator.reverseOrder())
+                .forEach(file -> {
+                    try {
+                        Files.delete(file);
+                    } catch (IOException e) {
+                        System.err.println("删除失败: " + file + " - " + e.getMessage());
+                    }
+                });
+        }
+    }
+
+    public static void main(String[] args) {
+        Path dir = Paths.get("要删除的目录路径");
+        try {
+            deleteDirectory(dir);
+            System.out.println("目录已成功删除！");
+        } catch (IOException e) {
+            System.err.println("错误: " + e.getMessage());
         }
     }
 }
+
+
+
