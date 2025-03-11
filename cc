@@ -1,138 +1,80 @@
-下面是基于 Ant Design 的实现方案，完成你的需求：
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 
-实现思路
+import java.nio.file.Path;
+import java.nio.file.Paths;
 
-	1.	使用 Ant Design 的 <Table> 组件来展示表格数据。
-	2.	定义表格的 columns 和 dataSource。
-	3.	在表格加载时，向后端接口发送请求，更新每行的状态。
-	4.	动态修改状态列的数据。
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.mockito.Mockito.*;
 
-示例代码
+@ExtendWith(MockitoExtension.class)
+public class S3UtilsTest {
 
-import React, { useState, useEffect } from "react";
-import { Table, Tag, Button } from "antd";
-import axios from "axios";
+    @Mock
+    private S3Client mockS3Client;
 
-const Dashboard = () => {
-  // 定义表格数据
-  const [dataSource, setDataSource] = useState([
-    { key: 1, apiName: "API 1", endpoint: "/api/endpoint1", status: "Pending" },
-    { key: 2, apiName: "API 2", endpoint: "/api/endpoint2", status: "Pending" },
-    { key: 3, apiName: "API 3", endpoint: "/api/endpoint3", status: "Pending" },
-  ]);
+    @InjectMocks
+    private S3Utils s3Utils;
 
-  // 定义表格列
-  const columns = [
-    {
-      title: "API Name",
-      dataIndex: "apiName",
-      key: "apiName",
-    },
-    {
-      title: "Endpoint",
-      dataIndex: "endpoint",
-      key: "endpoint",
-    },
-    {
-      title: "Status",
-      dataIndex: "status",
-      key: "status",
-      render: (status) => {
-        let color = "blue";
-        if (status === "Success") color = "green";
-        if (status === "Failed") color = "red";
-        return <Tag color={color}>{status}</Tag>;
-      },
-    },
-    {
-      title: "Action",
-      key: "action",
-      render: (_, record) => (
-        <Button type="primary" onClick={() => handleCheckStatus(record)}>
-          Check Status
-        </Button>
-      ),
-    },
-  ];
-
-  // 检查单个API的状态
-  const handleCheckStatus = async (record) => {
-    try {
-      const response = await axios.get(record.endpoint);
-      updateRowStatus(record.key, "Success");
-    } catch (error) {
-      updateRowStatus(record.key, "Failed");
+    @BeforeEach
+    void setUp() {
+        // 如果需要在测试前做一些初始化，可以放在这里
     }
-  };
 
-  // 批量请求所有API的状态
-  const fetchAllStatus = async () => {
-    const updatedData = await Promise.all(
-      dataSource.map(async (row) => {
-        try {
-          await axios.get(row.endpoint);
-          return { ...row, status: "Success" };
-        } catch (error) {
-          return { ...row, status: "Failed" };
-        }
-      })
-    );
-    setDataSource(updatedData);
-  };
+    @Test
+    void testUploadFileToS3() {
+        // 准备参数
+        String bucketName = "test-bucket";
+        String key = "test-key";
+        Path filePath = Paths.get("test-file.txt");
 
-  // 更新行状态
-  const updateRowStatus = (key, status) => {
-    setDataSource((prevData) =>
-      prevData.map((row) =>
-        row.key === key ? { ...row, status } : row
-      )
-    );
-  };
+        // 调用被测试的方法
+        s3Utils.uploadFileToS3(mockS3Client, bucketName, key, filePath);
 
-  // 页面加载时请求所有状态
-  useEffect(() => {
-    fetchAllStatus();
-  }, []);
+        // 使用 ArgumentCaptor 捕获调用 putObject 时传入的参数
+        ArgumentCaptor<PutObjectRequest> requestCaptor = ArgumentCaptor.forClass(PutObjectRequest.class);
+        ArgumentCaptor<Path> pathCaptor = ArgumentCaptor.forClass(Path.class);
 
-  return (
-    <div>
-      <h1>API Status Dashboard</h1>
-      <Table dataSource={dataSource} columns={columns} bordered />
-    </div>
-  );
-};
+        // 验证 mockS3Client.putObject(...) 是否被正确调用了一次
+        verify(mockS3Client, times(1)).putObject(requestCaptor.capture(), pathCaptor.capture());
 
-export default Dashboard;
+        // 断言传入的请求参数是否正确
+        PutObjectRequest capturedRequest = requestCaptor.getValue();
+        Path capturedPath = pathCaptor.getValue();
 
-关键点说明
+        assertEquals(bucketName, capturedRequest.bucket());
+        assertEquals(key, capturedRequest.key());
+        assertEquals(filePath, capturedPath);
+    }
 
-	1.	Ant Design 表格结构：
-	•	dataSource 是表格的数据源。
-	•	columns 定义表格的列，render 可以自定义单元格内容。
-	2.	动态状态更新：
-	•	handleCheckStatus 用于单个接口的状态更新。
-	•	fetchAllStatus 用于批量更新所有接口状态。
-	3.	Tag 的动态颜色：
-	•	根据状态动态渲染不同颜色的标签。
-	4.	异步接口请求：
-	•	使用 axios 请求接口，接口调用成功则返回 Success，失败则返回 Failed。
-	5.	重新渲染表格：
-	•	使用 setDataSource 更新数据源，从而触发表格的重新渲染。
+    @Test
+    void testGetClient_FirstTimeShouldCreate() {
+        // 先断言一下 s3Client 静态变量是否为 null（如果你愿意，可以用反射或者单独启动一个新进程来断言；不过这里仅示例）
+        // 调用 getClient
+        S3Client client = s3Utils.getClient("http://localhost:9000", "accessKey", "secretKey", "us-east-1");
 
-可选优化
+        // 验证返回的 client 不为 null
+        // （这里我们没有对 builder 进行 mock，因为 getClient 内部直接 new 出了一个真实的 S3Client。
+        //  如果想“真正”测试 builder 逻辑，需要在代码中对 S3Client.builder() 做进一步抽象或使用 PowerMockito 等手段。）
+        assertEquals(client, s3Utils.getClient("http://localhost:9000", "accessKey", "secretKey", "us-east-1"),
+                "第二次调用应该返回同一个静态实例");
+    }
 
-	1.	轮询刷新：
-如果需要定期检查状态，可以使用 setInterval 实现轮询更新。
+    @Test
+    void testGetClient_SubsequentCallsShouldReturnSameInstance() {
+        // 第一次调用
+        S3Client client1 = s3Utils.getClient("http://endpoint1", "ak1", "sk1", "us-east-1");
+        // 第二次调用，参数不同，但因为静态变量已经被赋值，所以应返回同一个实例
+        S3Client client2 = s3Utils.getClient("http://endpoint2", "ak2", "sk2", "us-west-2");
 
-useEffect(() => {
-  const interval = setInterval(fetchAllStatus, 5000); // 每5秒刷新
-  return () => clearInterval(interval);
-}, []);
-
-
-	2.	Loading 状态：
-	•	可以为每个请求添加 loading 状态，使用 <Spin> 或 Button 的 loading 属性。
-	3.	错误处理：
-	•	提供用户可视化的错误信息，结合 Ant Design 的 message 或 notification 组件。
-
-如果需要更多功能扩展或进一步优化，可以随时讨论！
+        // 断言是同一个实例
+        assertEquals(client1, client2);
+    }
+}
