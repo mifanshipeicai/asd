@@ -1,36 +1,83 @@
-@Data
-@Accessors(chain = true)
-@ApiModel("通用响应体")
-public class Result<T> implements Serializable {
-    @ApiModelProperty(value = "状态码", example = "200")
-    private Integer code;
-    
-    @ApiModelProperty(value = "业务消息", example = "操作成功")
-    private String message;
-    
-    @ApiModelProperty("业务数据负载")
-    private T data;
-    
-    @ApiModelProperty(value = "响应时间戳", example = "2025-02-14T08:30:45.123Z")
-    private LocalDateTime timestamp;
-    
-    @ApiModelProperty(value = "请求路径", example = "/api/v1/users")
-    private String path;
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
 
-    // 成功构造器
-    public static <T> Result<T> success(T data) {
-        return new Result<T>()
-                .setCode(HttpStatus.OK.value())
-                .setMessage("Success")
-                .setData(data)
-                .setTimestamp(LocalDateTime.now());
+import java.net.URI;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
+import org.mockito.junit.jupiter.MockitoExtension;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.S3ClientBuilder;
+
+@ExtendWith(MockitoExtension.class)
+public class S3ClientFactoryTest {
+
+    private S3ClientFactory factory;
+
+    // 假设原方法在 S3ClientFactory 类中
+    @BeforeEach
+    void setUp() throws Exception {
+        factory = new S3ClientFactory();
+        // 通过反射重置 s3Client 为 null
+        resetSingleton();
     }
 
-    // 错误构造器
-    public static Result<?> error(int code, String msg) {
-        return new Result<>()
-                .setCode(code)
-                .setMessage(msg)
-                .setTimestamp(LocalDateTime.now());
+    private void resetSingleton() throws Exception {
+        Field field = S3ClientFactory.class.getDeclaredField("s3Client");
+        field.setAccessible(true);
+        field.set(factory, null);
+    }
+
+    @Test
+    void testGetClient_FirstCall_CreatesNewClient() {
+        try (MockedStatic<S3Client> mockedS3Client = Mockito.mockStatic(S3Client.class)) {
+            // Mock S3Client 构建器
+            S3ClientBuilder builderMock = mock(S3ClientBuilder.class);
+            S3Client clientMock = mock(S3Client.class);
+
+            mockedS3Client.when(S3Client::builder).thenReturn(builderMock);
+            when(builderMock.endpointOverride(any(URI.class)).thenReturn(builderMock);
+            when(builderMock.credentialsProvider(any(StaticCredentialsProvider.class))).thenReturn(builderMock);
+            when(builderMock.region(any(Region.class))).thenReturn(builderMock);
+            when(builderMock.build()).thenReturn(clientMock);
+
+            // 调用方法
+            S3Client result = factory.getClient(
+                "http://example.com",
+                "accessKey",
+                "secretKey",
+                "us-east-1"
+            );
+
+            // 验证结果
+            assertNotNull(result);
+            assertEquals(clientMock, result);
+
+            // 验证构建器调用
+            mockedS3Client.verify(S3Client::builder);
+            verify(builderMock).endpointOverride(URI.create("http://example.com"));
+            verify(builderMock).credentialsProvider(
+                StaticCredentialsProvider.create(
+                    AwsBasicCredentials.create("accessKey", "secretKey")
+                )
+            );
+            verify(builderMock).region(Region.of("us-east-1"));
+            verify(builderMock).build();
+        }
+    }
+
+    @Test
+    void testGetClient_SecondCall_ReturnsSameInstance() {
+        // 首次调用创建实例
+        S3Client firstInstance = factory.getClient("ep1", "key1", "secret1", "region1");
+        // 第二次调用，返回同一实例
+        S3Client secondInstance = factory.getClient("ep2", "key2", "secret2", "region2");
+        assertSame(firstInstance, secondInstance);
     }
 }
