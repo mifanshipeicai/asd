@@ -1,38 +1,186 @@
-import org.apache.http.conn.ssl.NoopHostnameVerifier;
-import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
-import org.apache.http.impl.client.CloseableHttpClient;
-import org.apache.http.impl.client.HttpClients;
-import org.apache.http.ssl.SSLContextBuilder;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
-import org.springframework.web.client.RestTemplate;
+如果文件存储在 S3 对象存储中，可以通过 **流式拉取 S3 对象 + 流式传输到第三方接口** 实现零内存驻留（或极小内存占用）。以下是完整解决方案：
 
-import javax.net.ssl.SSLContext;
+---
 
-@Configuration
-public class RestTemplateConfig {
+### **1. 使用 AWS SDK 流式读取 S3 文件**
+**关键点**：直接获取 S3 对象的 `InputStream`，避免下载到本地或内存。
 
-    @Bean
-    public RestTemplate restTemplate() throws Exception {
-        // 创建SSLContext，信任所有证书
-        SSLContext sslContext = new SSLContextBuilder()
-                .loadTrustMaterial(null, (certificate, authType) -> true)
-                .build();
+```java
+import software.amazon.awssdk.core.sync.ResponseTransformer;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 
-        // 配置不验证主机名
-        SSLConnectionSocketFactory socketFactory = 
-            new SSLConnectionSocketFactory(sslContext, NoopHostnameVerifier.INSTANCE);
+public InputStream getS3ObjectStream(String bucket, String key) {
+    S3Client s3Client = S3Client.create(); // 确保复用 S3Client
+    GetObjectRequest request = GetObjectRequest.builder()
+            .bucket(bucket)
+            .key(key)
+            .build();
+    return s3Client.getObject(request, ResponseTransformer.toInputStream());
+}
+```
 
-        // 创建自定义HttpClient
-        CloseableHttpClient httpClient = HttpClients.custom()
-                .setSSLSocketFactory(socketFactory)
-                .build();
+---
 
-        // 将HttpClient设置到RestTemplate
-        HttpComponentsClientHttpRequestFactory factory =
-            new HttpComponentsClientHttpRequestFactory(httpClient);
+### **2. 流式传输到第三方接口（使用 WebClient）**
+**关键点**：将 S3 的 `InputStream` 直接作为 HTTP 请求体流式传输。
 
-        return new RestTemplate(factory);
+```java
+import org.springframework.core.io.InputStreamResource;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Mono;
+
+public Mono<Void> streamToThirdParty(InputStream inputStream) {
+    return WebClient.create()
+        .post()
+        .uri("https://third-party-api/upload")
+        .body(BodyInserters.fromResource(new InputStreamResource(inputStream)))
+        .retrieve()
+        .bodyToMono(Void.class)
+        .doFinally(signal -> {
+            try {
+                inputStream.close(); // 手动关闭流
+            } catch (IOException e) {
+                // 日志处理
+            }
+        });
+}
+```
+
+---
+
+### **3. 整合流程（逐文件处理）**
+```java
+public void processS3File(String bucket, String key) {
+    try (InputStream s3Stream = getS3ObjectStream(bucket, key)) {
+        streamToThirdParty(s3Stream).block(); // 同步阻塞（异步方案见下文）
+    } catch (IOException e) {
+        // 异常处理
     }
 }
+```
+
+---
+
+### **4. 进阶优化方案**
+
+#### **4.1 异步非阻塞处理**
+使用 Reactor 实现全链路非阻塞：
+```java
+public Mono<Void> processS3FileAsync(String bucket, String key) {
+    return Mono.fromSupplier(() -> getS3ObjectStream(bucket, key))
+        .flatMap(inputStream -> 
+            streamToThirdParty(inputStream)
+                .doOnTerminate(() -> {
+                    try {
+                        inputStream.close();
+                    } catch (IOException e) {
+                        // 日志处理
+                    }
+                })
+        );
+}
+```
+
+#### **4.2 并发控制（信号量限流）**
+限制同时处理的文件数：
+```java
+private final Scheduler scheduler = Schedulers.newBoundedElastic(
+    4,          // 最大并发数
+    100,        // 队列容量
+    "s3-pool"
+);
+
+public void processAllFiles(List<String> s3Keys) {
+    Flux.fromIterable(s3Keys)
+        .flatMap(key -> 
+            processS3FileAsync("my-bucket", key)
+                .subscribeOn(scheduler),
+            4 // 并发度
+        )
+        .blockLast();
+}
+```
+
+#### **4.3 分块传输编码（Chunked Transfer）**
+如果第三方接口支持分块传输：
+```java
+// 在 WebClient 请求头中明确启用分块
+.body(BodyInserters.fromResource(new InputStreamResource(inputStream)))
+.header(HttpHeaders.TRANSFER_ENCODING, "chunked")
+```
+
+#### **4.4 内存监控**
+在 `application.properties` 中限制 WebClient 内存缓冲：
+```properties
+spring.codec.max-in-memory-size=1MB  # 强制使用流式，避免缓冲
+```
+
+---
+
+### **5. 关键注意事项**
+
+1. **资源泄漏防护**：
+   - 确保所有 `InputStream` 在传输结束后关闭。
+   - 使用 `try-with-resources` 或 Reactor 的 `doOnTerminate`/`doFinally` 钩子。
+
+2. **S3 客户端复用**：
+   - 复用 `S3Client` 实例（避免每次创建新客户端）。
+
+3. **超时与重试**：
+   ```java
+   .retrieve()
+   .bodyToMono(Void.class)
+   .timeout(Duration.ofMinutes(10))  // 设置超时
+   .retry(3)                        // 重试机制
+   ```
+
+4. **大文件冷存储优化**：
+   - 如果文件在 S3 Glacier 等冷存储中，确保先触发解冻再读取。
+
+---
+
+### **6. 完整工作流示例**
+```java
+public void processAllS3Files() {
+    List<String> s3Keys = List.of("file1.txt", "file2.txt", "file3.txt");
+
+    Flux.fromIterable(s3Keys)
+        .parallel(4) // 并行度
+        .runOn(Schedulers.boundedElastic())
+        .flatMap(key -> 
+            Mono.fromCallable(() -> getS3ObjectStream("my-bucket", key))
+                .flatMap(inputStream ->
+                    WebClient.create()
+                        .post()
+                        .uri("https://third-party-api/upload")
+                        .body(BodyInserters.fromResource(new InputStreamResource(inputStream)))
+                        .retrieve()
+                        .bodyToMono(Void.class)
+                        .doFinally(s -> closeStream(inputStream))
+                )
+                .retry(3)
+                .onErrorResume(e -> {
+                    log.error("Failed to process {}", key, e);
+                    return Mono.empty();
+                })
+        )
+        .sequential()
+        .blockLast();
+}
+
+private void closeStream(InputStream is) {
+    try {
+        is.close();
+    } catch (IOException e) {
+        // 日志处理
+    }
+}
+```
+
+---
+
+通过以上方案，可以实现：
+1. **零内存峰值**：数据从 S3 到第三方接口全程流式传输。
+2. **可控并发**：通过线程池或 Reactor 调度器限制资源使用。
+3. **高可靠性**：超时、重试、资源关闭等防护机制。
