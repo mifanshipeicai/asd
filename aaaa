@@ -1,148 +1,89 @@
-针对 S3Service 进行单元测试，可以使用 JUnit 5 和 Mockito 进行依赖注入和方法模拟。
+在Spring Boot中处理大文件时出现OOM问题，通常是由于内存中一次性加载过多数据导致的。以下是分步解决方案：
 
-1. 添加测试依赖
+---
 
-在 pom.xml 中加入 JUnit 5 和 Mockito 依赖：
+### **1. 流式处理（避免内存驻留）**
+**问题**：一次性读取整个文件到内存会导致内存峰值。  
+**解决**：使用`InputStream`逐块读取文件，边读边传输。
 
-<dependency>
-    <groupId>org.junit.jupiter</groupId>
-    <artifactId>junit-jupiter-api</artifactId>
-    <scope>test</scope>
-</dependency>
-
-<dependency>
-    <groupId>org.junit.jupiter</groupId>
-    <artifactId>junit-jupiter-engine</artifactId>
-    <scope>test</scope>
-</dependency>
-
-<dependency>
-    <groupId>org.mockito</groupId>
-    <artifactId>mockito-core</artifactId>
-    <scope>test</scope>
-</dependency>
-
-2. 测试 listFiles 方法
-	•	使用 Mockito 模拟 AmazonS3 的 listObjects 方法
-	•	模拟返回多个 S3 文件对象
-
-S3ServiceTest.java
-
-import com.amazonaws.services.s3.AmazonS3;
-import com.amazonaws.services.s3.model.ObjectListing;
-import com.amazonaws.services.s3.model.S3ObjectSummary;
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
-import org.mockito.Mock;
-import org.mockito.MockitoAnnotations;
-
-import java.util.List;
-
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.mockito.Mockito.*;
-
-class S3ServiceTest {
-
-    @Mock
-    private AmazonS3 amazonS3;
-
-    private S3Service s3Service;
-
-    @BeforeEach
-    void setUp() {
-        MockitoAnnotations.openMocks(this);
-        s3Service = new S3Service(amazonS3);
-    }
-
-    @Test
-    void testListFiles() {
-        // 模拟 S3 返回文件列表
-        ObjectListing mockListing = mock(ObjectListing.class);
-        S3ObjectSummary file1 = new S3ObjectSummary();
-        file1.setKey("folder/file1.txt");
-
-        S3ObjectSummary file2 = new S3ObjectSummary();
-        file2.setKey("folder/file2.txt");
-
-        when(amazonS3.listObjects("test-bucket", "folder/")).thenReturn(mockListing);
-        when(mockListing.getObjectSummaries()).thenReturn(List.of(file1, file2));
-
-        // 调用方法
-        List<String> files = s3Service.listFiles("test-bucket", "folder/");
-
-        // 断言结果
-        assertEquals(2, files.size());
-        assertEquals("folder/file1.txt", files.get(0));
-        assertEquals("folder/file2.txt", files.get(1));
-
-        // 验证方法被调用
-        verify(amazonS3, times(1)).listObjects("test-bucket", "folder/");
+```java
+public void processFile(File file) {
+    try (InputStream is = new FileInputStream(file)) {
+        byte[] buffer = new byte[4096]; // 4KB缓冲区
+        int bytesRead;
+        while ((bytesRead = is.read(buffer)) != -1) {
+            sendChunkToApi(buffer, bytesRead); // 分块发送
+        }
+    } catch (IOException e) {
+        e.printStackTrace();
     }
 }
+```
 
-3. 测试 readFile 方法
-	•	使用 Mockito 模拟 getObject 方法
-	•	模拟返回一个 InputStream
-	•	验证是否正确读取字节数据
+---
 
-代码：
+### **2. 使用非阻塞、流式HTTP客户端**
+**问题**：传统HTTP客户端（如`RestTemplate`）可能缓冲整个请求体。  
+**解决**：使用Spring WebClient支持流式传输。
 
-import com.amazonaws.services.s3.model.S3Object;
-import com.amazonaws.services.s3.model.S3ObjectInputStream;
-import org.junit.jupiter.api.Test;
-import org.mockito.Mockito;
-
-import java.io.ByteArrayInputStream;
-import java.io.IOException;
-import java.io.InputStream;
-
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
-import static org.mockito.Mockito.*;
-
-class S3ServiceReadFileTest {
-
-    @Test
-    void testReadFile() throws IOException {
-        // 模拟 AmazonS3
-        AmazonS3 mockS3 = mock(AmazonS3.class);
-        S3Service s3Service = new S3Service(mockS3);
-
-        // 模拟 S3Object 返回的 InputStream
-        String fileContent = "Hello, S3!";
-        InputStream inputStream = new ByteArrayInputStream(fileContent.getBytes());
-        S3Object s3Object = mock(S3Object.class);
-        S3ObjectInputStream s3ObjectInputStream = new S3ObjectInputStream(inputStream, null);
-
-        when(mockS3.getObject("test-bucket", "folder/test.txt")).thenReturn(s3Object);
-        when(s3Object.getObjectContent()).thenReturn(s3ObjectInputStream);
-
-        // 执行方法
-        byte[] result = s3Service.readFile("test-bucket", "folder/test.txt");
-
-        // 断言结果
-        assertArrayEquals(fileContent.getBytes(), result);
-
-        // 验证 getObject 方法是否被调用
-        verify(mockS3, times(1)).getObject("test-bucket", "folder/test.txt");
-    }
+```java
+public Mono<Void> uploadFileStream(File file) {
+    return WebClient.create()
+        .post()
+        .uri("https://third-party-api/data")
+        .body(BodyInserters.fromResource(new FileSystemResource(file)))
+        .retrieve()
+        .bodyToMono(Void.class);
 }
+```
 
-4. 运行测试
+---
 
-如果你使用 Maven 作为构建工具，可以运行：
+### **3. 控制并发处理数**
+**问题**：同时处理多个大文件会导致内存叠加。  
+**解决**：使用线程池限制并发数。
 
-mvn test
+```java
+private ExecutorService executor = Executors.newFixedThreadPool(4); // 最大4个并发
 
-或者如果使用 IDEA，可以直接运行 S3ServiceTest.java。
+public void processAllFiles(List<File> files) {
+    files.forEach(file -> 
+        executor.submit(() -> processFile(file))
+    );
+}
+```
 
-5. 总结
+---
 
-✅ 测试 listFiles 方法：
-	•	通过 Mockito 模拟 S3 返回的 ObjectListing
-	•	断言文件列表是否正确
+### **4. 优化第三方接口调用**
+**建议**：
+- 如果第三方支持分块上传（如断点续传），按协议分块发送。
+- 检查接口是否支持压缩（如gzip），减少传输体积。
 
-✅ 测试 readFile 方法：
-	•	通过 Mockito 模拟 getObject
-	•	断言返回的字节数组内容
+---
 
-这样就完成了 S3Service 的单元测试，确保核心逻辑可以正常运行！
+### **5. 监控和调试**
+- **启用GC日志**：观察内存回收情况。
+  ```bash
+  java -jar -XX:+PrintGCDetails -XX:+PrintGCDateStamps your-app.jar
+  ```
+- **分析堆内存**：使用工具（如VisualVM、Eclipse MAT）查找内存泄漏。
+
+---
+
+### **6. JVM调优（辅助手段）**
+适当增加堆内存（但非根本解决）：
+```bash
+java -jar -Xms512m -Xmx2g your-app.jar
+```
+
+---
+
+### **总结方案**
+1. **流式读取文件**：分块处理，避免全量加载。
+2. **流式HTTP传输**：使用WebClient或OkHttp发送流式请求。
+3. **限制并发数**：通过线程池或信号量控制并行任务。
+4. **资源管理**：确保所有`InputStream`和响应体被正确关闭。
+5. **第三方适配**：尽量利用分块传输、压缩等特性。
+
+通过以上步骤，能显著降低内存占用，避免OOM问题。
