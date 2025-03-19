@@ -1,391 +1,232 @@
-在设计全面的错误处理机制时，需要覆盖从请求入口到数据持久化的全链路错误处理，以下是一个系统化的设计框架和实现方案：
+嗯，用户问的是如何用Python读取两个Avro文件并合并成一个。我需要先回想一下Avro的处理流程。Avro文件通常包含特定的模式，所以合并的时候需要确保两个文件的模式是一致的，否则可能会出问题。那首先，我需要用Python中的avro库来读取这两个文件，对吧？或者有没有其他更常用的库呢？比如fastavro可能更高效一些？
 
----
+首先，用户可能需要安装相关的库。常用的库是fastavro，因为它处理Avro文件比较快。所以第一步可能是安装fastavro，使用pip install fastavro。然后，我需要写代码读取两个Avro文件。
 
-### 一、错误处理分层架构
-```
-┌─────────────────────────────┐
-│       全局统一异常处理       │  ← 处理未捕获的全局异常
-├─────────────────────────────┤
-│      业务逻辑层异常处理      │  ← 处理业务规则校验异常
-├─────────────────────────────┤
-│  数据访问层异常转换处理      │  ← 转换数据库/缓存异常
-├─────────────────────────────┤
-│  WebFlux框架级错误处理       │  ← 处理路由/参数绑定异常
-├─────────────────────────────┤
-│  Reactive流错误传播机制      │  ← 处理响应式流中的错误
-└─────────────────────────────┘
-```
+读取Avro文件的时候，通常需要先打开文件，然后用fastavro的reader来读取数据。这时候要注意，每个Avro文件都有它自己的模式。虽然用户可能假设两个文件的模式是相同的，但作为开发者应该检查一下模式是否兼容。如果模式不同，合并的时候可能会报错，或者需要处理模式冲突的问题。不过用户的问题可能假设两个文件的模式是相同的，所以可能暂时不需要处理这种情况，但最好在代码里做个检查。
 
----
+接下来，合并两个Avro文件其实就是将两个文件中的记录（records）合并到一个新的Avro文件中。这时候，需要确定新文件的模式。通常应该使用其中一个文件的模式作为新文件的模式，或者确保两者的模式是相同的。所以在读取两个文件的时候，需要先获取它们的模式，然后比较是否一致，如果不一致可能需要处理，否则继续。
 
-### 二、核心组件设计
+然后，合并的记录可以写入到新的Avro文件中。写入的时候需要使用相同的模式，或者兼容的模式。整个流程大概是这样的：
 
-#### 1. 统一错误响应格式
-```java
-public record ErrorResponse(
-    String traceId,       // 请求唯一标识
-    Instant timestamp,    // 错误发生时间
-    String code,          // 业务错误码
-    String message,       // 用户友好提示
-    String detail,        // 技术细节（开发环境可见）
-    List<FieldError> errors // 字段校验错误
-) {
-    public record FieldError(String field, String message) {}
-}
-```
+1. 读取第一个Avro文件，获取模式和数据记录。
 
-#### 2. 全局异常处理器
-```java
-@ControllerAdvice
-public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHandler {
+2. 读取第二个Avro文件，获取模式和数据记录。
 
-    private static final ErrorAttributeOptions ERROR_ATTRIBUTE_OPTIONS = 
-        ErrorAttributeOptions.of(ErrorAttributeOptions.Include.MESSAGE, 
-                                ErrorAttributeOptions.Include.EXCEPTION);
+3. 检查两个模式是否一致，如果不一致，可能需要报错或者处理差异。
 
-    @Override
-    public RouterFunction<ServerResponse> getRoutingFunction(ErrorAttributes errorAttributes) {
-        return RouterFunctions.route(RequestPredicates.all(), this::renderErrorResponse);
-    }
+4. 合并两个数据记录列表。
 
-    private Mono<ServerResponse> renderErrorResponse(ServerRequest request) {
-        Map<String, Object> errorProperties = getErrorAttributes(request, ERROR_ATTRIBUTE_OPTIONS);
-        
-        return ServerResponse.status(getHttpStatus(errorProperties))
-            .contentType(MediaType.APPLICATION_JSON)
-            .body(BodyInserters.fromValue(
-                new ErrorResponse(
-                    (String)errorProperties.get("requestId"),
-                    Instant.now(),
-                    resolveErrorCode(errorProperties.get("error")),
-                    (String)errorProperties.get("message"),
-                    (String)errorProperties.get("trace"),
-                    resolveFieldErrors(errorProperties)
-                )
-            ));
-    }
+5. 将合并后的数据写入到新的Avro文件中，使用其中一个模式。
 
-    private HttpStatus getHttpStatus(Map<String, Object> errorProperties) {
-        return Optional.ofNullable(errorProperties.get("status"))
-            .map(status -> HttpStatus.valueOf((Integer)status))
-            .orElse(HttpStatus.INTERNAL_SERVER_ERROR);
-    }
-}
-```
+现在具体到代码的话，用fastavro怎么做呢？读取第一个文件的代码大概是这样的：
 
-#### 3. 业务异常体系
-```java
-// 基础业务异常
-public abstract class BusinessException extends RuntimeException {
-    private final ErrorCode errorCode;
+from fastavro import reader, writer
+
+with open('file1.avro', 'rb') as f1:
+avro_reader1 = reader(f1)
+schema1 = avro_reader1.writer_schema
+records1 = [record for record in avro_reader1]
+
+同样地读取第二个文件，得到schema2和records2。
+
+然后比较schema1和schema2是否相同。如果不同的话，可能需要抛出异常或者处理。这里需要用到模式比较的方法。不过，如何比较两个Avro模式是否相同呢？可能需要将它们转换为字典，然后进行比较，或者使用fastavro提供的工具。比如，可以使用json.dumps(schema1) == json.dumps(schema2)，不过这可能不够准确，因为字段顺序不同可能不影响模式兼容性。不过在这种情况下，用户可能希望两个模式完全一致，所以直接比较可能可以。
+
+假设模式一致的话，合并记录就很简单，records = records1 + records2。
+
+然后写入到新的文件：
+
+with open('merged.avro', 'wb') as out_file:
+writer(out_file, schema1, records)
+
+这样应该就可以了。不过需要注意，可能还有其他细节，比如Avro文件的块（blocks）处理。因为fastavro的reader会处理块，所以直接读取所有记录应该是没问题的。而写入的时候，writer会自动处理块的大小，所以不需要特别设置。
+
+那有没有可能用户的两个文件模式不同？这时候合并可能会有问题。所以在代码中应该加入模式检查，并提示用户。
+
+另外，可能要考虑内存问题，如果文件很大，直接读取全部记录可能占用太多内存。这时候可以考虑流式处理，逐条读取并写入。但对于这个问题，用户可能处理的是小文件，所以直接全部读取应该没问题。
+
+总结一下步骤：
+
+1. 安装fastavro库。
+
+2. 读取两个文件的模式和记录。
+
+3. 检查模式是否一致。
+
+4. 合并记录。
+
+5. 写入新文件。
+
+可能的错误处理点包括：文件不存在、模式不匹配、写入权限问题等。
+
+现在考虑代码示例：
+
+比如：
+
+from fastavro import reader, writer
+
+def merge_avro_files(file1, file2, output_file):
+# 读取第一个文件
+with open(file1, 'rb') as f1:
+avro_reader1 = reader(f1)
+schema1 = avro_reader1.writer_schema
+records1 = list(avro_reader1)
+
+# 读取第二个文件
+with open(file2, 'rb') as f2:
+avro_reader2 = reader(f2)
+schema2 = avro_reader2.writer_schema
+records2 = list(avro_reader2)
+
+# 检查模式是否相同
+if schema1 != schema2:
+raise ValueError("Schemas of the two Avro files are different.")
+
+# 合并记录
+merged_records = records1 + records2
+
+# 写入合并后的文件
+with open(output_file, 'wb') as out_file:
+writer(out_file, schema1, merged_records)
+
+然后调用这个函数：
+
+merge_avro_files('input1.avro', 'input2.avro', 'merged.avro')
+
+这样应该就完成了。
+
+不过需要注意的是，schema的比较可能并不完全准确，因为Avro的模式可能有不同的表示方式，但结构相同。比如，字段的顺序不同，或者注释不同，但实际结构一样。这时候简单的字典比较可能失败，但实际模式是兼容的。这种情况下可能需要更智能的模式比较，但这对用户来说可能比较复杂。所以这里假设用户的两个Avro文件的模式是完全一致的，包括字段顺序等，所以直接比较schema是否相等即可。
+
+另一个注意事项是，如果两个文件使用不同的压缩编解码器（比如snappy，deflate），在合并时是否需要处理？因为写入的时候可能需要指定相同的编解码器。不过默认情况下，fastavro的writer可能使用null编解码器，或者保留原文件的编解码器？可能需要明确指定。比如，原文件的编解码器可能保存在模式中吗？或者需要手动设置？
+
+例如，如果原文件是用snappy压缩的，那么合并后的文件是否需要同样使用snappy？这可能需要在writer的参数中指定。例如：
+
+在writer函数中，可以指定codec参数，比如codec='deflate'或者codec='snappy'。但默认情况下是'null'。所以如果原来的文件使用了不同的codec，合并后的文件将使用指定的codec。这可能与原文件不同，导致合并后的文件使用不同的压缩方式。所以用户可能需要处理这一点。比如，在合并时保持与原文件相同的codec。但如何获取原文件的codec？
+
+在fastavro的reader中，可能可以通过某些属性获取codec信息。例如，查看avro_reader1.codec，但需要确认是否存在这个属性。或者可能在读取时无法直接获取，因为codec是文件级别的元数据。这时候可能需要用户自行处理，或者在代码中设置正确的codec。
+
+例如，修改writer的调用：
+
+writer(out_file, schema1, merged_records, codec='snappy')
+
+但如何确定原文件的codec？可能需要从文件中读取。例如，在读取时，可以使用avro_reader1.codec。在fastavro的文档中，reader对象有一个codec属性吗？需要查证。
+
+根据fastavro的文档，reader对象有一个codec属性，所以在代码中可能可以这样做：
+
+codec1 = avro_reader1.codec
+
+然后，检查两个文件的codec是否相同，或者在写入时选择其中一个的codec。或者让用户指定codec。例如，可以修改函数，允许指定codec，或者自动使用第一个文件的codec。
+
+所以，修改后的代码：
+
+def merge_avro_files(file1, file2, output_file):
+# 读取第一个文件
+with open(file1, 'rb') as f1:
+avro_reader1 = reader(f1)
+schema1 = avro_reader1.writer_schema
+codec1 = avro_reader1.codec
+records1 = list(avro_reader1)
+
+# 读取第二个文件
+with open(file2, 'rb') as f2:
+avro_reader2 = reader(f2)
+schema2 = avro_reader2.writer_schema
+codec2 = avro_reader2.codec
+records2 = list(avro_reader2)
+
+if schema1 != schema2:
+raise ValueError("Schemas of the two Avro files are different.")
+
+# 检查codec是否相同，如果不同可能需要处理，这里假设使用第一个文件的codec
+# 或者可以强制统一，例如选择其中一个
+# 或者报错，让用户决定
+# 这里假设使用第一个文件的codec
+merged_records = records1 + records2
+
+with open(output_file, 'wb') as out_file:
+writer(out_file, schema1, merged_records, codec=codec1)
+
+这样在写入时会使用第一个文件的codec。但如果两个文件的codec不同，是否需要处理？比如，用户可能希望合并后的文件使用某个特定的codec，或者保持与原文件一致。这时候可能需要提示用户，或者在文档中说明。
+
+不过，可能大部分情况下，用户的两个Avro文件的codec是相同的，或者用户可以接受使用其中一个的codec。但如果没有处理codec的问题，合并后的文件可能会使用默认的null codec，这可能不符合用户预期，导致文件体积变大或者无法兼容某些读取工具。
+
+所以，为了更健壮的合并，应该考虑codec的问题，并在代码中处理。例如，检查两个文件的codec是否相同，如果不同则抛出错误，或者允许用户指定codec参数。
+
+不过这可能超出了用户当前的问题范围。用户可能只是需要简单的合并，而假设两个文件的codec是一致的。所以可能不需要处理，或者在代码中默认使用第一个文件的codec。
+
+综上，最终的代码应该包括读取两个文件的模式、记录和codec，检查模式是否一致，合并记录，并使用其中一个codec来写入。
+
+所以，总结后的步骤和代码应该如上述所示。可能还需要在代码中加入一些异常处理，比如文件无法打开等。
+
+另外，测试的时候需要注意，如果用户提供的文件路径不正确，或者没有读取权限等，程序会抛出异常，但用户可能需要自行处理这些情况。
+
+最后，用户可能需要安装fastavro，所以在回答中应该提醒他们先安装这个库。
+
+要使用Python合并两个Avro文件，可以使用fastavro库。以下是详细步骤和代码示例：
+
+步骤说明：
+
+1. 安装库：使用fastavro进行高效的Avro文件操作。
+
+2. 读取文件：分别读取两个Avro文件的模式和记录。
+
+3. 模式检查：确保两个文件的模式一致，避免合并冲突。
+
+4. 合并记录：将两个文件的记录合并为一个列表。
+
+5. 写入新文件：使用原文件的模式和编解码器（codec）写入合并后的记录。
+
+代码实现：
+
+from fastavro import reader, writer
+
+def merge_avro_files(file1_path, file2_path, output_path):
+    # 读取第一个文件
+    with open(file1_path, 'rb') as f1:
+        avro_reader1 = reader(f1)
+        schema1 = avro_reader1.writer_schema
+        codec1 = avro_reader1.codec  # 获取编解码器
+        records1 = list(avro_reader1)
     
-    protected BusinessException(ErrorCode errorCode, String message) {
-        super(message);
-        this.errorCode = errorCode;
-    }
-}
-
-// 具体业务异常示例
-public class ResourceNotFoundException extends BusinessException {
-    public ResourceNotFoundException(String resourceName, Object identifier) {
-        super(ErrorCode.RESOURCE_NOT_FOUND, 
-            String.format("%s with id %s not found", resourceName, identifier));
-    }
-}
-
-// 错误码枚举
-public enum ErrorCode {
-    RESOURCE_NOT_FOUND("RESOURCE_404"),
-    VALIDATION_FAILED("VALIDATION_400"),
-    UNAUTHORIZED("AUTH_401");
+    # 读取第二个文件
+    with open(file2_path, 'rb') as f2:
+        avro_reader2 = reader(f2)
+        schema2 = avro_reader2.writer_schema
+        codec2 = avro_reader2.codec
+        records2 = list(avro_reader2)
     
-    private final String code;
-}
-```
-
----
-
-### 三、关键处理场景实现
-
-#### 1. 参数校验错误处理
-```java
-@Configuration
-@EnableWebFlux
-public class ValidationConfig implements WebFluxConfigurer {
-
-    @Override
-    public void configureHttpMessageCodecs(ServerCodecConfigurer configurer) {
-        configurer.defaultCodecs().enableLoggingRequestDetails(true);
-    }
-
-    @Bean
-    public Validator validator() {
-        return new LocalValidatorFactoryBean();
-    }
-
-    @ExceptionHandler(WebExchangeBindException.class)
-    public Mono<ServerResponse> handleValidationExceptions(WebExchangeBindException ex) {
-        return ServerResponse.badRequest()
-            .bodyValue(ErrorResponse.builder()
-                .code(ErrorCode.VALIDATION_FAILED.getCode())
-                .errors(convertFieldErrors(ex.getFieldErrors()))
-                .build());
-    }
+    # 检查模式是否相同
+    if schema1 != schema2:
+        raise ValueError("错误：两个Avro文件的模式不一致，无法合并。")
     
-    private List<FieldError> convertFieldErrors(List<org.springframework.validation.FieldError> errors) {
-        return errors.stream()
-            .map(e -> new FieldError(e.getField(), e.getDefaultMessage()))
-            .toList();
-    }
-}
-```
+    # 可选：检查编解码器是否一致（根据需求决定是否强制检查）
+    if codec1 != codec2:
+        print("警告：两个文件的编解码器不同，将使用第一个文件的编解码器。")
+    
+    # 合并记录
+    merged_records = records1 + records2
+    
+    # 写入合并后的文件（使用第一个文件的模式和编解码器）
+    with open(output_path, 'wb') as out_file:
+        writer(out_file, schema1, merged_records, codec=codec1)
 
-#### 2. 响应式流错误处理
-```java
-public Mono<User> getUserWithFallback(String userId) {
-    return userRepository.findById(userId)
-        .onErrorResume(DataAccessResourceFailureException.class, 
-            ex -> cachedUserService.getFromCache(userId))
-        .onErrorResume(NoSuchElementException.class, 
-            ex -> Mono.error(new ResourceNotFoundException("User", userId)))
-        .retryWhen(Retry.backoff(3, Duration.ofMillis(100))
-            .filter(ex -> ex instanceof TransientDataAccessException))
-        .doOnError(ex -> log.error("Failed to retrieve user {}", userId, ex));
-}
-```
+# 示例调用
+merge_avro_files('input1.avro', 'input2.avro', 'merged.avro')
 
-#### 3. 安全相关异常处理
-```java
-@Bean
-public SecurityWebFilterChain securityFilterChain(ServerHttpSecurity http) {
-    return http
-        .exceptionHandling()
-            .authenticationEntryPoint((exchange, ex) -> 
-                ServerResponse.status(HttpStatus.UNAUTHORIZED)
-                    .bodyValue(ErrorResponse.from(ex)))
-            .accessDeniedHandler((exchange, ex) -> 
-                ServerResponse.status(HttpStatus.FORBIDDEN)
-                    .bodyValue(ErrorResponse.from(ex)))
-        .and()
-        // ...其他安全配置
-        .build();
-}
-```
 
----
+关键点：
 
-### 四、高级处理策略
+• 模式检查：若模式不同，合并会导致数据写入错误，因此直接抛出异常。
 
-#### 1. 错误日志标准化
-```java
-@Aspect
-@Component
-@Slf4j
-public class ErrorLoggingAspect {
+• 编解码器处理：若两个文件使用不同的压缩方式（如Snappy、Deflate），默认使用第一个文件的编解码器，避免数据损坏。
 
-    @AfterThrowing(pointcut = "execution(* com.example..*.*(..))", throwing = "ex")
-    public void logError(JoinPoint joinPoint, Throwable ex) {
-        StructuredLogMessage logMessage = new StructuredLogMessage()
-            .with("method", joinPoint.getSignature().getName())
-            .with("class", joinPoint.getTarget().getClass().getName())
-            .with("exceptionType", ex.getClass().getName())
-            .with("errorCode", ex instanceof BusinessException ? 
-                ((BusinessException)ex).getErrorCode() : "SYSTEM_ERROR");
-        
-        if (ex instanceof BusinessException) {
-            log.warn("Business exception occurred: {}", logMessage);
-        } else {
-            log.error("System error occurred: {}", logMessage, ex);
-        }
-    }
-}
-```
+• 效率优化：适合处理中小型文件，大文件建议流式读取写入以节省内存。
 
-#### 2. 熔断降级机制
-```java
-@Bean
-public Customizer<ReactiveResilience4JCircuitBreakerFactory> circuitBreakerFactory() {
-    return factory -> factory.configureDefault(id -> new Resilience4JConfigBuilder(id)
-        .circuitBreakerConfig(CircuitBreakerConfig.custom()
-            .failureRateThreshold(50)
-            .waitDurationInOpenState(Duration.ofSeconds(30))
-            .slidingWindowType(SlidingWindowType.COUNT_BASED)
-            .slidingWindowSize(10)
-            .build())
-        .timeLimiterConfig(TimeLimiterConfig.custom()
-            .timeoutDuration(Duration.ofSeconds(5))
-            .build())
-        .build());
-}
+注意事项：
 
-// 使用示例
-@CircuitBreaker(name = "userService", fallbackMethod = "fallbackGetUser")
-public Mono<User> getUser(String id) {
-    return userRepository.findById(id);
-}
+• 安装依赖：运行前需执行 pip install fastavro。
 
-private Mono<User> fallbackGetUser(String id, Throwable ex) {
-    return cachedUserService.getFromCache(id)
-        .switchIfEmpty(Mono.error(new ServiceDegradedException("User service unavailable")));
-}
-```
+• 异常处理：实际应用中可添加try-except块处理文件不存在或权限问题。
 
-#### 3. 错误追踪集成
-```java
-@Component
-public class ErrorTraceFilter implements WebFilter {
+• 模式兼容性：复杂场景下需深入比较模式兼容性，此处假设模式完全一致。
 
-    @Override
-    public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
-        String traceId = UUID.randomUUID().toString();
-        MDC.put("traceId", traceId);
-        exchange.getResponse().getHeaders().add("X-Trace-Id", traceId);
-        
-        return chain.filter(exchange)
-            .doFinally(signalType -> MDC.clear());
-    }
-}
-```
-
----
-
-### 五、监控与告警
-
-#### 1. 错误指标采集
-```java
-@Configuration
-public class ErrorMetricsConfig {
-
-    @Bean
-    public MeterRegistryCustomizer<MeterRegistry> metricsCommonTags() {
-        return registry -> registry.config().commonTags(
-            "application", "webflux-app",
-            "environment", System.getenv("APP_ENV")
-        );
-    }
-
-    @Bean
-    public Counter errorCounter(MeterRegistry registry) {
-        return Counter.builder("api.errors")
-            .description("Total API errors")
-            .tags("type", "business")
-            .register(registry);
-    }
-}
-
-// 在异常处理中记录指标
-@ExceptionHandler(BusinessException.class)
-public Mono<ServerResponse> handleBusinessException(BusinessException ex) {
-    errorCounter.increment();
-    // ...其他处理逻辑
-}
-```
-
-#### 2. Prometheus告警规则示例
-```yaml
-groups:
-- name: webflux-errors
-  rules:
-  - alert: HighErrorRate
-    expr: rate(api_errors_total{environment="production"}[5m]) > 10
-    for: 10m
-    labels:
-      severity: critical
-    annotations:
-      summary: "High error rate detected"
-      description: "Error rate exceeded 10 errors per second"
-```
-
----
-
-### 六、测试验证方案
-
-#### 1. 异常测试工具类
-```java
-public class ErrorAssertions {
-
-    public static void assertBusinessError(ErrorResponse response, ErrorCode expectedCode) {
-        assertThat(response.code()).isEqualTo(expectedCode.getCode());
-        assertThat(response.message()).isNotBlank();
-    }
-
-    public static StepVerifier.FirstStep<ErrorResponse> expectError(Mono<?> mono) {
-        return StepVerifier.create(mono)
-            .expectErrorSatisfies(ex -> {
-                assertThat(ex).isInstanceOf(WebClientResponseException.class);
-                WebClientResponseException wcre = (WebClientResponseException)ex;
-                ErrorResponse error = parseError(wcre);
-                assertThat(error.code()).isNotNull();
-            });
-    }
-}
-```
-
-#### 2. 集成测试示例
-```java
-@SpringBootTest(webEnvironment = WebEnvironment.RANDOM_PORT)
-class ErrorHandlingIntegrationTest {
-
-    @Autowired
-    private WebTestClient webTestClient;
-
-    @Test
-    void shouldReturnValidationError() {
-        webTestClient.post().uri("/users")
-            .contentType(MediaType.APPLICATION_JSON)
-            .bodyValue("{}")
-            .exchange()
-            .expectStatus().isBadRequest()
-            .expectBody(ErrorResponse.class)
-            .value(response -> {
-                assertThat(response.code()).isEqualTo("VALIDATION_400");
-                assertThat(response.errors()).isNotEmpty();
-            });
-    }
-}
-```
-
----
-
-### 七、错误处理最佳实践
-
-1. **错误分类策略**：
-   - 可恢复错误：网络超时、数据库连接中断等，应启用重试机制
-   - 不可恢复错误：数据校验失败、权限不足等，直接返回客户端
-   - 系统级错误：内存溢出、磁盘空间不足等，触发系统告警
-
-2. **上下文保留原则**：
-   - 始终携带请求唯一标识（traceId）
-   - 保持错误堆栈的完整传递
-   - 区分用户可见消息和技术细节
-
-3. **防御性编程技巧**：
-   ```java
-   public Mono<User> safeUpdateUser(String userId, UserUpdateRequest request) {
-       return Mono.just(request)
-           .filter(req -> req.name() != null && !req.name().isBlank())
-           .switchIfEmpty(Mono.error(new InvalidRequestException("Name cannot be empty")))
-           .flatMap(req -> userRepository.findById(userId))
-           .switchIfEmpty(Mono.error(new ResourceNotFoundException("User", userId)))
-           .flatMap(existing -> validateBusinessRules(existing, request))
-           .flatMap(userRepository::save);
-   }
-   ```
-
-4. **错误传播控制**：
-   - 使用`onErrorMap`转换异常类型
-   - 使用`onErrorResume`提供备用值
-   - 使用`onErrorContinue`跳过错误元素（适用于Flux）
-
----
-
-通过这种分层设计的错误处理机制，可以实现：
-- 统一的错误响应规范
-- 精准的错误分类处理
-- 完整的错误追踪能力
-- 智能的错误恢复机制
-- 可视化的错误监控体系
-- 可验证的错误处理逻辑
-
-系统可根据不同环境（开发/生产）动态调整错误信息暴露程度，同时保证在高压场景下错误处理不会成为性能瓶颈。
+此方法确保了两个Avro文件在结构和编码一致时安全合并，适用于大多数常见场景。
