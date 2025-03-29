@@ -1,107 +1,250 @@
-在Spring Boot WebFlux中实现服务A追踪服务B的数据插入状态，可采用Server-Sent Events (SSE) 实现实时状态推送。以下是分步解决方案：
+针对不同团队需要不同凭证的需求，我们可以通过扩展配置来实现。以下是分步解决方案：
 
-### 1. 服务B 暴露SSE端点推送状态
-**Controller:**
+---
+
+### 步骤1：增强配置结构
+在`application.yml`中配置团队专属信息：
+```yaml
+teams:
+  configs:
+    teamA:
+      base-url: https://api.team-a.com
+      credentials:
+        username: teamA_user
+        password: s3cr3tA
+    teamB:
+      base-url: https://api.team-b.com
+      credentials:
+        username: teamB_user
+        password: s3cr3tB
+```
+
+---
+
+### 步骤2：创建配置实体类
 ```java
-@RestController
-public class ServiceBController {
+@Configuration
+@ConfigurationProperties(prefix = "teams")
+public class TeamConfig {
+    private Map<String, TeamClientConfig> configs = new HashMap<>();
 
-    @Autowired
-    private ReactiveRepository repository; // 假设使用R2DBC
-
-    @PostMapping("/insert")
-    public Flux<ServerSentEvent<String>> insertData(@RequestBody Data data) {
-        return Flux.create(sink -> {
-            // 开始事件
-            sink.next(createEvent("start", "插入开始"));
-
-            // 执行插入操作
-            repository.insert(data)
-                .doOnSuccess(v -> 
-                    sink.next(createEvent("success", "插入成功")))
-                .doOnError(e -> 
-                    sink.next(createEvent("error", "失败: " + e.getMessage())))
-                .doFinally(signal -> sink.complete())
-                .subscribe();
-        });
+    @Data
+    public static class TeamClientConfig {
+        private String baseUrl;
+        private Credentials credentials;
+        
+        @Data
+        public static class Credentials {
+            private String username;
+            private String password;
+        }
     }
 
-    private ServerSentEvent<String> createEvent(String event, String data) {
-        return ServerSentEvent.builder()
-            .event(event)
-            .data(data)
-            .build();
+    // Getter/Setter
+    public Map<String, TeamClientConfig> getConfigs() {
+        return configs;
+    }
+
+    public void setConfigs(Map<String, TeamClientConfig> configs) {
+        this.configs = configs;
     }
 }
 ```
 
-### 2. 服务A 使用WebClient订阅SSE流
-**调用服务B并处理事件:**
+---
+
+### 步骤3：改造API接口
+```java
+public interface ThirdPartyApiClient {
+    // 移除固定参数，改为从上下文获取
+    @PostExchange(url = "/auth/token", contentType = "application/x-www-form-urlencoded")
+    Mono<TokenResponse> fetchToken();
+}
+```
+
+---
+
+### 步骤4：实现凭证拦截器
+```java
+public class CredentialInterceptor implements ExchangeFilterFunction {
+    private final String username;
+    private final password;
+
+    public CredentialInterceptor(String username, String password) {
+        this.username = username;
+        this.password = password;
+    }
+
+    @Override
+    public Mono<ClientResponse> filter(ClientRequest request, ExchangeFunction next) {
+        if (request.url().getPath().contains("/auth/token")) {
+            String credentials = "username=" + username + "&password=" + password;
+            return next.exchange(ClientRequest.from(request)
+                .body(credentials, MediaType.APPLICATION_FORM_URLENCODED)
+                .build());
+        }
+        return next.exchange(request);
+    }
+}
+```
+
+---
+
+### 步骤5：增强客户端工厂
+```java
+@Component
+public class TeamApiClientFactory {
+    private final Map<String, ThirdPartyApiClient> clientCache = new ConcurrentHashMap<>();
+    private final TeamConfig teamConfig;
+    private final HttpServiceProxyFactory.Builder factoryBuilder;
+
+    public TeamApiClientFactory(
+        TeamConfig teamConfig,
+        WebClient.Builder webClientBuilder
+    ) {
+        this.teamConfig = teamConfig;
+        this.factoryBuilder = HttpServiceProxyFactory.builder()
+            .exchangeAdapter(WebClientAdapter.forBuilder(webClientBuilder));
+    }
+
+    public ThirdPartyApiClient getClient(String teamName) {
+        return clientCache.computeIfAbsent(teamName, name -> {
+            TeamConfig.TeamClientConfig config = teamConfig.getConfigs().get(name);
+            validateConfig(name, config);
+
+            WebClient customClient = buildTeamWebClient(config);
+            return factoryBuilder.build().createClient(ThirdPartyApiClient.class, customClient);
+        });
+    }
+
+    private WebClient buildTeamWebClient(TeamConfig.TeamClientConfig config) {
+        return WebClient.builder()
+            .baseUrl(config.getBaseUrl())
+            .filter(new CredentialInterceptor(
+                config.getCredentials().getUsername(),
+                config.getCredentials().getPassword()
+            ))
+            .build();
+    }
+
+    private void validateConfig(String teamName, TeamConfig.TeamClientConfig config) {
+        if (config == null) {
+            throw new IllegalArgumentException("未配置的团队: " + teamName);
+        }
+        if (config.getCredentials() == null) {
+            throw new ConfigurationException(teamName + "缺少凭证配置");
+        }
+    }
+}
+```
+
+---
+
+### 步骤6：服务层调整
 ```java
 @Service
-public class ServiceA {
+public class TransactionalDataService {
+    private final TeamApiClientFactory apiClientFactory;
 
-    private static final Logger log = LoggerFactory.getLogger(ServiceA.class);
+    public Mono<Void> processData(String teamName, List<ByteArrayResource> files) {
+        ThirdPartyApiClient client = apiClientFactory.getClient(teamName);
 
-    public void callServiceBAndMonitor(Data data) {
-        WebClient.create("http://service-b")
-            .post()
-            .uri("/insert")
-            .bodyValue(data)
-            .retrieve()
-            .bodyToFlux(ServerSentEvent.class)
-            .subscribe(
-                event -> {
-                    switch (event.event()) {
-                        case "start":
-                            log.info("插入开始: {}", event.data());
-                            break;
-                        case "success":
-                            log.info("插入成功: {}", event.data());
-                            break;
-                        case "error":
-                            log.error("插入失败: {}", event.data());
-                            break;
-                    }
-                },
-                error -> log.error("SSE连接错误", error),
-                () -> log.info("SSE流结束")
+        return client.fetchToken()
+            .flatMap(token -> {
+                String authHeader = "Bearer " + token.token();
+                return client.createTransaction(authHeader)
+                    .flatMap(tx -> processTransaction(client, authHeader, tx.id(), files));
+            });
+    }
+
+    private Mono<Void> processTransaction(
+        ThirdPartyApiClient client,
+        String authHeader,
+        String txId,
+        List<ByteArrayResource> files
+    ) {
+        return Flux.fromIterable(files)
+            .flatMap(file -> client.commit(txId, authHeader, file))
+            .then(client.closeTransaction(txId, authHeader))
+            .onErrorResume(e -> 
+                client.rollback(txId, authHeader)
+                    .then(Mono.error(e))
             );
     }
 }
 ```
 
-### 3. 配置数据库反应式访问（示例使用R2DBC）
-**Repository:**
-```java
-public interface ReactiveRepository extends ReactiveCrudRepository<Data, Long> {
-}
-```
+---
 
-**application.properties:**
-```properties
-spring.r2dbc.url=r2dbc:mysql://localhost:3306/mydb
-spring.r2dbc.username=user
-spring.r2dbc.password=pass
-```
+### 实现要点说明：
 
-### 4. 运行流程说明
-1. **服务A调用服务B**：通过POST请求触发插入操作。
-2. **服务B立即返回SSE流**：在处理的不同阶段（开始、成功、失败）发送事件。
-3. **服务A实时接收事件**：通过订阅SSE流，记录每个状态到日志。
-4. **非阻塞处理**：所有操作基于Reactive Streams，确保高并发下的资源高效利用。
+1. **动态凭证注入**：
+   - 通过`CredentialInterceptor`自动注入团队专属凭证
+   - Token请求不再需要显式传递用户名密码
 
-### 其他方案对比
-| 方案               | 优点                          | 缺点                         |
-|--------------------|-------------------------------|------------------------------|
-| **SSE (推荐)**     | 实时性强，纯HTTP无需中间件    | 需处理长连接稳定性           |
-| 消息队列           | 高可靠，支持断线重传          | 需额外组件，系统复杂度增加   |
-| 轮询状态API        | 实现简单                      | 实时性差，资源消耗较高       |
+2. **安全配置**：
+   ```java
+   // 拦截器自动处理敏感凭证
+   .filter(new CredentialInterceptor(username, password))
+   ```
+   避免在代码中明文出现凭证信息
 
-### 注意事项
-- **错误处理**：确保服务B中所有异常都被捕获并发送error事件。
-- **背压管理**：WebClient默认会根据消费能力处理背压。
-- **超时控制**：可配置SSE客户端超时时间，避免僵尸连接。
-- **生产环境建议**：考虑结合Spring Cloud CircuitBreaker增加容错能力。
+3. **配置验证**：
+   ```java
+   private void validateConfig(...) {
+       // 启动时检查配置完整性
+   }
+   ```
+   确保所有必需配置项都存在
 
-此方案利用WebFlux的响应式特性，通过SSE实现服务间实时状态通知，确保服务A能准确记录数据插入全过程状态。
+4. **接口简化**：
+   ```java
+   Mono<TokenResponse> fetchToken(); // 无需参数
+   ```
+   调用方无需关心凭证传递细节
+
+---
+
+### 高级安全方案（可选）：
+
+如果需要更高安全性，可以采用以下改进：
+
+1. **加密存储密码**：
+   ```yaml
+   teams:
+     configs:
+       teamA:
+         credentials:
+           username: teamA_user
+           password: "{cipher}encrypted_string_here"
+   ```
+
+2. **使用Vault集成**：
+   ```java
+   public class VaultCredentialProvider {
+       public Credentials getCredentials(String teamName) {
+           // 从Vault获取动态凭证
+       }
+   }
+   ```
+
+3. **临时令牌机制**：
+   ```java
+   .filter((request, next) -> {
+       return getTempToken()
+           .flatMap(token -> 
+               next.exchange(withAuthHeader(request, token))
+           );
+   })
+   ```
+
+---
+
+### 最终架构优势：
+1. **完全解耦**：服务层完全不需要知道凭证细节
+2. **配置集中管理**：所有团队配置统一维护
+3. **自动凭证轮换**：通过拦截器机制可轻松实现凭证更新
+4. **类型安全**：所有配置访问都通过类型化的配置类
+5. **可观测性**：可在拦截器中统一添加日志/监控
+
+这种设计既保持了接口的简洁性，又实现了敏感信息的隔离管理，是处理多租户系统凭证差异的理想方案。
