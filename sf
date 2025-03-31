@@ -1,1 +1,90 @@
-，
+在Java中，可以通过以下步骤检查指定目录下是否存在超过150MB的文件：
+
+### 方法1：使用NIO API（推荐，支持递归遍历）
+```java
+import java.io.IOException;
+import java.nio.file.*;
+import java.util.stream.Stream;
+
+public class LargeFileChecker {
+    public static void main(String[] args) {
+        Path directory = Paths.get("指定目录路径");
+        long maxSize = 150 * 1024 * 1024; // 150MB转换为字节
+
+        try (Stream<Path> pathStream = Files.walk(directory)) { // 递归遍历所有子目录
+            boolean hasLargeFile = pathStream
+                    .filter(Files::isRegularFile) // 仅检查普通文件
+                    .anyMatch(path -> {
+                        try {
+                            return Files.size(path) > maxSize;
+                        } catch (IOException e) {
+                            System.err.println("无法读取文件大小: " + path);
+                            return false;
+                        }
+                    });
+            System.out.println("存在超过150MB的文件: " + hasLargeFile);
+        } catch (IOException e) {
+            System.err.println("遍历目录出错: " + e.getMessage());
+        }
+    }
+}
+```
+
+### 方法2：仅检查当前目录（不递归）
+```java
+try (Stream<Path> pathStream = Files.list(directory)) { // 不遍历子目录
+    boolean hasLargeFile = pathStream
+            .filter(Files::isRegularFile)
+            .anyMatch(path -> {
+                try {
+                    return Files.size(path) > maxSize;
+                } catch (IOException e) {
+                    System.err.println("无法读取文件大小: " + path);
+                    return false;
+                }
+            });
+    System.out.println("存在超过150MB的文件: " + hasLargeFile);
+}
+```
+
+### 方法3：传统File类实现（递归）
+```java
+import java.io.File;
+
+public class FileUtils {
+    public static boolean hasLargeFiles(File dir, long maxSize) {
+        if (!dir.isDirectory()) {
+            throw new IllegalArgumentException("路径不是目录");
+        }
+        File[] files = dir.listFiles();
+        if (files == null) return false;
+
+        for (File file : files) {
+            if (file.isFile() && file.length() > maxSize) {
+                return true;
+            } else if (file.isDirectory()) {
+                if (hasLargeFiles(file, maxSize)) { // 递归检查子目录
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    public static void main(String[] args) {
+        File dir = new File("指定目录路径");
+        long maxSize = 150 * 1024 * 1024;
+        System.out.println("存在大文件: " + hasLargeFiles(dir, maxSize));
+    }
+}
+```
+
+### 注意事项：
+1. **单位换算**：`150MB = 150 * 1024 * 1024 字节`，确保正确转换。
+2. **递归控制**： 
+   - 使用`Files.walk()`会遍历所有子目录，若仅需当前目录，改用`Files.list()`。
+3. **异常处理**：
+   - 捕获`IOException`处理无权限或无法访问的文件。
+4. **性能**：发现首个大文件会立即返回，避免不必要的遍历。
+
+根据需求选择是否包含子目录检查。推荐使用NIO API（方法1或2），因其代码更简洁且能更好地处理符号链接等复杂情况。
