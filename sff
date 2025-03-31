@@ -1,406 +1,102 @@
-以下是为SSE方案设计的完善实现，包含完整代码、异常处理、心跳机制和最佳实践：
+在 Amazon S3 这样的对象存储中，"目录"本质上是基于前缀的虚拟结构。以下是使用 **AWS SDK for Java 2.x** 检查指定前缀下是否存在超过 150MB 对象的完整方案：
 
-### 1. 服务B完善实现（完整SSE服务端）
+---
 
-```java
-@RestController
-@RequestMapping("/api/data")
-public class DataControllerB {
-    private static final Logger log = LoggerFactory.getLogger(DataControllerB.class);
-    
-    private final ReactiveRepository repository;
-    private final Scheduler scheduler;
-
-    public DataControllerB(ReactiveRepository repository, 
-                          @Qualifier("ioScheduler") Scheduler scheduler) {
-        this.repository = repository;
-        this.scheduler = scheduler;
-    }
-
-    @PostMapping(produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public Flux<ServerSentEvent<Map<String, Object>>> insertDataWithProgress(
-            @Valid @RequestBody Data data) {
-        
-        return Flux.<ServerSentEvent<Map<String, Object>>>create(sink -> {
-            final String processId = UUID.randomUUID().toString();
-            
-            sink.onRequest(n -> {
-                log.info("开始处理数据插入，ProcessID: {}", processId);
-                Map<String, Object> startEvent = Map.of(
-                    "status", "PROCESSING",
-                    "message", "开始处理数据插入",
-                    "timestamp", Instant.now(),
-                    "processId", processId
-                );
-                sink.next(createSSE("start", startEvent));
-            });
-
-            repository.insert(data)
-                .delayElement(Duration.ofSeconds(1), scheduler) // 模拟耗时操作
-                .doOnSuccess(id -> {
-                    Map<String, Object> successEvent = Map.of(
-                        "status", "SUCCESS",
-                        "message", "数据插入完成",
-                        "recordId", id,
-                        "processId", processId,
-                        "timestamp", Instant.now()
-                    );
-                    sink.next(createSSE("complete", successEvent));
-                })
-                .doOnError(e -> {
-                    Map<String, Object> errorEvent = Map.of(
-                        "status", "ERROR",
-                        "message", "处理失败: " + e.getMessage(),
-                        "processId", processId,
-                        "timestamp", Instant.now(),
-                        "errorDetails", Map.of(
-                            "type", e.getClass().getSimpleName(),
-                            "stack", Arrays.stream(e.getStackTrace())
-                                .limit(5)
-                                .map(StackTraceElement::toString)
-                                .collect(Collectors.toList())
-                        )
-                    );
-                    sink.next(createSSE("error", errorEvent));
-                })
-                .doFinally(signal -> {
-                    log.info("处理完成，ProcessID: {}", processId);
-                    sink.complete();
-                })
-                .subscribe();
-        })
-        .timeout(Duration.ofMinutes(5)) // 设置超时时间
-        .onErrorResume(e -> {
-            Map<String, Object> timeoutEvent = Map.of(
-                "status", "TIMEOUT",
-                "message", "处理超时",
-                "timestamp", Instant.now()
-            );
-            return Flux.just(createSSE("error", timeoutEvent));
-        })
-        .mergeWith(heartbeatFlux()); // 合并心跳事件
-    }
-
-    // SSE心跳保持连接
-    private Flux<ServerSentEvent<Map<String, Object>>> heartbeatFlux() {
-        return Flux.interval(Duration.ofSeconds(15))
-            .map(seq -> createSSE("heartbeat", Map.of(
-                "status", "HEARTBEAT",
-                "timestamp", Instant.now(),
-                "sequence", seq
-            )))
-            .doOnCancel(() -> log.info("心跳停止"));
-    }
-
-    private ServerSentEvent<Map<String, Object>> createSSE(String event, 
-                                                          Map<String, Object> data) {
-        return ServerSentEvent.<Map<String, Object>>builder()
-            .id(UUID.randomUUID().toString())
-            .event(event)
-            .data(data)
-            .retry(Duration.ofSeconds(3))
-            .build();
-    }
-}
+### 步骤 1：添加依赖
+```xml
+<dependency>
+    <groupId>software.amazon.awssdk</groupId>
+    <artifactId>s3</artifactId>
+    <version>2.20.26</version> <!-- 使用最新版本 -->
+</dependency>
 ```
 
-### 2. 服务A完善实现（增强客户端）
+---
 
+### 步骤 2：Java 代码实现
 ```java
-@Service
-public class DataServiceA {
-    private static final Logger log = LoggerFactory.getLogger(DataServiceA.class);
-    private final WebClient webClient;
+import software.amazon.awssdk.core.exception.SdkException;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.*;
 
-    public DataServiceA(WebClient.Builder webClientBuilder) {
-        this.webClient = webClientBuilder
-            .baseUrl("http://service-b:8080")
-            .clientConnector(new ReactorClientHttpConnector(
-                HttpClient.create()
-                    .responseTimeout(Duration.ofMinutes(5))
-                    .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5000)
-            ))
-            .build();
+public class S3LargeObjectChecker {
+    private static final long MAX_SIZE_BYTES = 150L * 1024 * 1024; // 150MB
+    private static final String BUCKET_NAME = "your-bucket-name";
+    private static final String TARGET_PREFIX = "your/directory/prefix/"; // 以"/"结尾
+
+    public static void main(String[] args) {
+        S3Client s3 = S3Client.builder()
+                .region(Region.US_EAST_1) // 根据实际情况修改
+                .build();
+
+        boolean hasLargeObject = checkLargeObjects(s3);
+        System.out.println("存在超过150MB的对象: " + hasLargeObject);
     }
 
-    public Mono<Void> trackDataInsertProcess(Data data) {
-        return webClient.post()
-            .uri("/api/data")
-            .contentType(MediaType.APPLICATION_JSON)
-            .accept(MediaType.TEXT_EVENT_STREAM)
-            .bodyValue(data)
-            .retrieve()
-            .onStatus(HttpStatus::isError, response -> 
-                response.bodyToMono(String.class)
-                    .flatMap(error -> Mono.error(new ServiceException(
-                        "服务B响应错误: " + error)))
-            .bodyToFlux(ServerSentEvent.class)
-            .doOnSubscribe(sub -> log.info("开始监听数据插入状态"))
-            .flatMap(this::handleSSEEvent)
-            .doOnComplete(() -> log.info("事件流正常结束"))
-            .doOnError(e -> log.error("事件流异常终止", e))
-            .then();
-    }
+    private static boolean checkLargeObjects(S3Client s3) {
+        try {
+            ListObjectsV2Request request = ListObjectsV2Request.builder()
+                    .bucket(BUCKET_NAME)
+                    .prefix(TARGET_PREFIX)
+                    .build();
 
-    private Mono<Void> handleSSEEvent(ServerSentEvent<Map<String, Object>> event) {
-        String eventType = event.event();
-        Map<String, Object> data = event.data();
-
-        switch (eventType) {
-            case "start":
-                log.info("处理开始 | ProcessID: {} | 时间: {}", 
-                    data.get("processId"), data.get("timestamp"));
-                return saveProgressToDB(data, "STARTED");
-                
-            case "complete":
-                log.info("处理成功 | 记录ID: {} | 耗时: {}ms", 
-                    data.get("recordId"),
-                    calculateDuration(data.get("timestamp")));
-                return saveProgressToDB(data, "COMPLETED");
-                
-            case "error":
-                log.error("处理失败 | 原因: {} | 错误类型: {}", 
-                    data.get("message"),
-                    ((Map)data.get("errorDetails")).get("type"));
-                return saveProgressToDB(data, "FAILED");
-                
-            case "heartbeat":
-                log.debug("心跳检测 | 序号: {}", data.get("sequence"));
-                return Mono.empty();
-                
-            default:
-                log.warn("未知事件类型: {}", eventType);
-                return Mono.empty();
+            // 使用分页遍历所有对象（避免截断）
+            for (ListObjectsV2Response response : s3.listObjectsV2Paginator(request)) {
+                boolean found = response.contents().stream()
+                        .anyMatch(s3Object -> s3Object.size() > MAX_SIZE_BYTES);
+                if (found) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (S3Exception e) {
+            System.err.println("S3错误: " + e.awsErrorDetails().errorMessage());
+            return false;
+        } catch (SdkException e) {
+            System.err.println("SDK错误: " + e.getMessage());
+            return false;
         }
     }
-
-    private Mono<Void> saveProgressToDB(Map<String, Object> data, String status) {
-        // 实现数据库存储逻辑（例如MongoDB）
-        return reactiveMongoTemplate.save(
-            new ProcessStatus(
-                data.get("processId").toString(),
-                status,
-                data
-            )
-        ).then();
-    }
-
-    private long calculateDuration(Object timestamp) {
-        Instant end = Instant.now();
-        Instant start = Instant.parse(timestamp.toString());
-        return Duration.between(start, end).toMillis();
-    }
 }
 ```
 
-### 3. 增强配置类（application.yml）
+---
 
-```yaml
-spring:
-  webflux:
-    base-path: /api
-  data:
-    mongodb:
-      uri: mongodb://user:pass@localhost:27017/processTracking
-      
-service-b:
-  url: http://service-b:8080
-  sse:
-    timeout: 5m
-    retry:
-      max-attempts: 3
-      backoff: 1s
+### 关键点说明
 
-logging:
-  level:
-    org.springframework.web.reactive: DEBUG
-    reactor.netty: INFO
-```
+1. **前缀而非目录**：
+   - S3 没有真正的目录结构，通过 `prefix` 参数模拟目录查询（例如 `"reports/2023/"`）。
+   - 确保 `prefix` 以 `/` 结尾，避免匹配类似前缀的其他对象。
 
-### 4. 全链路监控增强
+2. **分页处理**：
+   - 使用 `listObjectsV2Paginator` 自动处理分页，确保获取所有对象。
 
-```java
-@Configuration
-public class MonitoringConfig {
+3. **性能优化**：
+   - 使用 `anyMatch` 短路操作，发现首个大对象后立即终止检查。
 
-    @Bean
-    public MeterRegistryCustomizer<MeterRegistry> metricsCommonTags() {
-        return registry -> registry.config().commonTags(
-            "application", "service-a"
-        );
-    }
+4. **异常处理**：
+   - 捕获 `S3Exception` 处理权限、Bucket不存在等问题。
+   - 通用 `SdkException` 捕获网络等底层错误。
 
-    @Bean
-    public TimedAspect timedAspect(MeterRegistry registry) {
-        return new TimedAspect(registry);
-    }
+---
 
-    @Bean
-    public WebClientSseMetrics webClientSseMetrics(MeterRegistry registry) {
-        return new WebClientSseMetrics(registry);
-    }
-}
-
-@Component
-@RequiredArgsConstructor
-class WebClientSseMetrics {
-    private final MeterRegistry registry;
-    private final DistributionSummary.Builder summaryBuilder;
-
-    @PostConstruct
-    void init() {
-        summaryBuilder = DistributionSummary.builder("sse.events.duration")
-            .description("SSE事件处理耗时")
-            .baseUnit("milliseconds")
-            .publishPercentiles(0.5, 0.95, 0.99);
-    }
-
-    public void recordEventDuration(String eventType, long duration) {
-        summaryBuilder.tag("eventType", eventType)
-            .register(registry)
-            .record(duration);
-    }
+### 补充：权限要求
+确保 IAM 用户/角色拥有以下权限：
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [{
+        "Effect": "Allow",
+        "Action": ["s3:ListBucket"],
+        "Resource": ["arn:aws:s3:::your-bucket-name"]
+    }]
 }
 ```
 
-### 5. 测试方案（使用TestContainers）
+---
 
-```java
-@SpringBootTest
-@AutoConfigureWebTestClient
-@Testcontainers
-class DataFlowIntegrationTest {
-    
-    @Container
-    static MongoDBContainer mongoDB = new MongoDBContainer("mongo:5.0");
-    
-    @Container
-    static GenericContainer<?> serviceB = new GenericContainer<>("service-b:latest")
-        .withExposedPorts(8080);
-
-    @Autowired
-    private WebTestClient webTestClient;
-
-    @DynamicPropertySource
-    static void setProperties(DynamicPropertyRegistry registry) {
-        registry.add("spring.data.mongodb.uri", mongoDB::getReplicaSetUrl);
-        registry.add("service-b.url", 
-            () -> "http://"+serviceB.getHost()+":"+serviceB.getMappedPort(8080));
-    }
-
-    @Test
-    void shouldReceiveFullEventFlow() {
-        Data testData = new Data("Test Content");
-
-        webTestClient.post()
-            .uri("/api/data")
-            .bodyValue(testData)
-            .exchange()
-            .expectStatus().isOk()
-            .expectHeader().contentTypeCompatibleWith(MediaType.TEXT_EVENT_STREAM)
-            .expectBodyList(ServerSentEvent.class)
-            .consumeWith(response -> {
-                List<ServerSentEvent> events = response.getResponseBody();
-                assertThat(events)
-                    .extracting(ServerSentEvent::event)
-                    .containsExactly("start", "heartbeat", "complete");
-            });
-    }
-}
-```
-
-### 6. 生产环境最佳实践
-
-1. **连接稳定性增强**
-   ```java
-   // 客户端重试策略
-   RetryBackoffSpec retrySpec = Retry.backoff(3, Duration.ofSeconds(1))
-       .jitter(0.5)
-       .doBeforeRetry(ctx -> log.warn("第{}次重试，原因：{}", 
-           ctx.totalRetries(), ctx.failure().getMessage()));
-
-   return webClient.post()
-       // ...其他配置
-       .retrieve()
-       .bodyToFlux(ServerSentEvent.class)
-       .retryWhen(retrySpec);
-   ```
-
-2. **事件回溯机制**
-   ```java
-   @Bean
-   public EventStore eventStore(ReactiveMongoTemplate mongoTemplate) {
-       return new MongoEventStore(mongoTemplate);
-   }
-
-   @Component
-   @RequiredArgsConstructor
-   class MongoEventStore {
-       private final ReactiveMongoTemplate mongoTemplate;
-
-       public Mono<Void> storeEvent(ServerSentEvent<?> event) {
-           return mongoTemplate.save(
-               new StoredEvent(
-                   UUID.randomUUID(),
-                   Instant.now(),
-                   event.event(),
-                   event.data()
-               )
-           ).then();
-       }
-   }
-   ```
-
-3. **安全增强**
-   ```java
-   @Bean
-   SecurityWebFilterChain securityFilterChain(ServerHttpSecurity http) {
-       return http
-           .authorizeExchange(exchanges -> 
-               exchanges.pathMatchers("/api/data").authenticated())
-           .oauth2ResourceServer(ServerHttpSecurity.OAuth2ResourceServerSpec::jwt)
-           .csrf().disable()
-           .build();
-   }
-   ```
-
-4. **性能优化**
-   ```java
-   @Bean
-   public Scheduler boundedElasticScheduler() {
-       return Schedulers.newBoundedElastic(
-           50,                      // 最大线程数
-           1000,                   // 任务队列容量
-           "sse-worker",            // 线程名前缀
-           60,                      // 空闲时间（秒）
-           true                     // 守护线程
-       );
-   }
-   ```
-
-### 架构示意图
-```
-服务A (WebClient) → HTTP/2 → 服务B (SSE Endpoint)
-       ↑ 事件流                   ↓ 数据库操作
-       └─── 实时状态更新 ←─── 持久化层 (R2DBC/MongoDB)
-               │
-               ├── 监控系统 (Micrometer)
-               ├── 日志系统 (ELK)
-               └── 审计存储 (Event Sourcing)
-```
-
-### 监控指标清单
-| 指标名称                 | 类型       | 描述                      |
-|--------------------------|------------|---------------------------|
-| sse.connections.active  | Gauge      | 当前活跃SSE连接数         |
-| sse.events.total        | Counter    | 各类事件总数（按eventType）|
-| sse.errors.count        | Counter    | 错误事件计数              |
-| process.duration        | Timer      | 全流程处理耗时分布        |
-
-该方案实现了：
-1. 完整的全生命周期事件追踪
-2. 生产级错误处理（超时、重试、幂等性）
-3. 详细的监控指标和日志追踪
-4. 数据库操作与事件流解耦
-5. 客户端/服务端双端容错机制
-6. 符合云原生标准的可观测性实现
+### 验证方式
+1. 替换代码中的 `BUCKET_NAME` 和 `TARGET_PREFIX`。
+2. 配置 AWS 凭证（通过环境变量、`~/.aws/credentials` 文件或 IAM 角色）。
+3. 执行代码检查输出结果。
