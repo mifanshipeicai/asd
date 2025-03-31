@@ -1,113 +1,102 @@
-在使用 Spring 的 `HttpClient` 和 `@HttpExchange` 时，处理服务端返回的错误状态并打印错误信息可以通过以下步骤实现：
+在 Amazon S3 这样的对象存储中，"目录"本质上是基于前缀的虚拟结构。以下是使用 **AWS SDK for Java 2.x** 检查指定前缀下是否存在超过 150MB 对象的完整方案：
 
-### 方法 1：捕获 `WebClientResponseException` 异常
-当服务端返回非 2xx 状态码时，`HttpClient` 会抛出 `WebClientResponseException` 异常，你可以捕获该异常并提取错误信息。
+---
 
+### 步骤 1：添加依赖
+```xml
+<dependency>
+    <groupId>software.amazon.awssdk</groupId>
+    <artifactId>s3</artifactId>
+    <version>2.20.26</version> <!-- 使用最新版本 -->
+</dependency>
+```
+
+---
+
+### 步骤 2：Java 代码实现
 ```java
-import org.springframework.web.client.RestClient.*;
-import org.springframework.web.client.WebClientResponseException;
+import software.amazon.awssdk.core.exception.SdkException;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.*;
 
-public class MyServiceClient {
-    private final MyServiceApi myServiceApi;
+public class S3LargeObjectChecker {
+    private static final long MAX_SIZE_BYTES = 150L * 1024 * 1024; // 150MB
+    private static final String BUCKET_NAME = "your-bucket-name";
+    private static final String TARGET_PREFIX = "your/directory/prefix/"; // 以"/"结尾
 
-    public MyServiceClient(WebClient webClient) {
-        this.myServiceApi = HttpServiceProxyFactory.builder(WebClientAdapter.forClient(webClient))
-                .build()
-                .createClient(MyServiceApi.class);
+    public static void main(String[] args) {
+        S3Client s3 = S3Client.builder()
+                .region(Region.US_EAST_1) // 根据实际情况修改
+                .build();
+
+        boolean hasLargeObject = checkLargeObjects(s3);
+        System.out.println("存在超过150MB的对象: " + hasLargeObject);
     }
 
-    public void callService() {
+    private static boolean checkLargeObjects(S3Client s3) {
         try {
-            myServiceApi.someMethod();
-        } catch (WebClientResponseException e) {
-            // 打印状态码、响应头和响应体
-            System.err.println("错误状态码: " + e.getStatusCode());
-            System.err.println("响应头: " + e.getResponseHeaders());
-            System.err.println("响应体: " + e.getResponseBodyAsString());
-            // 可以抛出自定义异常或进行其他处理
-            throw new RuntimeException("服务调用失败", e);
+            ListObjectsV2Request request = ListObjectsV2Request.builder()
+                    .bucket(BUCKET_NAME)
+                    .prefix(TARGET_PREFIX)
+                    .build();
+
+            // 使用分页遍历所有对象（避免截断）
+            for (ListObjectsV2Response response : s3.listObjectsV2Paginator(request)) {
+                boolean found = response.contents().stream()
+                        .anyMatch(s3Object -> s3Object.size() > MAX_SIZE_BYTES);
+                if (found) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (S3Exception e) {
+            System.err.println("S3错误: " + e.awsErrorDetails().errorMessage());
+            return false;
+        } catch (SdkException e) {
+            System.err.println("SDK错误: " + e.getMessage());
+            return false;
         }
     }
 }
+```
 
-@HttpExchange(url = "/api")
-interface MyServiceApi {
-    @PostExchange
-    void someMethod();
+---
+
+### 关键点说明
+
+1. **前缀而非目录**：
+   - S3 没有真正的目录结构，通过 `prefix` 参数模拟目录查询（例如 `"reports/2023/"`）。
+   - 确保 `prefix` 以 `/` 结尾，避免匹配类似前缀的其他对象。
+
+2. **分页处理**：
+   - 使用 `listObjectsV2Paginator` 自动处理分页，确保获取所有对象。
+
+3. **性能优化**：
+   - 使用 `anyMatch` 短路操作，发现首个大对象后立即终止检查。
+
+4. **异常处理**：
+   - 捕获 `S3Exception` 处理权限、Bucket不存在等问题。
+   - 通用 `SdkException` 捕获网络等底层错误。
+
+---
+
+### 补充：权限要求
+确保 IAM 用户/角色拥有以下权限：
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [{
+        "Effect": "Allow",
+        "Action": ["s3:ListBucket"],
+        "Resource": ["arn:aws:s3:::your-bucket-name"]
+    }]
 }
 ```
 
-### 方法 2：配置全局错误处理（使用 `ExchangeFilterFunction`）
-通过自定义 `ExchangeFilterFunction` 拦截所有请求/响应，统一处理错误。
+---
 
-```java
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.web.client.RestClient.*;
-import org.springframework.web.reactive.function.client.ExchangeFilterFunction;
-import reactor.core.publisher.Mono;
-
-@Configuration
-public class WebClientConfig {
-
-    @Bean
-    public WebClient webClient() {
-        return WebClient.builder()
-                .filter(logErrorFilter())
-                .build();
-    }
-
-    private ExchangeFilterFunction logErrorFilter() {
-        return (request, next) -> next.exchange(request)
-                .flatMap(response -> {
-                    if (response.statusCode().isError()) {
-                        return response.bodyToMono(String.class)
-                                .flatMap(body -> {
-                                    // 记录错误信息
-                                    System.err.println("错误状态码: " + response.statusCode());
-                                    System.err.println("响应体: " + body);
-                                    // 抛出包含详细信息的异常
-                                    return Mono.error(new WebClientResponseException(
-                                            response.statusCode().value(),
-                                            "服务端错误",
-                                            response.headers().asHttpHeaders(),
-                                            body.getBytes(),
-                                            null
-                                    ));
-                                });
-                    }
-                    return Mono.just(response);
-                });
-    }
-}
-```
-
-### 方法 3：使用 `@ExceptionHandler`（Spring MVC 环境）
-如果处于 Spring MVC 环境中，可以通过全局异常处理器统一处理。
-
-```java
-import org.springframework.web.bind.annotation.ExceptionHandler;
-import org.springframework.web.bind.annotation.RestControllerAdvice;
-import org.springframework.web.client.WebClientResponseException;
-
-@RestControllerAdvice
-public class GlobalExceptionHandler {
-
-    @ExceptionHandler(WebClientResponseException.class)
-    public ResponseEntity<String> handleWebClientError(WebClientResponseException ex) {
-        // 记录错误日志
-        System.err.println("服务端错误: " + ex.getResponseBodyAsString());
-        // 返回自定义错误信息
-        return ResponseEntity.status(ex.getStatusCode())
-                .body("请求失败: " + ex.getResponseBodyAsString());
-    }
-}
-```
-
-### 关键点总结
-1. **捕获异常**：使用 `try-catch` 捕获 `WebClientResponseException`，从中提取状态码、响应头和响应体。
-2. **全局过滤器**：通过 `ExchangeFilterFunction` 拦截所有错误响应，统一记录日志或转换异常。
-3. **响应体处理**：使用 `getResponseBodyAsString()` 或 `bodyToMono(String.class)` 获取错误详情。
-4. **自定义异常**：根据需求抛出包含详细信息的业务异常。
-
-选择适合你的场景的方法，确保在服务端返回错误时能够清晰记录问题原因。
+### 验证方式
+1. 替换代码中的 `BUCKET_NAME` 和 `TARGET_PREFIX`。
+2. 配置 AWS 凭证（通过环境变量、`~/.aws/credentials` 文件或 IAM 角色）。
+3. 执行代码检查输出结果。
