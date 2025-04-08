@@ -1,157 +1,106 @@
-在 Spring Boot 中，如果需要通过 `Resource` 返回流式响应（即边生成数据边传输，避免一次性加载到内存），可以使用 `StreamingResponseBody` 或 `InputStreamResource` 结合流式处理。以下是优化后的实现方案：
+在Spring Boot中，使用JdbcTemplate查询数据并返回CSV压缩为ZIP文件的步骤如下：
 
----
+### 实现步骤
+1. **添加依赖**：使用OpenCSV处理CSV生成。
+   ```xml
+   <dependency>
+       <groupId>com.opencsv</groupId>
+       <artifactId>opencsv</artifactId>
+       <version>5.7.1</version>
+   </dependency>
+   ```
 
-### 实现方案：流式生成 ZIP + CSV，直接返回资源流
-```java
-import org.apache.commons.csv.CSVFormat;
-import org.apache.commons.csv.CSVPrinter;
-import org.springframework.core.io.InputStreamResource;
-import org.springframework.core.io.Resource;
-import org.springframework.http.*;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.RestController;
+2. **编写Controller方法**：
+   ```java
+   import com.opencsv.CSVWriter;
+   import org.springframework.core.io.ByteArrayResource;
+   import org.springframework.core.io.Resource;
+   import org.springframework.http.HttpHeaders;
+   import org.springframework.http.MediaType;
+   import org.springframework.http.ResponseEntity;
+   import org.springframework.jdbc.core.JdbcTemplate;
+   import org.springframework.web.bind.annotation.GetMapping;
+   import org.springframework.web.bind.annotation.RestController;
+   
+   import java.io.ByteArrayOutputStream;
+   import java.io.IOException;
+   import java.io.OutputStreamWriter;
+   import java.nio.charset.StandardCharsets;
+   import java.util.List;
+   import java.util.Map;
+   import java.util.zip.ZipEntry;
+   import java.util.zip.ZipOutputStream;
+   
+   @RestController
+   public class ExportController {
+   
+       private final JdbcTemplate jdbcTemplate;
+   
+       public ExportController(JdbcTemplate jdbcTemplate) {
+           this.jdbcTemplate = jdbcTemplate;
+       }
+   
+       @GetMapping("/export")
+       public ResponseEntity<Resource> exportToZip() throws IOException {
+           // 查询数据
+           List<Map<String, Object>> data = jdbcTemplate.queryForList("SELECT * FROM your_table");
+   
+           // 创建字节数组输出流用于ZIP
+           ByteArrayOutputStream baos = new ByteArrayOutputStream();
+           try (ZipOutputStream zos = new ZipOutputStream(baos);
+                OutputStreamWriter osw = new OutputStreamWriter(zos, StandardCharsets.UTF_8);
+                CSVWriter csvWriter = new CSVWriter(osw)) {
+   
+               // 创建ZIP条目（CSV文件）
+               zos.putNextEntry(new ZipEntry("data.csv"));
+   
+               // 写入CSV表头
+               if (!data.isEmpty()) {
+                   String[] headers = data.get(0).keySet().toArray(new String[0]);
+                   csvWriter.writeNext(headers);
+               }
+   
+               // 写入数据行
+               for (Map<String, Object> row : data) {
+                   String[] values = row.values().stream()
+                           .map(this::convertToString)
+                           .toArray(String[]::new);
+                   csvWriter.writeNext(values);
+               }
+   
+               // 关闭当前ZIP条目
+               zos.closeEntry();
+           }
+   
+           // 构建Resource并设置响应头
+           ByteArrayResource resource = new ByteArrayResource(baos.toByteArray());
+           return ResponseEntity.ok()
+                   .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"data.zip\"")
+                   .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                   .body(resource);
+       }
+   
+       // 处理不同类型的数据转换为字符串
+       private String convertToString(Object value) {
+           if (value == null) {
+               return "";
+           } else if (value instanceof java.util.Date) {
+               return new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format((java.util.Date) value);
+           } else {
+               return value.toString();
+           }
+       }
+   }
+   ```
 
-import java.io.*;
-import java.math.BigDecimal;
-import java.nio.charset.StandardCharsets;
-import java.text.SimpleDateFormat;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipOutputStream;
+### 关键点说明
+- **流处理**：使用`ByteArrayOutputStream`和`ZipOutputStream`在内存中生成ZIP文件，避免临时文件。
+- **编码**：指定UTF-8编码确保特殊字符正确处理。
+- **CSV格式**：通过OpenCSV自动处理字段中的逗号、换行符等转义。
+- **资源释放**：使用try-with-resources确保所有流正确关闭。
+- **响应头设置**：`Content-Disposition`触发浏览器下载，`application/octet-stream`作为通用的二进制流类型。
 
-@RestController
-public class ExportController {
-
-    private final JdbcTemplate jdbcTemplate;
-    private final ExecutorService executor = Executors.newSingleThreadExecutor();
-
-    public ExportController(JdbcTemplate jdbcTemplate) {
-        this.jdbcTemplate = jdbcTemplate;
-    }
-
-    @GetMapping(value = "/export-stream", produces = "application/zip")
-    public ResponseEntity<Resource> exportAsStream() throws IOException {
-        // 1. 查询数据（假设数据量较大，但这里仍一次性加载）
-        List<Map<String, Object>> data = jdbcTemplate.queryForList("SELECT * FROM your_table");
-        if (data.isEmpty()) {
-            return ResponseEntity.noContent().build();
-        }
-
-        // 2. 提取表头（假设使用 LinkedHashMap 保持列顺序）
-        List<String> headers = new ArrayList<>(data.get(0).keySet());
-
-        // 3. 创建管道流（避免内存溢出）
-        PipedInputStream in = new PipedInputStream();
-        PipedOutputStream out = new PipedOutputStream(in);
-
-        // 4. 异步生成 ZIP 和 CSV 数据
-        executor.submit(() -> {
-            try (ZipOutputStream zos = new ZipOutputStream(out);
-                 OutputStreamWriter osw = new OutputStreamWriter(zos, StandardCharsets.UTF_8);
-                 CSVPrinter printer = new CSVPrinter(osw, CSVFormat.DEFAULT.withHeader(headers.toArray(new String[0]))) {
-
-                // 创建 ZIP 条目
-                zos.putNextEntry(new ZipEntry("data.csv"));
-
-                // 逐行写入 CSV 数据
-                for (Map<String, Object> row : data) {
-                    List<String> values = new ArrayList<>();
-                    for (String header : headers) {
-                        Object value = row.get(header);
-                        values.add(convertValueToString(value));
-                    }
-                    printer.printRecord(values);
-                }
-
-                zos.closeEntry();
-            } catch (IOException e) {
-                throw new RuntimeException("生成 CSV/ZIP 失败", e);
-            } finally {
-                try {
-                    out.close();
-                } catch (IOException ignored) {}
-            }
-        });
-
-        // 5. 包装为 Resource 并返回
-        InputStreamResource resource = new InputStreamResource(in);
-        return ResponseEntity.ok()
-                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=data.zip")
-                .contentType(MediaType.APPLICATION_OCTET_STREAM)
-                .body(resource);
-    }
-
-    // 数据类型转换方法（与之前相同）
-    private String convertValueToString(Object value) {
-        // ... 与之前的实现保持一致 ...
-    }
-}
-```
-
----
-
-### 关键点解析
-
-#### 1. **流式处理机制**
-- **管道流 (`PipedInputStream`/`PipedOutputStream`)**:  
-  通过管道流实现生产者-消费者模式，`PipedOutputStream` 负责生成数据，`PipedInputStream` 负责消费数据。这种方式避免将整个 ZIP 文件加载到内存。
-  
-- **异步线程 (`ExecutorService`)**:  
-  将数据生成逻辑放在单独的线程中执行，防止阻塞 HTTP 响应线程。
-
-#### 2. **资源管理**
-- **`InputStreamResource`**:  
-  将 `PipedInputStream` 包装为 Spring 的 `Resource` 对象，允许框架逐步读取数据并传输给客户端。
-
-- **自动关闭流**:  
-  在异步线程中确保 `out.close()` 被调用，最终触发 `in` 的结束。
-
-#### 3. **响应头设置**
-- **`Content-Disposition`**:  
-  告诉浏览器以附件形式下载文件，并指定文件名 `data.zip`。
-
-- **`Content-Type`**:  
-  设置为 `application/zip`，明确返回的是 ZIP 格式。
-
----
-
-### 优化场景
-- **大数据量导出**:  
-  如果数据量极大（例如百万级），建议分页查询数据库，逐步写入 CSV，避免一次性加载所有数据到内存。
-- **流式压缩**:  
-  边查询、边生成 CSV、边压缩，全程不占用完整内存。
-
----
-
-### 注意事项
-- **线程池管理**:  
-  示例中使用了简单的单线程池 (`Executors.newSingleThreadExecutor()`)，实际生产环境需要根据需求调整。
-- **异常处理**:  
-  在异步线程中捕获异常，避免因个别数据处理失败导致整个导出中断。
-- **超时控制**:  
-  如果导出时间较长，需配置 HTTP 超时时间或提供进度查询接口。
-
----
-
-### 分页查询优化（伪代码）
-```java
-int pageSize = 1000;
-int totalPages = calculateTotalPages(); // 根据总行数计算页数
-
-try (ZipOutputStream zos = new ZipOutputStream(out);
-     CSVPrinter printer = ...) {
-    for (int page = 0; page < totalPages; page++) {
-        List<Map<String, Object>> data = jdbcTemplate.queryForList(
-            "SELECT * FROM your_table LIMIT ? OFFSET ?", pageSize, page * pageSize
-        );
-        // 写入数据到 CSV
-    }
-}
-```
-
-通过这种方式，可以实现真正的流式处理，适合海量数据导出场景。
+### 测试建议
+- 访问`/export`端点，确认返回ZIP文件。
+- 解压ZIP检查CSV内容，验证数据和格式正确性。
+- 测试包含特殊字符、日期和空值的数据行。
