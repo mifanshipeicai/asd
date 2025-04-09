@@ -1,102 +1,228 @@
-在 Amazon S3 这样的对象存储中，"目录"本质上是基于前缀的虚拟结构。以下是使用 **AWS SDK for Java 2.x** 检查指定前缀下是否存在超过 150MB 对象的完整方案：
+在Spring Boot中实现分页查询并将结果合并到同一个ZIP文件中导出的步骤如下：
 
 ---
 
-### 步骤 1：添加依赖
-```xml
-<dependency>
-    <groupId>software.amazon.awssdk</groupId>
-    <artifactId>s3</artifactId>
-    <version>2.20.26</version> <!-- 使用最新版本 -->
-</dependency>
-```
+### 实现方案
+#### 核心思路
+1. **流式响应**：使用`StreamingResponseBody`逐步写入HTTP响应流，避免内存溢出
+2. **分页查询**：通过`LIMIT`和`OFFSET`实现分页（需根据数据库类型调整SQL语法）
+3. **边查边写**：每次查询到分页数据后立即写入ZIP流，减少内存占用
 
----
-
-### 步骤 2：Java 代码实现
+#### 实现代码
 ```java
-import software.amazon.awssdk.core.exception.SdkException;
-import software.amazon.awssdk.regions.Region;
-import software.amazon.awssdk.services.s3.S3Client;
-import software.amazon.awssdk.services.s3.model.*;
+import com.opencsv.CSVWriter;
+import org.springframework.http.*;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
-public class S3LargeObjectChecker {
-    private static final long MAX_SIZE_BYTES = 150L * 1024 * 1024; // 150MB
-    private static final String BUCKET_NAME = "your-bucket-name";
-    private static final String TARGET_PREFIX = "your/directory/prefix/"; // 以"/"结尾
+import java.io.OutputStreamWriter;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.Map;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
-    public static void main(String[] args) {
-        S3Client s3 = S3Client.builder()
-                .region(Region.US_EAST_1) // 根据实际情况修改
-                .build();
+@RestController
+public class ExportController {
 
-        boolean hasLargeObject = checkLargeObjects(s3);
-        System.out.println("存在超过150MB的对象: " + hasLargeObject);
+    private final JdbcTemplate jdbcTemplate;
+    private static final int PAGE_SIZE = 1000; // 每页条数
+
+    public ExportController(JdbcTemplate jdbcTemplate) {
+        this.jdbcTemplate = jdbcTemplate;
     }
 
-    private static boolean checkLargeObjects(S3Client s3) {
-        try {
-            ListObjectsV2Request request = ListObjectsV2Request.builder()
-                    .bucket(BUCKET_NAME)
-                    .prefix(TARGET_PREFIX)
-                    .build();
+    @GetMapping("/export")
+    public ResponseEntity<StreamingResponseBody> exportLargeData() {
+        // 设置响应头
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_OCTET_STREAM);
+        headers.setContentDisposition(
+                ContentDisposition.attachment().filename("data.zip").build());
 
-            // 使用分页遍历所有对象（避免截断）
-            for (ListObjectsV2Response response : s3.listObjectsV2Paginator(request)) {
-                boolean found = response.contents().stream()
-                        .anyMatch(s3Object -> s3Object.size() > MAX_SIZE_BYTES);
-                if (found) {
-                    return true;
-                }
+        // 流式响应实现
+        StreamingResponseBody stream = output -> {
+            try (ZipOutputStream zos = new ZipOutputStream(output);
+                OutputStreamWriter osw = new OutputStreamWriter(zos, StandardCharsets.UTF_8);
+                CSVWriter csvWriter = new CSVWriter(osw)) {
+
+                // 创建ZIP条目
+                zos.putNextEntry(new ZipEntry("data.csv"));
+
+                // 分页查询并写入
+                int offset = 0;
+                boolean hasHeader = false;
+                boolean hasMore;
+
+                do {
+                    // 执行分页查询（MySQL语法示例）
+                    List<Map<String, Object>> page = jdbcTemplate.queryForList(
+                            "SELECT * FROM your_table LIMIT ? OFFSET ?",
+                            PAGE_SIZE, offset);
+
+                    // 处理当前页数据
+                    if (!page.isEmpty()) {
+                        // 只写入一次表头
+                        if (!hasHeader) {
+                            String[] headersArr = page.get(0).keySet().toArray(new String[0]);
+                            csvWriter.writeNext(headersArr);
+                            hasHeader = true;
+                        }
+
+                        // 写入数据行
+                        for (Map<String, Object> row : page) {
+                            String[] values = row.values().stream()
+                                    .map(this::safeToString)
+                                    .toArray(String[]::new);
+                            csvWriter.writeNext(values);
+                        }
+                    }
+
+                    // 更新状态
+                    hasMore = page.size() >= PAGE_SIZE;
+                    offset += PAGE_SIZE;
+                } while (hasMore);
+
+                zos.closeEntry();
+            } catch (Exception e) {
+                throw new RuntimeException("Export failed", e);
             }
-            return false;
-        } catch (S3Exception e) {
-            System.err.println("S3错误: " + e.awsErrorDetails().errorMessage());
-            return false;
-        } catch (SdkException e) {
-            System.err.println("SDK错误: " + e.getMessage());
-            return false;
+        };
+
+        return new ResponseEntity<>(stream, headers, HttpStatus.OK);
+    }
+
+    // 安全转换对象为字符串
+    private String safeToString(Object value) {
+        if (value == null) return "";
+        if (value instanceof java.util.Date) {
+            return new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(value);
         }
+        return value.toString();
     }
 }
 ```
 
 ---
 
-### 关键点说明
+### 关键优化点
 
-1. **前缀而非目录**：
-   - S3 没有真正的目录结构，通过 `prefix` 参数模拟目录查询（例如 `"reports/2023/"`）。
-   - 确保 `prefix` 以 `/` 结尾，避免匹配类似前缀的其他对象。
+1. **内存控制**：
+   - 每次只保留当前页数据在内存中
+   - 通过`StreamingResponseBody`实现流式输出
 
-2. **分页处理**：
-   - 使用 `listObjectsV2Paginator` 自动处理分页，确保获取所有对象。
+2. **分页策略**：
+   ```sql
+   -- MySQL分页示例
+   SELECT * FROM table LIMIT {pageSize} OFFSET {offset}
+   
+   -- PostgreSQL分页
+   SELECT * FROM table LIMIT {pageSize} OFFSET {offset}
+   
+   -- Oracle分页（需使用ROWNUM）
+   SELECT * FROM (
+     SELECT t.*, ROWNUM rn FROM (
+       SELECT * FROM table ORDER BY id
+     ) t WHERE ROWNUM <= {offset + pageSize}
+   ) WHERE rn > {offset}
+   ```
 
-3. **性能优化**：
-   - 使用 `anyMatch` 短路操作，发现首个大对象后立即终止检查。
+3. **断点续传支持**：
+   ```java
+   // 可添加Range头处理（需要记录offset）
+   String rangeHeader = request.getHeader("Range");
+   if (rangeHeader != null) {
+       // 解析已传输的offset值
+       // 调整分页查询的起始offset
+   }
+   ```
 
-4. **异常处理**：
-   - 捕获 `S3Exception` 处理权限、Bucket不存在等问题。
-   - 通用 `SdkException` 捕获网络等底层错误。
+4. **性能监控**：
+   ```java
+   // 添加性能日志
+   long startTime = System.currentTimeMillis();
+   int totalRows = 0;
+   
+   // 在分页循环中添加：
+   totalRows += page.size();
+   if (totalRows % 10_000 == 0) {
+       log.info("Exported {} rows, time elapsed: {}s",
+               totalRows, (System.currentTimeMillis()-startTime)/1000);
+   }
+   ```
 
 ---
 
-### 补充：权限要求
-确保 IAM 用户/角色拥有以下权限：
-```json
-{
-    "Version": "2012-10-17",
-    "Statement": [{
-        "Effect": "Allow",
-        "Action": ["s3:ListBucket"],
-        "Resource": ["arn:aws:s3:::your-bucket-name"]
-    }]
-}
-```
+### 扩展建议
+
+1. **动态字段处理**：
+   ```java
+   // 若需要动态指定字段，可添加参数
+   @RequestParam List<String> fields
+
+   // 修改查询SQL为：
+   String sql = String.format("SELECT %s FROM table", String.join(",", fields));
+   ```
+
+2. **压缩优化**：
+   ```java
+   // 使用更高压缩比（但会增加CPU消耗）
+   zos.setLevel(Deflater.BEST_COMPRESSION);
+
+   // 或使用更快的压缩
+   zos.setLevel(Deflater.BEST_SPEED);
+   ```
+
+3. **超时处理**：
+   ```java
+   // 配置异步请求超时
+   @GetMapping(value = "/export", produces = "application/zip")
+   public Callable<ResponseEntity<StreamingResponseBody>> handleRequest() {
+       return () -> {
+           // 分页查询逻辑
+       };
+   }
+   ```
+
+4. **断点续传实现**：
+   ```java
+   // 在响应头中添加：
+   headers.set("Accept-Ranges", "bytes");
+   headers.setContentType(MediaType.valueOf("application/zip"));
+   
+   // 处理Range请求：
+   String range = request.getHeader(HttpHeaders.RANGE);
+   if (range != null) {
+       // 解析范围值
+       // 调整ZIP输出流的位置
+   }
+   ```
 
 ---
 
-### 验证方式
-1. 替换代码中的 `BUCKET_NAME` 和 `TARGET_PREFIX`。
-2. 配置 AWS 凭证（通过环境变量、`~/.aws/credentials` 文件或 IAM 角色）。
-3. 执行代码检查输出结果。
+### 测试建议
+
+1. **不同数据量测试**：
+   - 测试空表情况
+   - 测试刚好整页（如1000条）
+   - 测试非整页（如1500条）
+
+2. **异常场景测试**：
+   - 网络中断后重连
+   - 数据库连接超时
+   - 大字段（如包含换行符、逗号等特殊字符）
+
+3. **性能测试**：
+   ```bash
+   # 使用压测工具
+   ab -n 100 -c 10 http://localhost:8080/export
+
+   # 监控内存使用
+   jstat -gc <pid> 1000
+   ```
+
+---
+
+这种实现方式在保证功能完整性的同时，通过流式处理和分页机制有效控制了内存使用，适用于大数据量导出场景。实际使用中需要根据具体数据库类型和业务需求调整分页实现方式。
