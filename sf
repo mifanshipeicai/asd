@@ -1,90 +1,125 @@
-在Java中，可以通过以下步骤检查指定目录下是否存在超过150MB的文件：
+在 WebFlux 中使用 Spring JdbcTemplate 实现流式导出 CSV 并压缩为 ZIP 文件，需确保数据从数据库到客户端全程流式处理，避免内存溢出。以下是分步解决方案：
 
-### 方法1：使用NIO API（推荐，支持递归遍历）
+### 1. 配置流式数据库查询
+确保 JdbcTemplate 使用流式结果集。以 PostgreSQL 为例，需设置 `fetchSize` 为 `Integer.MIN_VALUE`：
+
 ```java
-import java.io.IOException;
-import java.nio.file.*;
-import java.util.stream.Stream;
-
-public class LargeFileChecker {
-    public static void main(String[] args) {
-        Path directory = Paths.get("指定目录路径");
-        long maxSize = 150 * 1024 * 1024; // 150MB转换为字节
-
-        try (Stream<Path> pathStream = Files.walk(directory)) { // 递归遍历所有子目录
-            boolean hasLargeFile = pathStream
-                    .filter(Files::isRegularFile) // 仅检查普通文件
-                    .anyMatch(path -> {
-                        try {
-                            return Files.size(path) > maxSize;
-                        } catch (IOException e) {
-                            System.err.println("无法读取文件大小: " + path);
-                            return false;
-                        }
-                    });
-            System.out.println("存在超过150MB的文件: " + hasLargeFile);
-        } catch (IOException e) {
-            System.err.println("遍历目录出错: " + e.getMessage());
-        }
-    }
-}
+jdbcTemplate.query(con -> {
+    PreparedStatement ps = con.prepareStatement(
+        "SELECT * FROM your_table",
+        ResultSet.TYPE_FORWARD_ONLY,
+        ResultSet.CONCUR_READ_ONLY
+    );
+    ps.setFetchSize(Integer.MIN_VALUE); // 启用流式结果集
+    return ps;
+}, rowCallbackHandler);
 ```
 
-### 方法2：仅检查当前目录（不递归）
+### 2. 创建反应式 Controller 端点
+使用 `Flux<DataBuffer>` 作为返回类型，并设置正确的响应头：
+
 ```java
-try (Stream<Path> pathStream = Files.list(directory)) { // 不遍历子目录
-    boolean hasLargeFile = pathStream
-            .filter(Files::isRegularFile)
-            .anyMatch(path -> {
-                try {
-                    return Files.size(path) > maxSize;
-                } catch (IOException e) {
-                    System.err.println("无法读取文件大小: " + path);
-                    return false;
-                }
+@GetMapping(value = "/export", produces = "application/zip")
+public Flux<DataBuffer> exportAsZip() {
+    return Flux.using(
+        // 初始化资源：管道流和 ZipOutputStream
+        this::createStreams,
+        // 处理数据流
+        tuple -> {
+            startDbProcessing(tuple.getT1(), tuple.getT2());
+            return DataBufferUtils.readInputStream(() -> tuple.getT3(), new DefaultDataBufferFactory(), 4096);
+        },
+        // 释放资源
+        this::closeResources
+    );
+}
+
+private Tuple3<ZipOutputStream, PipedOutputStream, PipedInputStream> createStreams() throws IOException {
+    PipedOutputStream pos = new PipedOutputStream();
+    PipedInputStream pis = new PipedInputStream(pos);
+    ZipOutputStream zos = new ZipOutputStream(pos);
+    zos.putNextEntry(new ZipEntry("data.csv"));
+    return Tuples.of(zos, pos, pis);
+}
+
+private void startDbProcessing(ZipOutputStream zos, PipedOutputStream pos) {
+    Schedulers.boundedElastic().schedule(() -> {
+        try {
+            jdbcTemplate.query(con -> { /* 如上配置流式查询 */ }, rs -> {
+                String csvLine = convertToCsv(rs);
+                zos.write(csvLine.getBytes(StandardCharsets.UTF_8));
+                zos.write('\n');
             });
-    System.out.println("存在超过150MB的文件: " + hasLargeFile);
+            zos.closeEntry();
+            zos.close();
+            pos.close();
+        } catch (Exception e) {
+            // 异常处理
+        }
+    });
+}
+
+private void closeResources(Tuple3<ZipOutputStream, PipedOutputStream, PipedInputStream> tuple) {
+    try {
+        if (tuple.getT1() != null) tuple.getT1().close();
+        if (tuple.getT2() != null) tuple.getT2().close();
+        if (tuple.getT3() != null) tuple.getT3().close();
+    } catch (IOException e) {
+        // 处理关闭异常
+    }
 }
 ```
 
-### 方法3：传统File类实现（递归）
+### 3. CSV 转换方法
+将 `ResultSet` 行转换为 CSV 格式，注意处理特殊字符：
+
 ```java
-import java.io.File;
-
-public class FileUtils {
-    public static boolean hasLargeFiles(File dir, long maxSize) {
-        if (!dir.isDirectory()) {
-            throw new IllegalArgumentException("路径不是目录");
+private String convertToCsv(ResultSet rs) throws SQLException {
+    StringBuilder sb = new StringBuilder();
+    ResultSetMetaData metaData = rs.getMetaData();
+    int columnCount = metaData.getColumnCount();
+    
+    for (int i = 1; i <= columnCount; i++) {
+        String value = rs.getString(i);
+        // 处理逗号和换行符
+        if (value.contains(",") || value.contains("\n")) {
+            value = "\"" + value.replace("\"", "\"\"") + "\"";
         }
-        File[] files = dir.listFiles();
-        if (files == null) return false;
-
-        for (File file : files) {
-            if (file.isFile() && file.length() > maxSize) {
-                return true;
-            } else if (file.isDirectory()) {
-                if (hasLargeFiles(file, maxSize)) { // 递归检查子目录
-                    return true;
-                }
-            }
-        }
-        return false;
+        sb.append(value);
+        if (i < columnCount) sb.append(",");
     }
-
-    public static void main(String[] args) {
-        File dir = new File("指定目录路径");
-        long maxSize = 150 * 1024 * 1024;
-        System.out.println("存在大文件: " + hasLargeFiles(dir, maxSize));
-    }
+    return sb.toString();
 }
 ```
 
-### 注意事项：
-1. **单位换算**：`150MB = 150 * 1024 * 1024 字节`，确保正确转换。
-2. **递归控制**： 
-   - 使用`Files.walk()`会遍历所有子目录，若仅需当前目录，改用`Files.list()`。
-3. **异常处理**：
-   - 捕获`IOException`处理无权限或无法访问的文件。
-4. **性能**：发现首个大文件会立即返回，避免不必要的遍历。
+### 4. 处理响应头和文件名
+在 Controller 方法中设置 `Content-Disposition` 头：
 
-根据需求选择是否包含子目录检查。推荐使用NIO API（方法1或2），因其代码更简洁且能更好地处理符号链接等复杂情况。
+```java
+@GetMapping(...)
+public Flux<DataBuffer> exportAsZip(ServerHttpResponse response) {
+    response.getHeaders().setContentDisposition(
+        ContentDisposition.attachment().filename("data.zip").build()
+    );
+    // 其余代码同上
+}
+```
+
+### 关键点说明
+1. **流式数据库查询**：通过 JDBC 驱动特定的 `fetchSize` 设置实现真正的流式获取数据。
+2. **异步处理**：使用 `Schedulers.boundedElastic()` 执行阻塞的 JDBC 和 ZIP 操作，避免阻塞 Reactor 线程。
+3. **管道流连接**：通过 `PipedInputStream/PipedOutputStream` 将 ZIP 压缩与响应输出连接，实现流式压缩。
+4. **资源管理**：使用 `Flux.using` 确保流关闭时释放所有资源（数据库连接、流等）。
+5. **背压支持**：Spring WebFlux 自动处理背压，确保数据生成速度与客户端消费速度匹配。
+
+此方案实现了：
+- 数据库查询结果逐行处理
+- 实时 CSV 格式转换
+- 动态 ZIP 压缩
+- 非阻塞网络传输
+- 内存使用恒定（不随数据量增长）
+
+注意事项：
+- 不同数据库的流式查询配置可能不同（如 MySQL 需要 `useCursorFetch=true`）
+- 确保数据库事务和连接池配置支持长时间运行的流式查询
+- 生产环境需添加完善的错误处理和日志记录
