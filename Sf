@@ -1,37 +1,207 @@
-@Configuration
-public class SftpConfig {
+可以按照以下方案实现您的需求，将CSV数据加载为嵌套结构，其中：
 
-    @Value("${sftp.host}")
-    private String host;
+- **Key** 为前5个字段的组合（例如：`f1,f2,f3,f4,f5`）
+- **Value** 包含两个独立的分组：
+  - `group6_10`: List<Map>，每个Map对应第6-10列的键值对
+  - `group11_15`: List<Map>，每个Map对应第11-15列的键值对
 
-    @Value("${sftp.port}")
-    private int port;
+---
 
-    @Value("${sftp.username}")
-    private String username;
+### **实现步骤**
 
-    @Value("${sftp.password}")
-    private String password;
+#### 1. 定义数据结构
+```java
+// 使用不可变对象作为Key（确保equals/hashCode正确）
+public record CsvKey(String f1, String f2, String f3, String f4, String f5) {}
 
-    @Value("${sftp.timeout}")
-    private int timeout;
+// 定义Value对象，包含两个分组
+public class CsvGroupedData {
+    private final List<Map<String, String>> group6_10;  // 存储6-10列数据
+    private final List<Map<String, String>> group11_15; // 存储11-15列数据
 
-    @Bean
-    public Session sftpSession() throws JSchException {
-        JSch jsch = new JSch();
-        Session session = jsch.getSession(username, host, port);
-        session.setPassword(password);
-        session.setConfig("StrictHostKeyChecking", "no");
-        session.setTimeout(timeout);
-        session.connect();
-        return session;
+    public CsvGroupedData() {
+        this.group6_10 = new ArrayList<>();
+        this.group11_15 = new ArrayList<>();
     }
 
-    @Bean
-    @Scope("prototype")
-    public ChannelSftp sftpChannel(Session session) throws JSchException {
-        ChannelSftp channel = (ChannelSftp) session.openChannel("sftp");
-        channel.connect();
-        return channel;
+    public void addGroup6_10(Map<String, String> entry) {
+        group6_10.add(entry);
+    }
+
+    public void addGroup11_15(Map<String, String> entry) {
+        group11_15.add(entry);
+    }
+
+    // Getters
+    public List<Map<String, String>> getGroup6_10() {
+        return Collections.unmodifiableList(group6_10);
+    }
+
+    public List<Map<String, String>> getGroup11_15() {
+        return Collections.unmodifiableList(group11_15);
     }
 }
+```
+
+---
+
+#### 2. 加载CSV数据到内存
+```java
+@Service
+public class CsvDataLoader {
+    private final Map<CsvKey, CsvGroupedData> dataMap = new ConcurrentHashMap<>();
+
+    @PostConstruct
+    public void loadCsvData() throws IOException {
+        // 读取CSV标题行（假设第一行为列名）
+        List<String> headers = readCsvHeaders();
+
+        // 解析数据行
+        try (InputStream is = getClass().getResourceAsStream("/data.csv");
+             Reader reader = new InputStreamReader(is, StandardCharsets.UTF_8);
+             CSVParser parser = CSVFormat.DEFAULT.parse(reader)) {
+
+            for (CSVRecord record : parser) {
+                // 跳过标题行（已提前读取）
+                if (parser.getCurrentLineNumber() == 1) continue;
+
+                // 构造Key（前5列）
+                CsvKey key = new CsvKey(
+                    record.get(0).trim(), record.get(1).trim(),
+                    record.get(2).trim(), record.get(3).trim(),
+                    record.get(4).trim()
+                );
+
+                // 构建分组Map
+                Map<String, String> group6_10 = buildGroupMap(headers, record, 5, 10);  // 6-10列
+                Map<String, String> group11_15 = buildGroupMap(headers, record, 10, 15); // 11-15列
+
+                // 存入Map
+                CsvGroupedData groupedData = dataMap.computeIfAbsent(
+                    key, k -> new CsvGroupedData()
+                );
+                groupedData.addGroup6_10(group6_10);
+                groupedData.addGroup11_15(group11_15);
+            }
+        }
+    }
+
+    // 读取CSV标题行（假设第一行为列名）
+    private List<String> readCsvHeaders() throws IOException {
+        try (InputStream is = getClass().getResourceAsStream("/data.csv");
+             Reader reader = new InputStreamReader(is, StandardCharsets.UTF_8);
+             CSVParser parser = CSVFormat.DEFAULT.parse(reader)) {
+            return parser.iterator().next().toList();
+        }
+    }
+
+    // 构建分组Map（动态绑定列名）
+    private Map<String, String> buildGroupMap(
+        List<String> headers, CSVRecord record, int start, int end
+    ) {
+        Map<String, String> map = new HashMap<>();
+        for (int i = start; i < end; i++) {
+            String header = headers.get(i);  // 获取列名（例如：column6）
+            String value = record.get(i).trim();
+            map.put(header, value);
+        }
+        return map;
+    }
+
+    // 查询接口
+    public CsvGroupedData getData(CsvKey key) {
+        return dataMap.get(key);
+    }
+}
+```
+
+---
+
+#### 3. 提供查询接口
+```java
+@RestController
+@RequestMapping("/api/data")
+public class DataController {
+    private final CsvDataLoader csvDataLoader;
+
+    public DataController(CsvDataLoader csvDataLoader) {
+        this.csvDataLoader = csvDataLoader;
+    }
+
+    @GetMapping("/query")
+    public ResponseEntity<CsvGroupedData> queryData(
+        @RequestParam String f1, @RequestParam String f2,
+        @RequestParam String f3, @RequestParam String f4,
+        @RequestParam String f5
+    ) {
+        CsvKey key = new CsvKey(f1, f2, f3, f4, f5);
+        CsvGroupedData result = csvDataLoader.getData(key);
+        return result != null ?
+            ResponseEntity.ok(result) :
+            ResponseEntity.notFound().build();
+    }
+}
+```
+
+---
+
+### **数据结构示例**
+假设CSV内容如下（第一行为列名）：
+```csv
+col1,col2,col3,col4,col5,col6,col7,col8,col9,col10,col11,col12,col13,col14,col15
+A,B,C,D,E,100,200,300,400,500,X,Y,Z,AA,BB
+A,B,C,D,E,600,700,800,900,1000,CC,DD,EE,FF,GG
+```
+
+查询 `f1=A&f2=B&f3=C&f4=D&f5=E` 时，返回结果如下：
+```json
+{
+  "group6_10": [
+    {
+      "col6": "100",
+      "col7": "200",
+      "col8": "300",
+      "col9": "400",
+      "col10": "500"
+    },
+    {
+      "col6": "600",
+      "col7": "700",
+      "col8": "800",
+      "col9": "900",
+      "col10": "1000"
+    }
+  ],
+  "group11_15": [
+    {
+      "col11": "X",
+      "col12": "Y",
+      "col13": "Z",
+      "col14": "AA",
+      "col15": "BB"
+    },
+    {
+      "col11": "CC",
+      "col12": "DD",
+      "col13": "EE",
+      "col14": "FF",
+      "col15": "GG"
+    }
+  ]
+}
+```
+
+---
+
+### **关键设计说明**
+1. **动态列名绑定**  
+   通过读取CSV标题行，动态绑定列名到Map的键，避免硬编码。
+
+2. **支持多行相同Key**  
+   如果多行数据的前5列相同，它们的6-10和11-15列数据会以List形式合并存储。
+
+3. **线程安全**  
+   使用 `ConcurrentHashMap` 存储数据，确保并发安全。
+
+4. **内存优化**  
+   数据在启动时一次性加载，适合中小型文件（百万级以下数据）。
