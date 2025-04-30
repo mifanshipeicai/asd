@@ -1,186 +1,161 @@
-如果文件存储在 S3 对象存储中，可以通过 **流式拉取 S3 对象 + 流式传输到第三方接口** 实现零内存驻留（或极小内存占用）。以下是完整解决方案：
+以下是用 Python 编写接口调用、下载文件到指定目录并计算耗时的完整代码，包含详细注释和优化：
 
----
+```python
+import os
+import time
+import requests
+from tqdm import tqdm  # 进度条库（需安装：pip install tqdm）
 
-### **1. 使用 AWS SDK 流式读取 S3 文件**
-**关键点**：直接获取 S3 对象的 `InputStream`，避免下载到本地或内存。
+def download_file(url: str, save_dir: str, filename: str = None) -> float:
+    """
+    下载文件到指定目录并返回耗时
+    
+    :param url: 文件下载地址
+    :param save_dir: 文件保存目录
+    :param filename: 保存文件名（可选，默认从URL提取）
+    :return: 下载耗时（秒）
+    """
+    # 确保目录存在
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 获取文件名
+    if not filename:
+        filename = os.path.basename(url).split("?")[0]  # 处理带参数的URL
+    
+    save_path = os.path.join(save_dir, filename)
+    
+    try:
+        # 发送HEAD请求获取文件大小（用于进度条）
+        head_resp = requests.head(url, allow_redirects=True)
+        file_size = int(head_resp.headers.get('Content-Length', 0))
+        
+        # 记录开始时间
+        start_time = time.perf_counter()
+        
+        # 流式下载文件
+        with requests.get(url, stream=True) as response:
+            response.raise_for_status()  # 检查HTTP错误
+            
+            # 初始化进度条
+            progress = tqdm(
+                total=file_size,
+                unit='B',
+                unit_scale=True,
+                desc=f"下载 {filename}",
+                ncols=100  # 进度条宽度
+            )
+            
+            # 写入文件
+            with open(save_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:  # 过滤keep-alive chunks
+                        f.write(chunk)
+                        progress.update(len(chunk))
+            
+            progress.close()
+            
+        # 计算耗时
+        elapsed = time.perf_counter() - start_time
+        print(f"下载完成！保存路径：{save_path}")
+        print(f"文件大小：{file_size / 1024 / 1024:.2f} MB")
+        print(f"耗时：{elapsed:.2f} 秒 | 平均速度：{file_size / elapsed / 1024 / 1024:.2f} MB/s")
+        return elapsed
+        
+    except Exception as e:
+        # 清理未完成文件
+        if os.path.exists(save_path):
+            os.remove(save_path)
+        raise RuntimeError(f"下载失败: {str(e)}")
 
-```java
-import software.amazon.awssdk.core.sync.ResponseTransformer;
-import software.amazon.awssdk.services.s3.S3Client;
-import software.amazon.awssdk.services.s3.model.GetObjectRequest;
-
-public InputStream getS3ObjectStream(String bucket, String key) {
-    S3Client s3Client = S3Client.create(); // 确保复用 S3Client
-    GetObjectRequest request = GetObjectRequest.builder()
-            .bucket(bucket)
-            .key(key)
-            .build();
-    return s3Client.getObject(request, ResponseTransformer.toInputStream());
-}
+# 使用示例
+if __name__ == "__main__":
+    download_url = "https://example.com/largefile.zip"  # 替换为实际URL
+    save_directory = "./downloads"  # 保存目录
+    file_name = "dataset.zip"      # 自定义文件名（可选）
+    
+    try:
+        time_cost = download_file(download_url, save_directory, file_name)
+    except Exception as e:
+        print(str(e))
 ```
 
----
+### 代码特点说明
 
-### **2. 流式传输到第三方接口（使用 WebClient）**
-**关键点**：将 S3 的 `InputStream` 直接作为 HTTP 请求体流式传输。
+1. **智能文件名提取**  
+   - 自动从URL中提取文件名，处理带参数的URL（如 `file.zip?token=abc`）
+   - 支持自定义文件名
 
-```java
-import org.springframework.core.io.InputStreamResource;
-import org.springframework.web.reactive.function.client.WebClient;
-import reactor.core.publisher.Mono;
+2. **流式下载优化**  
+   - 使用 `stream=True` 避免内存爆炸
+   - 分块写入（`chunk_size=8192`）平衡内存和IO效率
 
-public Mono<Void> streamToThirdParty(InputStream inputStream) {
-    return WebClient.create()
-        .post()
-        .uri("https://third-party-api/upload")
-        .body(BodyInserters.fromResource(new InputStreamResource(inputStream)))
-        .retrieve()
-        .bodyToMono(Void.class)
-        .doFinally(signal -> {
-            try {
-                inputStream.close(); // 手动关闭流
-            } catch (IOException e) {
-                // 日志处理
-            }
-        });
-}
+3. **进度显示**  
+   - 通过 `tqdm` 显示实时进度条
+   - 显示下载速度、剩余时间等关键信息
+
+4. **异常处理**  
+   - 自动删除未完成文件
+   - 捕获所有异常并提供明确错误信息
+
+5. **性能统计**  
+   - 精确到毫秒的计时（`time.perf_counter()`）
+   - 计算平均下载速度
+
+6. **目录自动创建**  
+   - 使用 `os.makedirs(..., exist_ok=True)` 自动创建目录
+
+### 运行效果示例
+
+```text
+下载 dataset.zip: 100%|████████████| 256M/256M [00:12<00:00, 21.3MB/s]
+下载完成！保存路径：./downloads/dataset.zip
+文件大小：256.00 MB
+耗时：12.34 秒 | 平均速度：20.75 MB/s
 ```
 
----
+### 扩展优化建议
 
-### **3. 整合流程（逐文件处理）**
-```java
-public void processS3File(String bucket, String key) {
-    try (InputStream s3Stream = getS3ObjectStream(bucket, key)) {
-        streamToThirdParty(s3Stream).block(); // 同步阻塞（异步方案见下文）
-    } catch (IOException e) {
-        // 异常处理
-    }
-}
-```
-
----
-
-### **4. 进阶优化方案**
-
-#### **4.1 异步非阻塞处理**
-使用 Reactor 实现全链路非阻塞：
-```java
-public Mono<Void> processS3FileAsync(String bucket, String key) {
-    return Mono.fromSupplier(() -> getS3ObjectStream(bucket, key))
-        .flatMap(inputStream -> 
-            streamToThirdParty(inputStream)
-                .doOnTerminate(() -> {
-                    try {
-                        inputStream.close();
-                    } catch (IOException e) {
-                        // 日志处理
-                    }
-                })
-        );
-}
-```
-
-#### **4.2 并发控制（信号量限流）**
-限制同时处理的文件数：
-```java
-private final Scheduler scheduler = Schedulers.newBoundedElastic(
-    4,          // 最大并发数
-    100,        // 队列容量
-    "s3-pool"
-);
-
-public void processAllFiles(List<String> s3Keys) {
-    Flux.fromIterable(s3Keys)
-        .flatMap(key -> 
-            processS3FileAsync("my-bucket", key)
-                .subscribeOn(scheduler),
-            4 // 并发度
-        )
-        .blockLast();
-}
-```
-
-#### **4.3 分块传输编码（Chunked Transfer）**
-如果第三方接口支持分块传输：
-```java
-// 在 WebClient 请求头中明确启用分块
-.body(BodyInserters.fromResource(new InputStreamResource(inputStream)))
-.header(HttpHeaders.TRANSFER_ENCODING, "chunked")
-```
-
-#### **4.4 内存监控**
-在 `application.properties` 中限制 WebClient 内存缓冲：
-```properties
-spring.codec.max-in-memory-size=1MB  # 强制使用流式，避免缓冲
-```
-
----
-
-### **5. 关键注意事项**
-
-1. **资源泄漏防护**：
-   - 确保所有 `InputStream` 在传输结束后关闭。
-   - 使用 `try-with-resources` 或 Reactor 的 `doOnTerminate`/`doFinally` 钩子。
-
-2. **S3 客户端复用**：
-   - 复用 `S3Client` 实例（避免每次创建新客户端）。
-
-3. **超时与重试**：
-   ```java
-   .retrieve()
-   .bodyToMono(Void.class)
-   .timeout(Duration.ofMinutes(10))  // 设置超时
-   .retry(3)                        // 重试机制
+1. **断点续传**  
+   添加以下代码实现断点续传：
+   ```python
+   file_size_downloaded = os.path.getsize(save_path) if os.path.exists(save_path) else 0
+   headers = {"Range": f"bytes={file_size_downloaded}-"} if file_size_downloaded else None
+   response = requests.get(url, headers=headers, stream=True)
    ```
 
-4. **大文件冷存储优化**：
-   - 如果文件在 S3 Glacier 等冷存储中，确保先触发解冻再读取。
+2. **多线程下载**  
+   使用 `concurrent.futures` 实现分块并行下载：
+   ```python
+   from concurrent.futures import ThreadPoolExecutor
+   ```
 
----
+3. **文件校验**  
+   下载完成后验证文件完整性：
+   ```python
+   import hashlib
+   def calculate_md5(file_path):
+       # 计算文件MD5
+   ```
 
-### **6. 完整工作流示例**
-```java
-public void processAllS3Files() {
-    List<String> s3Keys = List.of("file1.txt", "file2.txt", "file3.txt");
+4. **代理支持**  
+   添加代理配置：
+   ```python
+   proxies = {
+       'http': 'http://10.10.1.10:3128',
+       'https': 'http://10.10.1.10:1080',
+   }
+   response = requests.get(url, proxies=proxies, stream=True)
+   ```
 
-    Flux.fromIterable(s3Keys)
-        .parallel(4) // 并行度
-        .runOn(Schedulers.boundedElastic())
-        .flatMap(key -> 
-            Mono.fromCallable(() -> getS3ObjectStream("my-bucket", key))
-                .flatMap(inputStream ->
-                    WebClient.create()
-                        .post()
-                        .uri("https://third-party-api/upload")
-                        .body(BodyInserters.fromResource(new InputStreamResource(inputStream)))
-                        .retrieve()
-                        .bodyToMono(Void.class)
-                        .doFinally(s -> closeStream(inputStream))
-                )
-                .retry(3)
-                .onErrorResume(e -> {
-                    log.error("Failed to process {}", key, e);
-                    return Mono.empty();
-                })
-        )
-        .sequential()
-        .blockLast();
-}
+### 环境要求
 
-private void closeStream(InputStream is) {
-    try {
-        is.close();
-    } catch (IOException e) {
-        // 日志处理
-    }
-}
-```
+1. 安装依赖：
+   ```bash
+   pip install requests tqdm
+   ```
 
----
+2. 测试文件建议：
+   - 小文件测试：`https://httpbin.org/stream-bytes/1024`
+   - 大文件测试：`https://speed.hetzner.de/100MB.bin`
 
-通过以上方案，可以实现：
-1. **零内存峰值**：数据从 S3 到第三方接口全程流式传输。
-2. **可控并发**：通过线程池或 Reactor 调度器限制资源使用。
-3. **高可靠性**：超时、重试、资源关闭等防护机制。
+该代码可直接用于生产环境，通过合理的异常处理和性能优化，能够稳定处理从KB级到GB级文件的下载任务。
