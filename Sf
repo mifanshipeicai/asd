@@ -1,64 +1,278 @@
-根据需求调整，若需判断列表中是否存在任意一个 `Map` 满足其 **唯一的键** 属于给定的多个目标键之一，且对应的列表元素个数为1，实现如下：
+以下是针对多台SFTP服务器的动态选择解决方案：
 
-### 代码实现
+### 增强版实现方案
+
+#### 1. 扩展配置存储（以数据库为例）
 ```java
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+@Entity
+public class SftpServerConfig {
+    @Id
+    private String serverId;
+    private String host;
+    private int port = 22;
+    private String user;
+    private String password;
+    private String privateKeyPath;
+    private String remoteDirectory;
+    // getters/setters
+}
+```
 
-public class KeyChecker {
+#### 2. 创建配置服务
+```java
+@Service
+public class SftpConfigService {
+    @Autowired
+    private SftpConfigRepository configRepository;
 
-    // 方法一：传统循环方式
-    public static boolean hasAnyKeyWithSingleElement(List<Map<String, List<String>>> list, Set<String> targetKeys) {
-        for (Map<String, List<String>> map : list) {
-            // 每个Map有且仅有一个Key
-            if (map.size() != 1) continue; // 防御性判断，根据实际情况可移除
-            String key = map.keySet().iterator().next();
-            if (targetKeys.contains(key)) {
-                List<String> values = map.get(key);
-                if (values != null && values.size() == 1) {
-                    return true;
-                }
-            }
-        }
-        return false;
+    private final Map<String, SessionFactory<ChannelSftp.LsEntry>> sessionFactoryCache = new ConcurrentHashMap<>();
+    private final Map<String, SftpRemoteFileTemplate> templateCache = new ConcurrentHashMap<>();
+
+    public SftpRemoteFileTemplate getSftpTemplate(String serverId) {
+        return templateCache.computeIfAbsent(serverId, id -> {
+            SessionFactory<ChannelSftp.LsEntry> sessionFactory = sessionFactoryCache.computeIfAbsent(id, 
+                key -> createSessionFactory(configRepository.findById(key)
+                    .orElseThrow(() -> new IllegalArgumentException("Invalid SFTP server ID"))));
+            return new SftpRemoteFileTemplate(sessionFactory);
+        });
     }
 
-    // 方法二：Stream API（更简洁）
-    public static boolean hasAnyKeyWithSingleElementStream(List<Map<String, List<String>>> list, Set<String> targetKeys) {
-        return list.stream()
-            .filter(map -> map.size() == 1) // 确保每个Map只有一个键
-            .anyMatch(map -> {
-                String key = map.keySet().iterator().next();
-                return targetKeys.contains(key) 
-                       && map.get(key) != null 
-                       && map.get(key).size() == 1;
-            });
+    private SessionFactory<ChannelSftp.LsEntry> createSessionFactory(SftpServerConfig config) {
+        DefaultSftpSessionFactory factory = new DefaultSftpSessionFactory(true);
+        factory.setHost(config.getHost());
+        factory.setPort(config.getPort());
+        factory.setUser(config.getUser());
+        
+        if (config.getPassword() != null) {
+            factory.setPassword(config.getPassword());
+        } else if (config.getPrivateKeyPath() != null) {
+            factory.setPrivateKey(new FileSystemResource(config.getPrivateKeyPath()));
+        }
+        
+        factory.setAllowUnknownKeys(true);
+        return new CachingSessionFactory<>(factory);
     }
 }
 ```
 
-### 关键逻辑说明
-1. **遍历每个 `Map`**：逐个检查列表中的 `Map`。
-2. **提取唯一的键**：通过 `map.keySet().iterator().next()` 获取 `Map` 中唯一的键。
-3. **键匹配检查**：确认该键是否在目标键集合 `targetKeys` 中。
-4. **列表长度验证**：检查对应列表非空且长度等于1。
-5. **立即返回结果**：找到符合条件的 `Map` 则直接返回 `true`，否则遍历结束后返回 `false`。
-
-### 使用示例
+#### 3. 增强SFTP服务
 ```java
-Set<String> targetKeys = Set.of("name", "id", "date");
-List<Map<String, List<String>>> data = List.of(
-    Map.of("name", List.of("Alice")),
-    Map.of("age", List.of("30")),
-    Map.of("id", List.of("001", "002")) // 不符合，列表长度>1
-);
+@Service
+public class DynamicSftpService {
+    private final SftpConfigService configService;
 
-boolean result = KeyChecker.hasAnyKeyWithSingleElement(data, targetKeys);
-System.out.println(result); // 输出 true（存在 "name" 符合条件）
+    @Autowired
+    public DynamicSftpService(SftpConfigService configService) {
+        this.configService = configService;
+    }
+
+    @Async("sftpTaskExecutor")
+    public CompletableFuture<Void> uploadFile(String serverId, File file) {
+        return CompletableFuture.runAsync(() -> {
+            SftpRemoteFileTemplate template = configService.getSftpTemplate(serverId);
+            SftpServerConfig config = configService.getConfig(serverId);
+            
+            template.execute(session -> {
+                String remotePath = config.getRemoteDirectory() + "/" + file.getName();
+                try (InputStream is = new FileInputStream(file)) {
+                    session.write(is, remotePath);
+                }
+                return null;
+            });
+        });
+    }
+
+    @Async("sftpTaskExecutor")
+    public CompletableFuture<File> downloadFile(String serverId, String remotePath, File localFile) {
+        return CompletableFuture.supplyAsync(() -> {
+            SftpRemoteFileTemplate template = configService.getSftpTemplate(serverId);
+            template.execute(session -> {
+                try (OutputStream os = new FileOutputStream(localFile)) {
+                    session.read(remotePath, os);
+                }
+                return null;
+            });
+            return localFile;
+        });
+    }
+}
 ```
 
-### 注意事项
-- **防御性校验**：代码中 `map.size() != 1` 的判断是为了确保每个 `Map` 仅有一个键，若业务场景已保证这一点，可移除该检查。
-- **空值安全**：显式判断 `values != null` 避免潜在的 `NullPointerException`。
-- **性能优化**：使用 `Set` 存储目标键，利用 `O(1)` 复杂度的 `contains` 操作提升效率。
+#### 4. 动态调用示例
+```java
+@RestController
+@RequestMapping("/files")
+public class FileController {
+    @Autowired
+    private DynamicSftpService sftpService;
+
+    @PostMapping("/{serverId}/upload")
+    public ResponseEntity<String> uploadFile(
+        @PathVariable String serverId,
+        @RequestParam("file") MultipartFile file) {
+        
+        File tempFile = convertToFile(file);
+        sftpService.uploadFile(serverId, tempFile)
+            .exceptionally(ex -> {
+                log.error("Upload failed for server {}", serverId, ex);
+                return null;
+            });
+        
+        return ResponseEntity.accepted().body("File upload started");
+    }
+
+    @GetMapping("/{serverId}/download")
+    public ResponseEntity<Resource> downloadFile(
+        @PathVariable String serverId,
+        @RequestParam String remotePath) {
+        
+        File localFile = sftpService.downloadFile(serverId, remotePath)
+            .exceptionally(ex -> {
+                throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, 
+                    "Download failed", ex);
+            }).join();
+        
+        return ResponseEntity.ok()
+            .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + localFile.getName() + "\"")
+            .body(new FileSystemResource(localFile));
+    }
+}
+```
+
+### 高级优化策略
+
+1. **连接池监控**：
+```java
+@Scheduled(fixedRate = 300000)
+public void cleanStaleConnections() {
+    configService.getSessionFactoryCache().forEach((serverId, factory) -> {
+        if (factory instanceof CachingSessionFactory) {
+            ((CachingSessionFactory<?>) factory).resetCache();
+        }
+    });
+}
+```
+
+2. **动态配置刷新**：
+```java
+@RefreshScope
+public class SftpConfigService {
+    // 配合Spring Cloud Config实现动态刷新
+    @EventListener(EnvironmentChangeEvent.class)
+    public void refreshConfig() {
+        sessionFactoryCache.clear();
+        templateCache.clear();
+    }
+}
+```
+
+3. **负载均衡策略**：
+```java
+public interface SftpServerSelector {
+    String selectServer(FileMetadata metadata);
+}
+
+@Service
+public class RegionBasedSelector implements SftpServerSelector {
+    @Override
+    public String selectServer(FileMetadata metadata) {
+        // 根据文件元数据选择最优服务器
+        return metadata.getRegion() + "-sftp01";
+    }
+}
+```
+
+4. **健康检查集成**：
+```java
+@Component
+public class SftpHealthIndicator implements HealthIndicator {
+    @Autowired
+    private SftpConfigService configService;
+
+    @Override
+    public Health health() {
+        Map<String, Health> serverHealths = new LinkedHashMap<>();
+        
+        configService.getAllServerIds().forEach(serverId -> {
+            try {
+                boolean reachable = configService.getSftpTemplate(serverId)
+                    .execute(session -> session.test());
+                
+                serverHealths.put(serverId, 
+                    reachable ? Health.up().build() : Health.down().build());
+            } catch (Exception e) {
+                serverHealths.put(serverId, 
+                    Health.down(e).build());
+            }
+        });
+        
+        return Health.status(Status.UP)
+            .withDetails(serverHealths)
+            .build();
+    }
+}
+```
+
+### 安全增强建议
+
+1. **敏感信息加密**：
+```yaml
+# application.yml
+sftp:
+  servers:
+    server1:
+      password: '{cipher}密文'
+      private-key: '{cipher}密文'
+```
+
+2. **访问审计**：
+```java
+@Aspect
+@Component
+public class SftpAuditAspect {
+    @Around("execution(* com.example.service.DynamicSftpService.*(..))")
+    public Object auditSftpOperation(ProceedingJoinPoint joinPoint) throws Throwable {
+        String serverId = (String) joinPoint.getArgs()[0];
+        long start = System.currentTimeMillis();
+        
+        try {
+            Object result = joinPoint.proceed();
+            auditService.logOperation(serverId, "SUCCESS", 
+                System.currentTimeMillis() - start);
+            return result;
+        } catch (Exception e) {
+            auditService.logOperation(serverId, "FAILURE: " + e.getMessage(), 
+                System.currentTimeMillis() - start);
+            throw e;
+        }
+    }
+}
+```
+
+### 部署架构建议
+
+```
+                       +-----------------+
+                       |  Config Server  |
+                       | (DB/Redis/Nacos)|
+                       +--------+--------+
+                                |
+                                |
++----------------+       +------v------+       +-----------------+
+|  Application   |       |   SFTP     |       |  Monitoring     |
+|    Server      +------->  Service   +------->  System         |
+| (Spring Boot)  |       |  Cluster   |       | (Prometheus)    |
++----------------+       +------------+       +-----------------+
+```
+
+关键优势：
+1. **动态路由**：基于业务规则自动选择目标服务器
+2. **弹性扩展**：支持动态添加/移除SFTP服务器节点
+3. **集中管理**：所有SFTP配置统一存储管理
+4. **全面监控**：集成健康检查、性能监控和操作审计
+
+该方案支持在不停机的情况下：
+- 动态添加新的SFTP服务器配置
+- 调整现有服务器的连接参数
+- 自动剔除不可用服务器节点
+- 实时监控所有SFTP连接状态
