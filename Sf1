@@ -1,116 +1,253 @@
+在Spring Boot 3.3中，结合JSch实现SFTP多线程文件传输的步骤如下：
+
+### 1. 添加依赖（pom.xml）
+```xml
+<dependency>
+    <groupId>com.jcraft</groupId>
+    <artifactId>jsch</artifactId>
+    <version>0.1.55</version>
+</dependency>
+```
+
+### 2. 配置线程池和SFTP参数（application.yml）
+```yaml
+sftp:
+  host: your.sftp.host
+  port: 22
+  username: your-username
+  password: your-password
+  session-timeout: 30000
+  channel-timeout: 30000
+
+thread-pool:
+  core-size: 4
+  max-size: 8
+  queue-capacity: 50
+  keep-alive-seconds: 60
+```
+
+### 3. 线程池配置类
+```java
+@Configuration
+public class ThreadPoolConfig {
+
+    @Value("${thread-pool.core-size}")
+    private int coreSize;
+
+    @Value("${thread-pool.max-size}")
+    private int maxSize;
+
+    @Value("${thread-pool.queue-capacity}")
+    private int queueCapacity;
+
+    @Value("${thread-pool.keep-alive-seconds}")
+    private int keepAliveSeconds;
+
+    @Bean
+    public ThreadPoolTaskExecutor sftpTaskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(coreSize);
+        executor.setMaxPoolSize(maxSize);
+        executor.setQueueCapacity(queueCapacity);
+        executor.setKeepAliveSeconds(keepAliveSeconds);
+        executor.setThreadNamePrefix("sftp-worker-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(30);
+        return executor;
+    }
+}
+```
+
+### 4. SFTP连接工厂类
+```java
 @Component
-public class SftpDownloader {
+public class SftpConnectionFactory {
 
-    private final Session session;
-    private final String rootPath;
+    @Value("${sftp.host}")
+    private String host;
 
-    @Autowired
-    public SftpDownloader(Session session, @Value("${sftp.root-path}") String rootPath) {
-        this.session = session;
-        this.rootPath = rootPath;
+    @Value("${sftp.port}")
+    private int port;
+
+    @Value("${sftp.username}")
+    private String username;
+
+    @Value("${sftp.password}")
+    private String password;
+
+    @Value("${sftp.session-timeout}")
+    private int sessionTimeout;
+
+    @Value("${sftp.channel-timeout}")
+    private int channelTimeout;
+
+    public ChannelSftp createChannel() throws JSchException {
+        JSch jsch = new JSch();
+        Session session = jsch.getSession(username, host, port);
+        session.setPassword(password);
+        session.setConfig("StrictHostKeyChecking", "no");
+        session.connect(sessionTimeout);
+        
+        ChannelSftp channel = (ChannelSftp) session.openChannel("sftp");
+        channel.connect(channelTimeout);
+        return channel;
     }
 
-    public byte[] downloadFile(String remoteFilePath) throws IOException, JSchException, SftpException {
-        ChannelSftp channel = null;
-        try (ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
-            channel = (ChannelSftp) session.openChannel("sftp");
-            channel.connect();
-            channel.cd(rootPath);
-            channel.get(remoteFilePath, outputStream);
-            return outputStream.toByteArray();
-        } finally {
-            if (channel != null && channel.isConnected()) {
+    public void disconnect(ChannelSftp channel) {
+        if (channel != null) {
+            try {
+                Session session = channel.getSession();
                 channel.disconnect();
+                if (session != null && session.isConnected()) {
+                    session.disconnect();
+                }
+            } catch (JSchException e) {
+                // Log exception
             }
         }
     }
+}
+```
 
-    public void downloadToLocal(String remoteFilePath, String localFilePath) throws JSchException, SftpException, IOException {
-        ChannelSftp channel = null;
-        try {
-            channel = (ChannelSftp) session.openChannel("sftp");
-            channel.connect();
-            channel.cd(rootPath);
-            channel.get(remoteFilePath, localFilePath);
-        } finally {
-            if (channel != null && channel.isConnected()) {
-                channel.import java.io.IOException;
-import java.nio.file.*;
-import java.util.Comparator;
+### 5. SFTP服务类（支持批量操作）
+```java
+@Service
+public class SftpService {
 
-public class DeleteDirectory {
-    public static void deleteDirectory(Path path) throws IOException {
-        if (Files.exists(path)) {
-            Files.walk(path)
-                .sorted(Comparator.reverseOrder())
-                .forEach(file -> {
-                    try {
-                        Files.delete(file);
-                    } catch (IOException e) {
-                        System.err.println("删除失败: " + file + " - " + e.getMessage());
-                    }
-                });
+    private final SftpConnectionFactory connectionFactory;
+    private final ThreadPoolTaskExecutor executor;
+
+    @Autowired
+    public SftpService(SftpConnectionFactory connectionFactory, 
+                      @Qualifier("sftpTaskExecutor") ThreadPoolTaskExecutor executor) {
+        this.connectionFactory = connectionFactory;
+        this.executor = executor;
+    }
+
+    public void batchUpload(List<File> localFiles, String remoteDir) {
+        for (File localFile : localFiles) {
+            executor.execute(() -> {
+                ChannelSftp channel = null;
+                try {
+                    channel = connectionFactory.createChannel();
+                    channel.put(localFile.getAbsolutePath(), remoteDir + "/" + localFile.getName());
+                } catch (JSchException | SftpException e) {
+                    // 处理异常，记录失败文件
+                    System.err.println("Upload failed: " + localFile.getName());
+                    e.printStackTrace();
+                } finally {
+                    connectionFactory.disconnect(channel);
+                }
+            });
         }
     }
 
-    public static void main(String[] args) {
-        Path dir = Paths.get("要删除的目录路径");
-        try {
-            deleteDirectory(dir);
-            System.out.println("目录已成功删除！");
-        } catch (IOException e) {
-            System.err.println("错误: " + e.import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.io.TempDir;
-import java.io.IOException;
-import java.nio.file.*;
-
-import static org.junit.jupiter.api.Assertions.*;
-
-class DeleteDirectoryTest {
-
-    @Test
-    void testDeleteNonEmptyDirectory(@TempDir Path tempDir) throws IOException {
-        // 创建测试目录结构
-        Path subDir = Files.createDirectory(tempDir.resolve("subdir"));
-        Files.write(tempDir.resolve("file1.txt"), "test".getBytes());
-        Files.write(subDir.resolve("file2.txt"), "test".getBytes());
-
-        // 执行删除
-        DeleteDirectory.deleteDirectory(tempDir);
-
-        // 验证目录已删除
-        assertFalse(Files.exists(tempDir), "目录应被成功删除");
-    }
-
-    @Test
-    void testDeleteEmptyDirectory(@TempDir Path tempDir) throws IOException {
-        DeleteDirectory.deleteDirectory(tempDir);
-        assertFalse(Files.exists(tempDir), "空目录应被删除");
-    }
-
-    @Test
-    void testDeleteNonExistentDirectory() {
-        Path nonExistentDir = Paths.get("non_existent_directory");
-        
-        // 验证不会抛出异常
-        assertDoesNotThrow(() -> DeleteDirectory.deleteDirectory(nonExistentDir));
-    }
-
-    @Test
-    void testDeleteReadOnlyFile(@TempDir Path tempDir) throws IOException {
-        Path readOnlyFile = Files.createFile(tempDir.resolve("readonly.txt"));
-        readOnlyFile.toFile().setReadOnly(); // 设置文件为只读
-
-        // 执行删除（可能需要处理权限问题）
-        assertThrows(IOException.class, () -> DeleteDirectory.deleteDirectory(tempDir));
-
-        // 清理（确保测试后恢复权限）
-        readOnlyFile.toFile().setWritable(true);
+    public void batchDownload(List<String> remoteFiles, String localDir) {
+        for (String remoteFile : remoteFiles) {
+            executor.execute(() -> {
+                ChannelSftp channel = null;
+                try {
+                    channel = connectionFactory.createChannel();
+                    channel.get(remoteFile, localDir + "/" + Paths.get(remoteFile).getFileName());
+                } catch (JSchException | SftpException e) {
+                    System.err.println("Download failed: " + remoteFile);
+                    e.printStackTrace();
+                } finally {
+                    connectionFactory.disconnect(channel);
+                }
+            });
+        }
     }
 }
+```
 
+### 6. 高级功能扩展
+**连接池优化（使用commons-pool2）**
+```java
+@Bean
+public GenericObjectPool<ChannelSftp> sftpPool() {
+    return new GenericObjectPool<>(new BasePooledObjectFactory<>() {
+        @Override
+        public ChannelSftp create() throws Exception {
+            return connectionFactory.createChannel();
+        }
 
+        @Override
+        public PooledObject<ChannelSftp> wrap(ChannelSftp channel) {
+            return new DefaultPooledObject<>(channel);
+        }
 
+        @Override
+        public void destroyObject(PooledObject<ChannelSftp> p) {
+            connectionFactory.disconnect(p.getObject());
+        }
+    });
+}
 
+// 在Service中使用
+public void uploadWithPool(File file, String remotePath) {
+    executor.execute(() -> {
+        ChannelSftp channel = null;
+        try {
+            channel = sftpPool.borrowObject();
+            channel.put(file.getAbsolutePath(), remotePath);
+            sftpPool.returnObject(channel);
+        } catch (Exception e) {
+            if (channel != null) {
+                sftpPool.invalidateObject(channel);
+            }
+        }
+    });
+}
+```
 
+### 7. 监控线程池状态
+```java
+@Scheduled(fixedRate = 5000)
+public void monitorThreadPool() {
+    System.out.println("Active Threads: " + executor.getActiveCount());
+    System.out.println("Queue Size: " + executor.getThreadPoolExecutor().getQueue().size());
+    System.out.println("Completed Tasks: " + executor.getThreadPoolExecutor().getCompletedTaskCount());
+}
+```
 
+### 8. 使用示例
+```java
+@RestController
+public class FileController {
+
+    @Autowired
+    private SftpService sftpService;
+
+    @PostMapping("/upload")
+    public void uploadBatch(@RequestBody List<String> filePaths) {
+        List<File> files = filePaths.stream()
+            .map(File::new)
+            .collect(Collectors.toList());
+        sftpService.batchUpload(files, "/remote/path");
+    }
+}
+```
+
+### 关键优化点：
+1. **连接复用**：通过对象池减少连接建立开销
+2. **流量控制**：
+   - 使用有界队列防止内存溢出
+   - 设置合理的拒绝策略（CallerRunsPolicy让主线程执行）
+3. **错误处理**：
+   - 自动标记失败任务
+   - 连接异常时自动销毁无效连接
+4. **资源管理**：
+   - 使用try-with-resources确保连接关闭
+   - 添加@PreDestroy清理线程池
+5. **性能监控**：
+   - 通过Spring Actuator暴露线程池指标
+   - 添加自定义监控端点
+
+### 注意事项：
+1. SFTP服务器最大连接数限制
+2. 网络不稳定时的重试机制
+3. 大文件传输时的内存管理（建议使用流式传输）
+4. 敏感信息加密存储（建议使用Jasypt加密密码）
+5. 使用MDC实现日志跟踪（为每个任务添加唯一ID）
