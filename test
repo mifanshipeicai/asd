@@ -1,106 +1,106 @@
-在Spring Boot中，使用JdbcTemplate查询数据并返回CSV压缩为ZIP文件的步骤如下：
+在 AWS S3 中，当使用 `listObjects` 或 `listObjectsV2` 方法列出对象时，默认最多返回 1000 个对象。要获取全部文件列表，你需要处理分页（Pagination），通过循环请求直到所有结果返回。以下是解决方案：
 
-### 实现步骤
-1. **添加依赖**：使用OpenCSV处理CSV生成。
-   ```xml
-   <dependency>
-       <groupId>com.opencsv</groupId>
-       <artifactId>opencsv</artifactId>
-       <version>5.7.1</version>
-   </dependency>
-   ```
+---
 
-2. **编写Controller方法**：
-   ```java
-   import com.opencsv.CSVWriter;
-   import org.springframework.core.io.ByteArrayResource;
-   import org.springframework.core.io.Resource;
-   import org.springframework.http.HttpHeaders;
-   import org.springframework.http.MediaType;
-   import org.springframework.http.ResponseEntity;
-   import org.springframework.jdbc.core.JdbcTemplate;
-   import org.springframework.web.bind.annotation.GetMapping;
-   import org.springframework.web.bind.annotation.RestController;
-   
-   import java.io.ByteArrayOutputStream;
-   import java.io.IOException;
-   import java.io.OutputStreamWriter;
-   import java.nio.charset.StandardCharsets;
-   import java.util.List;
-   import java.util.Map;
-   import java.util.zip.ZipEntry;
-   import java.util.zip.ZipOutputStream;
-   
-   @RestController
-   public class ExportController {
-   
-       private final JdbcTemplate jdbcTemplate;
-   
-       public ExportController(JdbcTemplate jdbcTemplate) {
-           this.jdbcTemplate = jdbcTemplate;
-       }
-   
-       @GetMapping("/export")
-       public ResponseEntity<Resource> exportToZip() throws IOException {
-           // 查询数据
-           List<Map<String, Object>> data = jdbcTemplate.queryForList("SELECT * FROM your_table");
-   
-           // 创建字节数组输出流用于ZIP
-           ByteArrayOutputStream baos = new ByteArrayOutputStream();
-           try (ZipOutputStream zos = new ZipOutputStream(baos);
-                OutputStreamWriter osw = new OutputStreamWriter(zos, StandardCharsets.UTF_8);
-                CSVWriter csvWriter = new CSVWriter(osw)) {
-   
-               // 创建ZIP条目（CSV文件）
-               zos.putNextEntry(new ZipEntry("data.csv"));
-   
-               // 写入CSV表头
-               if (!data.isEmpty()) {
-                   String[] headers = data.get(0).keySet().toArray(new String[0]);
-                   csvWriter.writeNext(headers);
-               }
-   
-               // 写入数据行
-               for (Map<String, Object> row : data) {
-                   String[] values = row.values().stream()
-                           .map(this::convertToString)
-                           .toArray(String[]::new);
-                   csvWriter.writeNext(values);
-               }
-   
-               // 关闭当前ZIP条目
-               zos.closeEntry();
-           }
-   
-           // 构建Resource并设置响应头
-           ByteArrayResource resource = new ByteArrayResource(baos.toByteArray());
-           return ResponseEntity.ok()
-                   .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"data.zip\"")
-                   .contentType(MediaType.APPLICATION_OCTET_STREAM)
-                   .body(resource);
-       }
-   
-       // 处理不同类型的数据转换为字符串
-       private String convertToString(Object value) {
-           if (value == null) {
-               return "";
-           } else if (value instanceof java.util.Date) {
-               return new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format((java.util.Date) value);
-           } else {
-               return value.toString();
-           }
-       }
-   }
-   ```
+### 1. 使用 **`listObjectsV2`** 并处理分页
+`listObjectsV2` 是推荐的方法，支持更高效的分页机制。通过检查返回的 **`isTruncated`** 标志和 **`nextContinuationToken`** 循环请求直到获取全部结果。
 
-### 关键点说明
-- **流处理**：使用`ByteArrayOutputStream`和`ZipOutputStream`在内存中生成ZIP文件，避免临时文件。
-- **编码**：指定UTF-8编码确保特殊字符正确处理。
-- **CSV格式**：通过OpenCSV自动处理字段中的逗号、换行符等转义。
-- **资源释放**：使用try-with-resources确保所有流正确关闭。
-- **响应头设置**：`Content-Disposition`触发浏览器下载，`application/octet-stream`作为通用的二进制流类型。
+```java
+import com.amazonaws.services.s3.AmazonS3;
+import com.amazonaws.services.s3.model.ListObjectsV2Request;
+import com.amazonaws.services.s3.model.ListObjectsV2Result;
+import com.amazonaws.services.s3.model.S3ObjectSummary;
 
-### 测试建议
-- 访问`/export`端点，确认返回ZIP文件。
-- 解压ZIP检查CSV内容，验证数据和格式正确性。
-- 测试包含特殊字符、日期和空值的数据行。
+public List<S3ObjectSummary> listAllObjectsInDirectory(String bucketName, String prefix) {
+    AmazonS3 s3Client = AmazonS3ClientBuilder.standard().build(); // 确保正确初始化
+    List<S3ObjectSummary> allObjects = new ArrayList<>();
+
+    ListObjectsV2Request request = new ListObjectsV2Request()
+            .withBucketName(bucketName)
+            .withPrefix(prefix) // 指定目录前缀，例如 "my-folder/"
+            .withDelimiter("/"); // 可选：如果需模拟目录结构
+
+    ListObjectsV2Result result;
+    do {
+        result = s3Client.listObjectsV2(request);
+        allObjects.addAll(result.getObjectSummaries());
+        String token = result.getNextContinuationToken();
+        request.setContinuationToken(token);
+    } while (result.isTruncated());
+
+    return allObjects;
+}
+```
+
+---
+
+### 2. 关键参数说明
+- **`withPrefix(String prefix)`**: 指定目录前缀（例如 `"my-folder/subfolder/"`），S3 会返回匹配该前缀的所有对象。
+- **`withDelimiter("/")`**: 可选参数，用于模拟目录层级。如果不需要目录结构，可省略。
+- **`ContinuationToken`**: 分页标记，每次请求后更新以获取下一页结果。
+
+---
+
+### 3. 注意事项
+- **性能优化**: 如果目录下文件极多（例如百万级），频繁调用 API 可能导致延迟或费用增加。考虑异步处理或缓存结果。
+- **权限检查**: 确保 IAM 角色或凭证有 `s3:ListBucket` 权限。
+- **SDK 版本**: 确保使用较新的 AWS SDK 版本（例如 2.x），但 `listObjectsV2` 在 1.x 中也有效。
+
+---
+
+### 4. 完整示例（Spring Boot 中注入 AmazonS3）
+```java
+@Service
+public class S3Service {
+    @Autowired
+    private AmazonS3 amazonS3;
+
+    public List<String> listAllFiles(String bucket, String prefix) {
+        List<String> fileKeys = new ArrayList<>();
+        ListObjectsV2Request request = new ListObjectsV2Request()
+                .withBucketName(bucket)
+                .withPrefix(prefix);
+        
+        ListObjectsV2Result result;
+        do {
+            result = amazonS3.listObjectsV2(request);
+            result.getObjectSummaries().forEach(summary -> 
+                fileKeys.add(summary.getKey())
+            );
+            request.setContinuationToken(result.getNextContinuationToken());
+        } while (result.isTruncated());
+        
+        return fileKeys;
+    }
+}
+```
+
+---
+
+### 5. 扩展：使用 AWS SDK for Java 2.x
+如果升级到 AWS SDK 2.x，可使用 **`listObjectsV2Paginator`** 简化分页：
+
+```java
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
+import software.amazon.awssdk.services.s3.paginators.ListObjectsV2Iterable;
+
+public List<String> listAllFilesV2(String bucket, String prefix) {
+    S3Client s3 = S3Client.create();
+    ListObjectsV2Request request = ListObjectsV2Request.builder()
+            .bucket(bucket)
+            .prefix(prefix)
+            .build();
+
+    ListObjectsV2Iterable response = s3.listObjectsV2Paginator(request);
+    List<String> keys = new ArrayList<>();
+    response.contents().forEach(object -> keys.add(object.key()));
+    
+    return keys;
+}
+```
+
+---
+
+通过正确处理分页逻辑，你可以突破 1000 个文件的限制，完整获取 S3 目录下的所有文件列表。
