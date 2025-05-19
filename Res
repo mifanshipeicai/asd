@@ -1,172 +1,149 @@
-在Spring Boot 3.3中实现使用线程池处理大量SFTP文件上传和下载，可以按照以下步骤进行：
+以下是为 AWS SDK v2 编写的单元测试示例，使用 **JUnit 5** 和 **Mockito** 模拟 `S3Client`：
 
-### 1. 添加依赖
-在`pom.xml`中添加Spring Integration SFTP和JSch依赖：
+### 步骤 1：添加测试依赖
+在 `pom.xml` 中添加：
 ```xml
 <dependency>
-    <groupId>org.springframework.boot</groupId>
-    <artifactId>spring-boot-starter-integration</artifactId>
+    <groupId>org.junit.jupiter</groupId>
+    <artifactId>junit-jupiter-engine</artifactId>
+    <version>5.8.2</version>
+    <scope>test</scope>
 </dependency>
 <dependency>
-    <groupId>org.springframework.integration</groupId>
-    <artifactId>spring-integration-sftp</artifactId>
-</dependency>
-<dependency>
-    <groupId>com.jcraft</groupId>
-    <artifactId>jsch</artifactId>
-    <version>0.1.55</version>
+    <groupId>org.mockito</groupId>
+    <artifactId>mockito-core</artifactId>
+    <version>4.5.1</version>
+    <scope>test</scope>
 </dependency>
 ```
 
-### 2. 配置SFTP连接参数
-在`application.properties`中配置SFTP信息：
-```properties
-sftp.host=your.sftp.host
-sftp.port=22
-sftp.user=username
-sftp.password=password
-sftp.private-key= # 可选，私钥路径
-sftp.remote-directory=/remote/path
-```
+---
 
-### 3. 配置线程池
-创建线程池配置类：
+### 步骤 2：编写单元测试
 ```java
-@Configuration
-@EnableAsync
-public class ThreadPoolConfig {
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
+import software.amazon.awssdk.services.s3.model.S3Object;
 
-    @Bean(name = "sftpTaskExecutor")
-    public Executor sftpTaskExecutor() {
-        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(10); // 核心线程数
-        executor.setMaxPoolSize(20); // 最大线程数
-        executor.setQueueCapacity(500); // 队列容量
-        executor.setThreadNamePrefix("SftpTask-");
-        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
-        executor.initialize();
-        return executor;
+import java.util.Arrays;
+import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.when;
+
+@ExtendWith(MockitoExtension.class)
+public class S3ServiceTest {
+
+    @Mock
+    private S3Client s3Client; // 模拟 S3 客户端
+
+    @InjectMocks
+    private S3Service s3Service; // 注入被测试的 Service
+
+    private static final String BUCKET_NAME = "test-bucket";
+
+    @Test
+    void testListFilesInFolder_WithValidPath_ReturnsFiles() {
+        // 模拟 S3 响应数据
+        String folderPath = "images/2023/";
+        List<S3Object> mockObjects = Arrays.asList(
+                S3Object.builder().key(folderPath).build(), // 文件夹对象（需要被过滤）
+                S3Object.builder().key(folderPath + "file1.jpg").build(),
+                S3Object.builder().key(folderPath + "file2.jpg").build()
+        );
+
+        ListObjectsV2Response mockResponse = ListObjectsV2Response.builder()
+                .contents(mockObjects)
+                .build();
+
+        // 配置 Mock 行为
+        when(s3Client.listObjectsV2(any(ListObjectsV2Request.class)))
+                .thenReturn(mockResponse);
+
+        // 调用测试方法
+        List<String> result = s3Service.listFilesInFolder(folderPath);
+
+        // 验证结果
+        assertEquals(2, result.size());
+        assertTrue(result.contains("images/2023/file1.jpg"));
+        assertTrue(result.contains("images/2023/file2.jpg"));
+        assertFalse(result.contains(folderPath)); // 确保过滤文件夹对象
+    }
+
+    @Test
+    void testListFilesInFolder_PathWithoutSlash_AppendsSlash() {
+        // 模拟响应（空列表）
+        ListObjectsV2Response mockResponse = ListObjectsV2Response.builder().build();
+        when(s3Client.listObjectsV2(any(ListObjectsV2Request.class)))
+                .thenReturn(mockResponse);
+
+        // 调用方法（路径不带斜杠）
+        s3Service.listFilesInFolder("images/2023");
+
+        // 验证请求参数是否自动添加了斜杠
+        ArgumentCaptor<ListObjectsV2Request> requestCaptor = 
+            ArgumentCaptor.forClass(ListObjectsV2Request.class);
+        verify(s3Client).listObjectsV2(requestCaptor.capture());
+
+        ListObjectsV2Request capturedRequest = requestCaptor.getValue();
+        assertEquals("images/2023/", capturedRequest.prefix());
+    }
+
+    @Test
+    void testListFilesInFolder_EmptyPath_ReturnsRootFiles() {
+        // 模拟根目录下的文件
+        List<S3Object> mockObjects = Arrays.asList(
+                S3Object.builder().key("file1.txt").build(),
+                S3Object.builder().key("file2.txt").build()
+        );
+
+        ListObjectsV2Response mockResponse = ListObjectsV2Response.builder()
+                .contents(mockObjects)
+                .build();
+        when(s3Client.listObjectsV2(any(ListObjectsV2Request.class)))
+                .thenReturn(mockResponse);
+
+        // 调用方法（空路径）
+        List<String> result = s3Service.listFilesInFolder("");
+
+        assertEquals(2, result.size());
+        assertTrue(result.contains("file1.txt"));
     }
 }
 ```
 
-### 4. 配置SFTP连接工厂
-创建SFTP配置类：
-```java
-@Configuration
-public class SftpConfig {
+---
 
-    @Value("${sftp.host}")
-    private String host;
+### 关键点说明
+1. **模拟依赖项**  
+   使用 `@Mock` 注解模拟 `S3Client`，通过 `@InjectMocks` 将模拟对象注入 `S3Service`。
 
-    @Value("${sftp.port}")
-    private int port;
+2. **验证逻辑覆盖**  
+   - **过滤文件夹对象**：确保路径末尾的文件夹对象（如 `images/2023/`）被排除。
+   - **路径修正**：验证输入的路径自动添加斜杠（如 `images/2023` → `images/2023/`）。
+   - **空路径处理**：测试根目录文件列表。
 
-    @Value("${sftp.user}")
-    private String user;
+3. **参数捕获**  
+   使用 `ArgumentCaptor` 捕获实际请求参数，验证 `prefix` 是否正确。
 
-    @Value("${sftp.password}")
-    private String password;
+4. **边界条件**  
+   可根据需要扩展测试案例，例如：
+   - 分页处理（`continuationToken`）
+   - 无效路径或无权限场景
 
-    @Bean
-    public SessionFactory<ChannelSftp.LsEntry> sftpSessionFactory() {
-        DefaultSftpSessionFactory factory = new DefaultSftpSessionFactory(true);
-        factory.setHost(host);
-        factory.setPort(port);
-        factory.setUser(user);
-        if (password != null) {
-            factory.setPassword(password);
-        }
-        // 如果有私钥，配置私钥路径
-        // factory.setPrivateKey(new FileSystemResource("path/to/private.key"));
-        // factory.setAllowUnknownKeys(true);
-        return new CachingSessionFactory<>(factory);
-    }
+---
 
-    @Bean
-    public SftpRemoteFileTemplate sftpRemoteFileTemplate(SessionFactory<ChannelSftp.LsEntry> sessionFactory) {
-        return new SftpRemoteFileTemplate(sessionFactory);
-    }
-}
+### 运行测试
+使用 Maven 命令运行测试：
+```bash
+mvn test
 ```
 
-### 5. 实现异步SFTP服务
-使用`@Async`注解和线程池执行上传下载：
-```java
-@Service
-public class SftpService {
-
-    private final SftpRemoteFileTemplate sftpTemplate;
-
-    @Value("${sftp.remote-directory}")
-    private String remoteDirectory;
-
-    public SftpService(SftpRemoteFileTemplate sftpTemplate) {
-        this.sftpTemplate = sftpTemplate;
-    }
-
-    @Async("sftpTaskExecutor")
-    public CompletableFuture<Void> uploadFile(File file) {
-        return CompletableFuture.runAsync(() -> {
-            sftpTemplate.execute(session -> {
-                session.write(new FileInputStream(file), remoteDirectory + "/" + file.getName());
-                return null;
-            });
-        });
-    }
-
-    @Async("sftpTaskExecutor")
-    public CompletableFuture<File> downloadFile(String remoteFilePath, File localFile) {
-        return CompletableFuture.supplyAsync(() -> {
-            sftpTemplate.execute(session -> {
-                session.read(remoteFilePath, new FileOutputStream(localFile));
-                return null;
-            });
-            return localFile;
-        });
-    }
-}
-```
-
-### 6. 调用异步服务
-在Controller或其他组件中调用：
-```java
-@RestController
-public class FileController {
-
-    @Autowired
-    private SftpService sftpService;
-
-    @PostMapping("/upload")
-    public ResponseEntity<String> uploadMultipleFiles(@RequestParam("files") MultipartFile[] files) {
-        for (MultipartFile file : files) {
-            File tempFile = convertMultipartToFile(file); // 转换为File
-            sftpService.uploadFile(tempFile)
-                .exceptionally(ex -> {
-                    // 处理异常
-                    return null;
-                });
-        }
-        return ResponseEntity.ok("Files are being uploaded");
-    }
-
-    private File convertMultipartToFile(MultipartFile file) {
-        // 实现转换逻辑
-    }
-}
-```
-
-### 关键点说明：
-1. **线程池配置**：根据任务类型（IO密集型）设置合理的线程数，避免过多线程导致资源竞争。
-2. **连接管理**：使用`CachingSessionFactory`复用SFTP会话，提高性能。
-3. **异步处理**：`@Async`结合自定义线程池实现并发处理。
-4. **异常处理**：使用`CompletableFuture.exceptionally()`捕获并处理异常。
-5. **资源释放**：确保文件流正确关闭，避免资源泄漏。
-
-### 优化建议：
-- **批量处理**：对于极大数量文件，采用分批次提交任务。
-- **连接池**：考虑使用连接池管理SFTP会话（如Apache Pool2）。
-- **限流控制**：根据系统负载动态调整线程池参数。
-- **监控**：集成Micrometer监控线程池指标。
-
-通过以上步骤，可以在Spring Boot应用中高效安全地处理大量SFTP文件传输任务。
+通过这种方式，你可以确保 S3 文件列表逻辑在隔离环境中正确工作，无需真实 AWS 连接。
