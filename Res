@@ -1,149 +1,72 @@
-以下是为 AWS SDK v2 编写的单元测试示例，使用 **JUnit 5** 和 **Mockito** 模拟 `S3Client`：
+在Java中删除包含多个文件且无子目录的文件夹，可以按照以下步骤实现：
 
-### 步骤 1：添加测试依赖
-在 `pom.xml` 中添加：
-```xml
-<dependency>
-    <groupId>org.junit.jupiter</groupId>
-    <artifactId>junit-jupiter-engine</artifactId>
-    <version>5.8.2</version>
-    <scope>test</scope>
-</dependency>
-<dependency>
-    <groupId>org.mockito</groupId>
-    <artifactId>mockito-core</artifactId>
-    <version>4.5.1</version>
-    <scope>test</scope>
-</dependency>
-```
+1. **验证目标路径是否为有效目录**：确保目标存在且是一个目录。
+2. **删除目录内所有文件**：遍历目录中的文件并逐个删除。
+3. **删除空目录**：在确认所有文件删除后删除空目录。
 
----
+以下是具体实现的代码：
 
-### 步骤 2：编写单元测试
 ```java
-import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.InjectMocks;
-import org.mockito.Mock;
-import org.mockito.junit.jupiter.MockitoExtension;
-import software.amazon.awssdk.services.s3.S3Client;
-import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
-import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
-import software.amazon.awssdk.services.s3.model.S3Object;
+import java.io.File;
+import java.io.IOException;
 
-import java.util.Arrays;
-import java.util.List;
-
-import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.when;
-
-@ExtendWith(MockitoExtension.class)
-public class S3ServiceTest {
-
-    @Mock
-    private S3Client s3Client; // 模拟 S3 客户端
-
-    @InjectMocks
-    private S3Service s3Service; // 注入被测试的 Service
-
-    private static final String BUCKET_NAME = "test-bucket";
-
-    @Test
-    void testListFilesInFolder_WithValidPath_ReturnsFiles() {
-        // 模拟 S3 响应数据
-        String folderPath = "images/2023/";
-        List<S3Object> mockObjects = Arrays.asList(
-                S3Object.builder().key(folderPath).build(), // 文件夹对象（需要被过滤）
-                S3Object.builder().key(folderPath + "file1.jpg").build(),
-                S3Object.builder().key(folderPath + "file2.jpg").build()
-        );
-
-        ListObjectsV2Response mockResponse = ListObjectsV2Response.builder()
-                .contents(mockObjects)
-                .build();
-
-        // 配置 Mock 行为
-        when(s3Client.listObjectsV2(any(ListObjectsV2Request.class)))
-                .thenReturn(mockResponse);
-
-        // 调用测试方法
-        List<String> result = s3Service.listFilesInFolder(folderPath);
-
-        // 验证结果
-        assertEquals(2, result.size());
-        assertTrue(result.contains("images/2023/file1.jpg"));
-        assertTrue(result.contains("images/2023/file2.jpg"));
-        assertFalse(result.contains(folderPath)); // 确保过滤文件夹对象
+public class FolderDeleter {
+    public static void deleteFolder(String folderPath) throws IOException {
+        File folder = new File(folderPath);
+        
+        // 检查文件夹是否存在
+        if (!folder.exists()) {
+            throw new IOException("文件夹不存在: " + folderPath);
+        }
+        
+        // 检查是否是目录
+        if (!folder.isDirectory()) {
+            throw new IOException("路径不是目录: " + folderPath);
+        }
+        
+        // 获取目录下的所有文件
+        File[] files = folder.listFiles();
+        if (files == null) {
+            throw new IOException("无法访问目录内容: " + folderPath);
+        }
+        
+        // 删除所有文件
+        for (File file : files) {
+            if (!file.delete()) {
+                throw new IOException("删除文件失败: " + file.getAbsolutePath());
+            }
+        }
+        
+        // 删除空目录
+        if (!folder.delete()) {
+            throw new IOException("删除目录失败: " + folderPath);
+        }
     }
 
-    @Test
-    void testListFilesInFolder_PathWithoutSlash_AppendsSlash() {
-        // 模拟响应（空列表）
-        ListObjectsV2Response mockResponse = ListObjectsV2Response.builder().build();
-        when(s3Client.listObjectsV2(any(ListObjectsV2Request.class)))
-                .thenReturn(mockResponse);
-
-        // 调用方法（路径不带斜杠）
-        s3Service.listFilesInFolder("images/2023");
-
-        // 验证请求参数是否自动添加了斜杠
-        ArgumentCaptor<ListObjectsV2Request> requestCaptor = 
-            ArgumentCaptor.forClass(ListObjectsV2Request.class);
-        verify(s3Client).listObjectsV2(requestCaptor.capture());
-
-        ListObjectsV2Request capturedRequest = requestCaptor.getValue();
-        assertEquals("images/2023/", capturedRequest.prefix());
-    }
-
-    @Test
-    void testListFilesInFolder_EmptyPath_ReturnsRootFiles() {
-        // 模拟根目录下的文件
-        List<S3Object> mockObjects = Arrays.asList(
-                S3Object.builder().key("file1.txt").build(),
-                S3Object.builder().key("file2.txt").build()
-        );
-
-        ListObjectsV2Response mockResponse = ListObjectsV2Response.builder()
-                .contents(mockObjects)
-                .build();
-        when(s3Client.listObjectsV2(any(ListObjectsV2Request.class)))
-                .thenReturn(mockResponse);
-
-        // 调用方法（空路径）
-        List<String> result = s3Service.listFilesInFolder("");
-
-        assertEquals(2, result.size());
-        assertTrue(result.contains("file1.txt"));
+    public static void main(String[] args) {
+        String targetFolder = "path/to/your/folder"; // 替换为目标文件夹路径
+        try {
+            deleteFolder(targetFolder);
+            System.out.println("文件夹删除成功。");
+        } catch (IOException e) {
+            System.err.println("错误: " + e.getMessage());
+        }
     }
 }
 ```
 
----
+**关键点说明**：
 
-### 关键点说明
-1. **模拟依赖项**  
-   使用 `@Mock` 注解模拟 `S3Client`，通过 `@InjectMocks` 将模拟对象注入 `S3Service`。
+1. **异常处理**：方法通过抛出`IOException`明确错误原因（如权限不足、路径无效等）。
+2. **安全性检查**：
+   - 确认目标存在且为目录。
+   - 处理`listFiles()`返回`null`的情况（如不可读的目录）。
+3. **删除文件**：遍历所有文件并逐个删除，确保目录为空。
+4. **删除目录**：最后删除已空的目录。
 
-2. **验证逻辑覆盖**  
-   - **过滤文件夹对象**：确保路径末尾的文件夹对象（如 `images/2023/`）被排除。
-   - **路径修正**：验证输入的路径自动添加斜杠（如 `images/2023` → `images/2023/`）。
-   - **空路径处理**：测试根目录文件列表。
+**注意事项**：
+- **权限问题**：确保程序有权限删除目标文件及目录。
+- **路径格式**：根据操作系统使用正确的路径分隔符（如Windows用`\`，Linux/macOS用`/`）。
+- **并发操作**：删除过程中若有其他程序修改目录内容，可能导致删除失败，需根据需求处理。
 
-3. **参数捕获**  
-   使用 `ArgumentCaptor` 捕获实际请求参数，验证 `prefix` 是否正确。
-
-4. **边界条件**  
-   可根据需要扩展测试案例，例如：
-   - 分页处理（`continuationToken`）
-   - 无效路径或无权限场景
-
----
-
-### 运行测试
-使用 Maven 命令运行测试：
-```bash
-mvn test
-```
-
-通过这种方式，你可以确保 S3 文件列表逻辑在隔离环境中正确工作，无需真实 AWS 连接。
+此方法适用于删除无子目录的文件夹，高效且直接。对于包含子目录的情况，需递归处理，但根据题目要求此处无需考虑。
