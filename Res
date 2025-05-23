@@ -1,72 +1,68 @@
-在Java中删除包含多个文件且无子目录的文件夹，可以按照以下步骤实现：
+要将Java List中具有相同键的Map合并成一个Map，并将对应的值连接起来，可以按照以下步骤实现：
 
-1. **验证目标路径是否为有效目录**：确保目标存在且是一个目录。
-2. **删除目录内所有文件**：遍历目录中的文件并逐个删除。
-3. **删除空目录**：在确认所有文件删除后删除空目录。
+1. **遍历所有Map中的键值对**：将每个键的值合并到一个临时Map中。
+2. **生成结果列表**：将合并后的键值对转换为单独的Map，并存入结果列表。
 
-以下是具体实现的代码：
+以下是实现代码：
 
 ```java
-import java.io.File;
-import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
-public class FolderDeleter {
-    public static void deleteFolder(String folderPath) throws IOException {
-        File folder = new File(folderPath);
-        
-        // 检查文件夹是否存在
-        if (!folder.exists()) {
-            throw new IOException("文件夹不存在: " + folderPath);
-        }
-        
-        // 检查是否是目录
-        if (!folder.isDirectory()) {
-            throw new IOException("路径不是目录: " + folderPath);
-        }
-        
-        // 获取目录下的所有文件
-        File[] files = folder.listFiles();
-        if (files == null) {
-            throw new IOException("无法访问目录内容: " + folderPath);
-        }
-        
-        // 删除所有文件
-        for (File file : files) {
-            if (!file.delete()) {
-                throw new IOException("删除文件失败: " + file.getAbsolutePath());
+public class MapMerger {
+
+    public static List<Map<String, String>> mergeMaps(List<Map<String, String>> list) {
+        // 用于合并所有键值对的临时Map
+        Map<String, String> mergedValues = new HashMap<>();
+
+        // 遍历每个Map中的键值对，合并值
+        for (Map<String, String> map : list) {
+            for (Map.Entry<String, String> entry : map.entrySet()) {
+                String key = entry.getKey();
+                String value = entry.getValue();
+                // 如果键已存在，则拼接值；否则直接添加
+                mergedValues.merge(key, value, (oldVal, newVal) -> oldVal + newVal);
             }
         }
-        
-        // 删除空目录
-        if (!folder.delete()) {
-            throw new IOException("删除目录失败: " + folderPath);
+
+        // 将合并后的键值对转换为独立的Map并存入结果列表
+        List<Map<String, String>> result = new ArrayList<>();
+        for (Map.Entry<String, String> entry : mergedValues.entrySet()) {
+            Map<String, String> newMap = new HashMap<>();
+            newMap.put(entry.getKey(), entry.getValue());
+            result.add(newMap);
         }
+
+        return result;
     }
 
     public static void main(String[] args) {
-        String targetFolder = "path/to/your/folder"; // 替换为目标文件夹路径
-        try {
-            deleteFolder(targetFolder);
-            System.out.println("文件夹删除成功。");
-        } catch (IOException e) {
-            System.err.println("错误: " + e.getMessage());
-        }
+        // 示例测试
+        List<Map<String, String>> list = new ArrayList<>();
+        
+        Map<String, String> map1 = new HashMap<>();
+        map1.put("a", "hello");
+        list.add(map1);
+        
+        Map<String, String> map2 = new HashMap<>();
+        map2.put("a", "world");
+        list.add(map2);
+        
+        Map<String, String> map3 = new HashMap<>();
+        map3.put("b", "test");
+        list.add(map3);
+
+        List<Map<String, String>> mergedList = mergeMaps(list);
+        System.out.println(mergedList);  // 输出：[{a=helloworld}, {b=test}]
     }
 }
 ```
 
-**关键点说明**：
+### 解释：
+- **合并过程**：使用`mergedValues`临时Map收集所有键的值。若键已存在，则通过`merge`方法将新值连接到旧值之后。
+- **生成结果**：遍历临时Map，将每个键值对转换为新的Map，并添加到结果列表中。
+- **示例结果**：输入三个Map（两个含键`a`，一个含键`b`），合并后得到两个Map（`a`的值合并，`b`保留）。
 
-1. **异常处理**：方法通过抛出`IOException`明确错误原因（如权限不足、路径无效等）。
-2. **安全性检查**：
-   - 确认目标存在且为目录。
-   - 处理`listFiles()`返回`null`的情况（如不可读的目录）。
-3. **删除文件**：遍历所有文件并逐个删除，确保目录为空。
-4. **删除目录**：最后删除已空的目录。
-
-**注意事项**：
-- **权限问题**：确保程序有权限删除目标文件及目录。
-- **路径格式**：根据操作系统使用正确的路径分隔符（如Windows用`\`，Linux/macOS用`/`）。
-- **并发操作**：删除过程中若有其他程序修改目录内容，可能导致删除失败，需根据需求处理。
-
-此方法适用于删除无子目录的文件夹，高效且直接。对于包含子目录的情况，需递归处理，但根据题目要求此处无需考虑。
+此方法确保所有相同键的值被合并，最终每个键对应一个独立的Map。
