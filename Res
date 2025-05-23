@@ -1,68 +1,64 @@
-要将Java List中具有相同键的Map合并成一个Map，并将对应的值连接起来，可以按照以下步骤实现：
+为了去除List中重复key的Map，并保留最新加入的那个，可以按照以下步骤实现：
 
-1. **遍历所有Map中的键值对**：将每个键的值合并到一个临时Map中。
-2. **生成结果列表**：将合并后的键值对转换为单独的Map，并存入结果列表。
+1. **逆序遍历原List**：这样可以确保先访问到每个key最后一次出现的元素。
+2. **使用Set记录已处理的key**：当第一次遇到某个key时（即逆序中首次出现，原List中最后一次出现），将其对应的Map加入结果列表。
+3. **反转结果列表**：恢复元素在原List中的最后一次出现的顺序。
 
-以下是实现代码：
+以下是Java代码实现：
 
 ```java
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
-public class MapMerger {
+public class RemoveDuplicateMaps {
 
-    public static List<Map<String, String>> mergeMaps(List<Map<String, String>> list) {
-        // 用于合并所有键值对的临时Map
-        Map<String, String> mergedValues = new HashMap<>();
+    public static List<Map<String, Object>> removeDuplicates(List<Map<String, Object>> list) {
+        Set<String> seen = new HashSet<>();
+        List<Map<String, Object>> result = new ArrayList<>();
 
-        // 遍历每个Map中的键值对，合并值
-        for (Map<String, String> map : list) {
-            for (Map.Entry<String, String> entry : map.entrySet()) {
-                String key = entry.getKey();
-                String value = entry.getValue();
-                // 如果键已存在，则拼接值；否则直接添加
-                mergedValues.merge(key, value, (oldVal, newVal) -> oldVal + newVal);
+        // 逆序遍历原List，确保保留最后一次出现的元素
+        for (int i = list.size() - 1; i >= 0; i--) {
+            Map<String, Object> map = list.get(i);
+            String key = map.keySet().iterator().next();
+            if (seen.add(key)) { // 如果key未被添加过，则加入结果列表
+                result.add(map);
             }
         }
 
-        // 将合并后的键值对转换为独立的Map并存入结果列表
-        List<Map<String, String>> result = new ArrayList<>();
-        for (Map.Entry<String, String> entry : mergedValues.entrySet()) {
-            Map<String, String> newMap = new HashMap<>();
-            newMap.put(entry.getKey(), entry.getValue());
-            result.add(newMap);
-        }
-
+        // 反转结果以保持原List中最后一次出现的顺序
+        Collections.reverse(result);
         return result;
     }
 
     public static void main(String[] args) {
         // 示例测试
-        List<Map<String, String>> list = new ArrayList<>();
-        
-        Map<String, String> map1 = new HashMap<>();
-        map1.put("a", "hello");
-        list.add(map1);
-        
-        Map<String, String> map2 = new HashMap<>();
-        map2.put("a", "world");
-        list.add(map2);
-        
-        Map<String, String> map3 = new HashMap<>();
-        map3.put("b", "test");
-        list.add(map3);
+        List<Map<String, Object>> list = new ArrayList<>();
+        addEntry(list, "A", 1);
+        addEntry(list, "B", 2);
+        addEntry(list, "A", 3);
+        addEntry(list, "C", 4);
+        addEntry(list, "B", 5);
 
-        List<Map<String, String>> mergedList = mergeMaps(list);
-        System.out.println(mergedList);  // 输出：[{a=helloworld}, {b=test}]
+        List<Map<String, Object>> result = removeDuplicates(list);
+        for (Map<String, Object> map : result) {
+            System.out.println(map);
+        }
+        // 输出：
+        // {A=3}
+        // {C=4}
+        // {B=5}
+    }
+
+    private static void addEntry(List<Map<String, Object>> list, String key, Object value) {
+        Map<String, Object> map = new HashMap<>();
+        map.put(key, value);
+        list.add(map);
     }
 }
 ```
 
-### 解释：
-- **合并过程**：使用`mergedValues`临时Map收集所有键的值。若键已存在，则通过`merge`方法将新值连接到旧值之后。
-- **生成结果**：遍历临时Map，将每个键值对转换为新的Map，并添加到结果列表中。
-- **示例结果**：输入三个Map（两个含键`a`，一个含键`b`），合并后得到两个Map（`a`的值合并，`b`保留）。
+**步骤解释**：
+1. **逆序遍历**：从List末尾开始遍历，确保每个key第一次被遇到时是其在原List中最后一次出现的位置。
+2. **使用Set去重**：通过`seen.add(key)`判断是否已处理过该key，未处理则添加到结果列表。
+3. **反转结果**：由于逆序添加导致结果顺序与原List相反，通过`Collections.reverse(result)`恢复正确的顺序。
 
-此方法确保所有相同键的值被合并，最终每个键对应一个独立的Map。
+该方法确保每个key保留最新的Map，且顺序与原List中最后一次出现的顺序一致。
