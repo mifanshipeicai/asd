@@ -1,64 +1,231 @@
-为了去除List中重复key的Map，并保留最新加入的那个，可以按照以下步骤实现：
+在 Spring Boot MVC 过滤器中检查请求头是否存在，如果缺失则返回 401 状态码，可以通过以下方式实现：
 
-1. **逆序遍历原List**：这样可以确保先访问到每个key最后一次出现的元素。
-2. **使用Set记录已处理的key**：当第一次遇到某个key时（即逆序中首次出现，原List中最后一次出现），将其对应的Map加入结果列表。
-3. **反转结果列表**：恢复元素在原List中的最后一次出现的顺序。
-
-以下是Java代码实现：
+### 完整解决方案
 
 ```java
-import java.util.*;
+import javax.servlet.*;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import java.io.IOException;
 
-public class RemoveDuplicateMaps {
+public class AuthFilter implements Filter {
 
-    public static List<Map<String, Object>> removeDuplicates(List<Map<String, Object>> list) {
-        Set<String> seen = new HashSet<>();
-        List<Map<String, Object>> result = new ArrayList<>();
-
-        // 逆序遍历原List，确保保留最后一次出现的元素
-        for (int i = list.size() - 1; i >= 0; i--) {
-            Map<String, Object> map = list.get(i);
-            String key = map.keySet().iterator().next();
-            if (seen.add(key)) { // 如果key未被添加过，则加入结果列表
-                result.add(map);
-            }
+    // 需要验证的Header名称
+    private static final String REQUIRED_HEADER = "Authorization";
+    
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
+            throws IOException, ServletException {
+        
+        HttpServletRequest httpRequest = (HttpServletRequest) request;
+        HttpServletResponse httpResponse = (HttpServletResponse) response;
+        
+        // 检查Header是否存在
+        if (!hasRequiredHeader(httpRequest)) {
+            // 返回401 Unauthorized
+            httpResponse.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+            httpResponse.getWriter().write("Missing required header: " + REQUIRED_HEADER);
+            return; // 中断请求处理
         }
-
-        // 反转结果以保持原List中最后一次出现的顺序
-        Collections.reverse(result);
-        return result;
+        
+        // 继续处理请求
+        chain.doFilter(request, response);
     }
 
-    public static void main(String[] args) {
-        // 示例测试
-        List<Map<String, Object>> list = new ArrayList<>();
-        addEntry(list, "A", 1);
-        addEntry(list, "B", 2);
-        addEntry(list, "A", 3);
-        addEntry(list, "C", 4);
-        addEntry(list, "B", 5);
-
-        List<Map<String, Object>> result = removeDuplicates(list);
-        for (Map<String, Object> map : result) {
-            System.out.println(map);
-        }
-        // 输出：
-        // {A=3}
-        // {C=4}
-        // {B=5}
+    private boolean hasRequiredHeader(HttpServletRequest request) {
+        // 检查Header是否存在（不区分大小写）
+        return request.getHeader(REQUIRED_HEADER) != null;
     }
 
-    private static void addEntry(List<Map<String, Object>> list, String key, Object value) {
-        Map<String, Object> map = new HashMap<>();
-        map.put(key, value);
-        list.add(map);
+    @Override
+    public void init(FilterConfig filterConfig) {}
+
+    @Override
+    public void destroy() {}
+}
+```
+
+### 注册过滤器配置类
+
+```java
+import org.springframework.boot.web.servlet.FilterRegistrationBean;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class FilterConfig {
+
+    @Bean
+    public FilterRegistrationBean<AuthFilter> authFilter() {
+        FilterRegistrationBean<AuthFilter> registration = new FilterRegistrationBean<>();
+        registration.setFilter(new AuthFilter());
+        
+        // 设置过滤路径（可指定特定路径）
+        registration.addUrlPatterns("/secure/*", "/api/*");
+        
+        // 设置过滤器名称和顺序
+        registration.setName("authFilter");
+        registration.setOrder(1);
+        
+        return registration;
     }
 }
 ```
 
-**步骤解释**：
-1. **逆序遍历**：从List末尾开始遍历，确保每个key第一次被遇到时是其在原List中最后一次出现的位置。
-2. **使用Set去重**：通过`seen.add(key)`判断是否已处理过该key，未处理则添加到结果列表。
-3. **反转结果**：由于逆序添加导致结果顺序与原List相反，通过`Collections.reverse(result)`恢复正确的顺序。
+### 可选：添加更灵活的配置
 
-该方法确保每个key保留最新的Map，且顺序与原List中最后一次出现的顺序一致。
+如果需要动态配置必检Header名称或排除路径，可增加配置参数：
+
+```java
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.web.servlet.FilterRegistrationBean;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import java.util.Arrays;
+
+@Configuration
+public class FilterConfig {
+
+    @Value("${security.required-header:Authorization}")
+    private String requiredHeader;
+    
+    @Value("${security.exclude-paths:/public}")
+    private String[] excludePaths;
+
+    @Bean
+    public FilterRegistrationBean<AuthFilter> authFilter() {
+        FilterRegistrationBean<AuthFilter> registration = new FilterRegistrationBean<>();
+        AuthFilter filter = new AuthFilter();
+        filter.setRequiredHeader(requiredHeader); // 注入配置值
+        
+        registration.setFilter(filter);
+        registration.addUrlPatterns("/*");
+        registration.setName("authFilter");
+        registration.setOrder(1);
+        
+        // 添加排除路径（可选）
+        if (excludePaths != null && excludePaths.length > 0) {
+            registration.addInitParameter("excludePaths", String.join(",", excludePaths));
+        }
+        
+        return registration;
+    }
+}
+```
+
+修改过滤器支持配置注入：
+
+```java
+public class AuthFilter implements Filter {
+    
+    private String requiredHeader = "Authorization";
+    private String[] excludePaths;
+    
+    public void setRequiredHeader(String requiredHeader) {
+        this.requiredHeader = requiredHeader;
+    }
+    
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
+            throws IOException, ServletException {
+        
+        HttpServletRequest httpRequest = (HttpServletRequest) request;
+        HttpServletResponse httpResponse = (HttpServletResponse) response;
+        
+        // 检查是否在排除路径中
+        if (isExcludedPath(httpRequest)) {
+            chain.doFilter(request, response);
+            return;
+        }
+        
+        // 检查Header
+        if (httpRequest.getHeader(requiredHeader) == null) {
+            httpResponse.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+            httpResponse.getWriter().format("Missing required header: %s", requiredHeader);
+            return;
+        }
+        
+        chain.doFilter(request, response);
+    }
+    
+    private boolean isExcludedPath(HttpServletRequest request) {
+        if (excludePaths == null) return false;
+        
+        String path = request.getRequestURI().substring(request.getContextPath().length());
+        return Arrays.stream(excludePaths)
+                     .anyMatch(path::startsWith);
+    }
+    
+    @Override
+    public void init(FilterConfig filterConfig) {
+        // 获取排除路径配置
+        String excludeParam = filterConfig.getInitParameter("excludePaths");
+        if (excludeParam != null && !excludeParam.isEmpty()) {
+            this.excludePaths = excludeParam.split(",");
+        }
+    }
+    
+    // ... 其他方法
+}
+```
+
+### 在 `application.properties` 中添加配置
+
+```properties
+# 必检Header名称（默认为Authorization）
+security.required-header=X-Api-Key
+
+# 排除路径（逗号分隔）
+security.exclude-paths=/public,/health
+```
+
+### 测试场景
+
+1. **有效请求**：
+```bash
+curl -H "X-Api-Key: my-secret-key" http://localhost:8080/api/data
+# 返回正常响应 (200)
+```
+
+2. **缺失Header**：
+```bash
+curl http://localhost:8080/api/data
+# 返回: HTTP/1.1 401 
+# 内容: Missing required header: X-Api-Key
+```
+
+3. **排除路径**：
+```bash
+curl http://localhost:8080/public/info
+# 正常访问（不检查Header）
+```
+
+### 关键点说明
+
+1. **中断请求流程**：
+   - 当检测到Header缺失时，直接设置响应状态为 401 并返回错误信息
+   - 使用 `response.getWriter().write()` 返回错误详情
+   - **不调用** `chain.doFilter()` 中断后续处理
+
+2. **性能优化**：
+   - 在过滤路径中排除静态资源和公开端点
+   - 使用 `startsWith()` 匹配路径前缀提高效率
+
+3. **安全增强建议**：
+   ```java
+   // 防止缓存敏感错误信息
+   httpResponse.setHeader("Cache-Control", "no-store");
+   
+   // 标准化错误响应
+   httpResponse.setContentType("application/json");
+   httpResponse.getWriter().write(
+       "{\"error\":\"unauthorized\",\"message\":\"Missing authentication header\"}"
+   );
+   ```
+
+4. **生产环境注意事项**：
+   - 记录审计日志：`log.warn("Unauthorized access attempt to {}", request.getRequestURI())`
+   - 添加速率限制防止暴力请求
+   - 考虑使用 Spring Security 进行更复杂的认证场景
+
+这种实现方式适用于简单的API密钥验证场景。对于更复杂的需求（如JWT验证、OAuth等），建议使用 Spring Security 框架。
