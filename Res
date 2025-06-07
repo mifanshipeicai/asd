@@ -1,231 +1,151 @@
-在 Spring Boot MVC 过滤器中检查请求头是否存在，如果缺失则返回 401 状态码，可以通过以下方式实现：
+在 Spring Boot 3.5.0 中整合 Dremio 主要涉及数据源配置、查询执行及高级特性（如 Apache Iceberg 的 Time Travel）的支持。以下是详细实现步骤和最佳实践：
 
-### 完整解决方案
+---
 
-```java
-import javax.servlet.*;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
-import java.io.IOException;
+### 🔧 一、环境准备与依赖管理
+1. **添加依赖**  
+   在 `pom.xml` 中配置 Dremio JDBC 驱动和 Spring Boot 数据层依赖：
+   ```xml
+   <dependencies>
+       <!-- Spring Boot Starter Data JPA (可选) -->
+       <dependency>
+           <groupId>org.springframework.boot</groupId>
+           <artifactId>spring-boot-starter-data-jpa</artifactId>
+       </dependency>
+       <!-- Dremio JDBC 驱动 -->
+       <dependency>
+           <groupId>com.dremio</groupId>
+           <artifactId>dremio-jdbc-driver</artifactId>
+           <version>24.0.0</version> <!-- 确保与 Dremio 服务器版本匹配 -->
+       </dependency>
+   </dependencies>
+   ```
+   **依赖冲突处理**：若存在版本冲突（如 `jackson-databind`），通过 `<exclusions>` 或 `dependencyManagement` 显式指定版本。
 
-public class AuthFilter implements Filter {
+---
 
-    // 需要验证的Header名称
-    private static final String REQUIRED_HEADER = "Authorization";
-    
-    @Override
-    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
-            throws IOException, ServletException {
-        
-        HttpServletRequest httpRequest = (HttpServletRequest) request;
-        HttpServletResponse httpResponse = (HttpServletResponse) response;
-        
-        // 检查Header是否存在
-        if (!hasRequiredHeader(httpRequest)) {
-            // 返回401 Unauthorized
-            httpResponse.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
-            httpResponse.getWriter().write("Missing required header: " + REQUIRED_HEADER);
-            return; // 中断请求处理
-        }
-        
-        // 继续处理请求
-        chain.doFilter(request, response);
-    }
+### ⚙️ 二、配置 Dremio 数据源
+1. **多环境配置（YAML 格式）**  
+   在 `application.yml` 中定义 Dremio 连接，支持开发/生产环境隔离：
+   ```yaml
+   spring:
+     datasource:
+       url: jdbc:dremio:direct=http://dremio-server:9047;schema=my_space
+       username: dremio_user
+       password: "ENC(加密密码)" # 建议结合 Jasypt 加密
+       driver-class-name: com.dremio.jdbc.Driver
+   ```
+   **多环境扩展**：  
+   - 创建 `application-dev.yml`（开发环境）、`application-prod.yml`（生产环境）。
+   - 在 `application.yml` 中激活环境：`spring.profiles.active: dev`。
 
-    private boolean hasRequiredHeader(HttpServletRequest request) {
-        // 检查Header是否存在（不区分大小写）
-        return request.getHeader(REQUIRED_HEADER) != null;
-    }
-
-    @Override
-    public void init(FilterConfig filterConfig) {}
-
-    @Override
-    public void destroy() {}
-}
-```
-
-### 注册过滤器配置类
-
-```java
-import org.springframework.boot.web.servlet.FilterRegistrationBean;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-
-@Configuration
-public class FilterConfig {
-
-    @Bean
-    public FilterRegistrationBean<AuthFilter> authFilter() {
-        FilterRegistrationBean<AuthFilter> registration = new FilterRegistrationBean<>();
-        registration.setFilter(new AuthFilter());
-        
-        // 设置过滤路径（可指定特定路径）
-        registration.addUrlPatterns("/secure/*", "/api/*");
-        
-        // 设置过滤器名称和顺序
-        registration.setName("authFilter");
-        registration.setOrder(1);
-        
-        return registration;
-    }
-}
-```
-
-### 可选：添加更灵活的配置
-
-如果需要动态配置必检Header名称或排除路径，可增加配置参数：
-
-```java
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.web.servlet.FilterRegistrationBean;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import java.util.Arrays;
-
-@Configuration
-public class FilterConfig {
-
-    @Value("${security.required-header:Authorization}")
-    private String requiredHeader;
-    
-    @Value("${security.exclude-paths:/public}")
-    private String[] excludePaths;
-
-    @Bean
-    public FilterRegistrationBean<AuthFilter> authFilter() {
-        FilterRegistrationBean<AuthFilter> registration = new FilterRegistrationBean<>();
-        AuthFilter filter = new AuthFilter();
-        filter.setRequiredHeader(requiredHeader); // 注入配置值
-        
-        registration.setFilter(filter);
-        registration.addUrlPatterns("/*");
-        registration.setName("authFilter");
-        registration.setOrder(1);
-        
-        // 添加排除路径（可选）
-        if (excludePaths != null && excludePaths.length > 0) {
-            registration.addInitParameter("excludePaths", String.join(",", excludePaths));
-        }
-        
-        return registration;
-    }
-}
-```
-
-修改过滤器支持配置注入：
-
-```java
-public class AuthFilter implements Filter {
-    
-    private String requiredHeader = "Authorization";
-    private String[] excludePaths;
-    
-    public void setRequiredHeader(String requiredHeader) {
-        this.requiredHeader = requiredHeader;
-    }
-    
-    @Override
-    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
-            throws IOException, ServletException {
-        
-        HttpServletRequest httpRequest = (HttpServletRequest) request;
-        HttpServletResponse httpResponse = (HttpServletResponse) response;
-        
-        // 检查是否在排除路径中
-        if (isExcludedPath(httpRequest)) {
-            chain.doFilter(request, response);
-            return;
-        }
-        
-        // 检查Header
-        if (httpRequest.getHeader(requiredHeader) == null) {
-            httpResponse.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
-            httpResponse.getWriter().format("Missing required header: %s", requiredHeader);
-            return;
-        }
-        
-        chain.doFilter(request, response);
-    }
-    
-    private boolean isExcludedPath(HttpServletRequest request) {
-        if (excludePaths == null) return false;
-        
-        String path = request.getRequestURI().substring(request.getContextPath().length());
-        return Arrays.stream(excludePaths)
-                     .anyMatch(path::startsWith);
-    }
-    
-    @Override
-    public void init(FilterConfig filterConfig) {
-        // 获取排除路径配置
-        String excludeParam = filterConfig.getInitParameter("excludePaths");
-        if (excludeParam != null && !excludeParam.isEmpty()) {
-            this.excludePaths = excludeParam.split(",");
-        }
-    }
-    
-    // ... 其他方法
-}
-```
-
-### 在 `application.properties` 中添加配置
-
-```properties
-# 必检Header名称（默认为Authorization）
-security.required-header=X-Api-Key
-
-# 排除路径（逗号分隔）
-security.exclude-paths=/public,/health
-```
-
-### 测试场景
-
-1. **有效请求**：
-```bash
-curl -H "X-Api-Key: my-secret-key" http://localhost:8080/api/data
-# 返回正常响应 (200)
-```
-
-2. **缺失Header**：
-```bash
-curl http://localhost:8080/api/data
-# 返回: HTTP/1.1 401 
-# 内容: Missing required header: X-Api-Key
-```
-
-3. **排除路径**：
-```bash
-curl http://localhost:8080/public/info
-# 正常访问（不检查Header）
-```
-
-### 关键点说明
-
-1. **中断请求流程**：
-   - 当检测到Header缺失时，直接设置响应状态为 401 并返回错误信息
-   - 使用 `response.getWriter().write()` 返回错误详情
-   - **不调用** `chain.doFilter()` 中断后续处理
-
-2. **性能优化**：
-   - 在过滤路径中排除静态资源和公开端点
-   - 使用 `startsWith()` 匹配路径前缀提高效率
-
-3. **安全增强建议**：
-   ```java
-   // 防止缓存敏感错误信息
-   httpResponse.setHeader("Cache-Control", "no-store");
-   
-   // 标准化错误响应
-   httpResponse.setContentType("application/json");
-   httpResponse.getWriter().write(
-       "{\"error\":\"unauthorized\",\"message\":\"Missing authentication header\"}"
-   );
+2. **连接池优化（如 HikariCP）**  
+   增加连接池配置提升性能：
+   ```yaml
+   spring:
+     datasource:
+       hikari:
+         maximum-pool-size: 10
+         connection-timeout: 30000
+         idle-timeout: 600000
    ```
 
-4. **生产环境注意事项**：
-   - 记录审计日志：`log.warn("Unauthorized access attempt to {}", request.getRequestURI())`
-   - 添加速率限制防止暴力请求
-   - 考虑使用 Spring Security 进行更复杂的认证场景
+---
 
-这种实现方式适用于简单的API密钥验证场景。对于更复杂的需求（如JWT验证、OAuth等），建议使用 Spring Security 框架。
+### 🔍 三、执行 Dremio 查询
+1. **原生 JDBC 查询**  
+   通过 `JdbcTemplate` 直接执行 SQL：
+   ```java
+   @Autowired
+   private JdbcTemplate jdbcTemplate;
+
+   public List<Map<String, Object>> queryDremio(String sql) {
+       return jdbcTemplate.queryForList(sql);
+   }
+   ```
+   **示例查询**：  
+   ```sql
+   SELECT * FROM s3.ctas.iceberg_blog AT SNAPSHOT '4132119532727284872' -- Time Travel 查询
+   ```
+
+2. **集成 Spring Data**  
+   若需 ORM 支持，可结合 `Spring Data JPA` 或自定义 Repository：
+   ```java
+   @Repository
+   public interface IcebergRepository extends CrudRepository<CatalogSales, Long> {
+       @Query(value = "SELECT * FROM s3.ctas.iceberg_blog", nativeQuery = true)
+       List<CatalogSales> findAll();
+   }
+   ```
+
+---
+
+### ⏳ 四、支持 Dremio 高级特性
+1. **Apache Iceberg Time Travel**  
+   利用 Dremio 的 `AT SNAPSHOT` 语法查询历史数据快照：
+   ```sql
+   -- 查询特定快照的数据
+   SELECT * FROM my_table AT SNAPSHOT '1234567890';
+   ```
+   **管理快照**：  
+   通过 `TABLE(table_history('table_name'))` 获取快照历史：
+   ```sql
+   SELECT * FROM TABLE(table_history('s3.ctas.iceberg_blog'));
+   ```
+
+2. **虚拟数据集（VDS）集成**  
+   将 Time Travel 查询保存为虚拟数据集，供业务层复用：
+   ```sql
+   CREATE VDS demo.historical_sales AS
+   SELECT * FROM s3.ctas.iceberg_blog AT SNAPSHOT '4132119532727284872';
+   ```
+
+---
+
+### 🌐 五、多环境与部署优化
+1. **配置分离策略**  
+   - **通用配置**：`application.yml`（端口、日志级别）。  
+   - **环境专属配置**：`application-{env}.yml`（数据源、Dremio 连接）。  
+   - **命令行激活环境**：  
+     ```bash
+     java -jar app.jar --spring.profiles.active=prod
+     ```
+
+2. **原生编译支持（GraalVM）**  
+   Spring Boot 3.5.0 支持通过 GraalVM 生成原生镜像，提升 Dremio 查询性能：  
+   - 添加 AOT 插件：
+     ```xml
+     <build>
+         <plugins>
+             <plugin>
+                 <groupId>org.graalvm.buildtools</groupId>
+                 <artifactId>native-maven-plugin</artifactId>
+                 <version>0.9.28</version>
+             </plugin>
+         </plugins>
+     </build>
+     ```
+   - 编译命令：`mvn -Pnative native:compile`。  
+
+   | **部署模式** | 启动时间 | 内存占用 | 适用场景                |
+   |--------------|----------|----------|-------------------------|
+   | **JVM**      | 2-5s     | 100MB+   | 传统应用、复杂查询      |
+   | **Native**   | <100ms   | 20-40MB  | 微服务、Serverless 场景 |
+
+---
+
+### ⚠️ 六、常见问题解决
+- **连接超时**：检查 Dremio 服务端口（默认 9047）和防火墙规则。  
+- **依赖冲突**：使用 `mvn dependency:tree` 排查冲突，优先继承 `spring-boot-dependencies` 管理版本。  
+- **负载均衡问题**：若部署多实例，确保 CAS 认证配置无状态（如禁用 Session 粘滞）。
+
+---
+
+### 💎 总结
+Spring Boot 3.5.0 整合 Dremio 的核心步骤包括：  
+1. **依赖配置**：JDBC 驱动 + 连接池优化。  
+2. **多环境隔离**：YAML 分环境管理数据源。  
+3. **查询执行**：`JdbcTemplate` + Iceberg Time Travel 语法。  
+4. **部署优化**：GraalVM 原生编译提升性能。  
+
+通过合理利用 Dremio 的 Apache Iceberg 集成能力，可高效实现数据湖查询与历史版本追溯，适合实时分析场景。
