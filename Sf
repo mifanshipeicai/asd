@@ -1,278 +1,150 @@
-以下是针对多台SFTP服务器的动态选择解决方案：
+在使用 Jackson 的 `SequenceWriter` 进行流式 JSON 写入时，**不需要手动关闭底层的 `OutputStream`**，但需要正确处理 `SequenceWriter` 和相关的资源。以下是关键注意事项和最佳实践：
 
-### 增强版实现方案
-
-#### 1. 扩展配置存储（以数据库为例）
+### 1. 不需要手动关闭 Spring 提供的 `OutputStream`
+Spring MVC 会自动管理响应流的生命周期：
 ```java
-@Entity
-public class SftpServerConfig {
-    @Id
-    private String serverId;
-    private String host;
-    private int port = 22;
-    private String user;
-    private String password;
-    private String privateKeyPath;
-    private String remoteDirectory;
-    // getters/setters
-}
-```
-
-#### 2. 创建配置服务
-```java
-@Service
-public class SftpConfigService {
-    @Autowired
-    private SftpConfigRepository configRepository;
-
-    private final Map<String, SessionFactory<ChannelSftp.LsEntry>> sessionFactoryCache = new ConcurrentHashMap<>();
-    private final Map<String, SftpRemoteFileTemplate> templateCache = new ConcurrentHashMap<>();
-
-    public SftpRemoteFileTemplate getSftpTemplate(String serverId) {
-        return templateCache.computeIfAbsent(serverId, id -> {
-            SessionFactory<ChannelSftp.LsEntry> sessionFactory = sessionFactoryCache.computeIfAbsent(id, 
-                key -> createSessionFactory(configRepository.findById(key)
-                    .orElseThrow(() -> new IllegalArgumentException("Invalid SFTP server ID"))));
-            return new SftpRemoteFileTemplate(sessionFactory);
-        });
-    }
-
-    private SessionFactory<ChannelSftp.LsEntry> createSessionFactory(SftpServerConfig config) {
-        DefaultSftpSessionFactory factory = new DefaultSftpSessionFactory(true);
-        factory.setHost(config.getHost());
-        factory.setPort(config.getPort());
-        factory.setUser(config.getUser());
+@GetMapping("/stream")
+public StreamingResponseBody streamData() {
+    return outputStream -> {
+        // 不要关闭这个 outputStream！Spring 会处理
+        ObjectMapper mapper = new ObjectMapper();
+        JsonGenerator generator = mapper.getFactory().createGenerator(outputStream, JsonEncoding.UTF8);
         
-        if (config.getPassword() != null) {
-            factory.setPassword(config.getPassword());
-        } else if (config.getPrivateKeyPath() != null) {
-            factory.setPrivateKey(new FileSystemResource(config.getPrivateKeyPath()));
-        }
-        
-        factory.setAllowUnknownKeys(true);
-        return new CachingSessionFactory<>(factory);
-    }
-}
-```
-
-#### 3. 增强SFTP服务
-```java
-@Service
-public class DynamicSftpService {
-    private final SftpConfigService configService;
-
-    @Autowired
-    public DynamicSftpService(SftpConfigService configService) {
-        this.configService = configService;
-    }
-
-    @Async("sftpTaskExecutor")
-    public CompletableFuture<Void> uploadFile(String serverId, File file) {
-        return CompletableFuture.runAsync(() -> {
-            SftpRemoteFileTemplate template = configService.getSftpTemplate(serverId);
-            SftpServerConfig config = configService.getConfig(serverId);
-            
-            template.execute(session -> {
-                String remotePath = config.getRemoteDirectory() + "/" + file.getName();
-                try (InputStream is = new FileInputStream(file)) {
-                    session.write(is, remotePath);
-                }
-                return null;
-            });
-        });
-    }
-
-    @Async("sftpTaskExecutor")
-    public CompletableFuture<File> downloadFile(String serverId, String remotePath, File localFile) {
-        return CompletableFuture.supplyAsync(() -> {
-            SftpRemoteFileTemplate template = configService.getSftpTemplate(serverId);
-            template.execute(session -> {
-                try (OutputStream os = new FileOutputStream(localFile)) {
-                    session.read(remotePath, os);
-                }
-                return null;
-            });
-            return localFile;
-        });
-    }
-}
-```
-
-#### 4. 动态调用示例
-```java
-@RestController
-@RequestMapping("/files")
-public class FileController {
-    @Autowired
-    private DynamicSftpService sftpService;
-
-    @PostMapping("/{serverId}/upload")
-    public ResponseEntity<String> uploadFile(
-        @PathVariable String serverId,
-        @RequestParam("file") MultipartFile file) {
-        
-        File tempFile = convertToFile(file);
-        sftpService.uploadFile(serverId, tempFile)
-            .exceptionally(ex -> {
-                log.error("Upload failed for server {}", serverId, ex);
-                return null;
-            });
-        
-        return ResponseEntity.accepted().body("File upload started");
-    }
-
-    @GetMapping("/{serverId}/download")
-    public ResponseEntity<Resource> downloadFile(
-        @PathVariable String serverId,
-        @RequestParam String remotePath) {
-        
-        File localFile = sftpService.downloadFile(serverId, remotePath)
-            .exceptionally(ex -> {
-                throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, 
-                    "Download failed", ex);
-            }).join();
-        
-        return ResponseEntity.ok()
-            .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + localFile.getName() + "\"")
-            .body(new FileSystemResource(localFile));
-    }
-}
-```
-
-### 高级优化策略
-
-1. **连接池监控**：
-```java
-@Scheduled(fixedRate = 300000)
-public void cleanStaleConnections() {
-    configService.getSessionFactoryCache().forEach((serverId, factory) -> {
-        if (factory instanceof CachingSessionFactory) {
-            ((CachingSessionFactory<?>) factory).resetCache();
-        }
-    });
-}
-```
-
-2. **动态配置刷新**：
-```java
-@RefreshScope
-public class SftpConfigService {
-    // 配合Spring Cloud Config实现动态刷新
-    @EventListener(EnvironmentChangeEvent.class)
-    public void refreshConfig() {
-        sessionFactoryCache.clear();
-        templateCache.clear();
-    }
-}
-```
-
-3. **负载均衡策略**：
-```java
-public interface SftpServerSelector {
-    String selectServer(FileMetadata metadata);
-}
-
-@Service
-public class RegionBasedSelector implements SftpServerSelector {
-    @Override
-    public String selectServer(FileMetadata metadata) {
-        // 根据文件元数据选择最优服务器
-        return metadata.getRegion() + "-sftp01";
-    }
-}
-```
-
-4. **健康检查集成**：
-```java
-@Component
-public class SftpHealthIndicator implements HealthIndicator {
-    @Autowired
-    private SftpConfigService configService;
-
-    @Override
-    public Health health() {
-        Map<String, Health> serverHealths = new LinkedHashMap<>();
-        
-        configService.getAllServerIds().forEach(serverId -> {
-            try {
-                boolean reachable = configService.getSftpTemplate(serverId)
-                    .execute(session -> session.test());
-                
-                serverHealths.put(serverId, 
-                    reachable ? Health.up().build() : Health.down().build());
-            } catch (Exception e) {
-                serverHealths.put(serverId, 
-                    Health.down(e).build());
+        try (SequenceWriter writer = mapper.writer().writeValues(generator)) {
+            // 写入数据
+            for (Item item : itemList) {
+                writer.write(item);  // 流式写入
             }
-        });
-        
-        return Health.status(Status.UP)
-            .withDetails(serverHealths)
-            .build();
-    }
+        } // 自动关闭 SequenceWriter 和 Generator
+    };
 }
 ```
 
-### 安全增强建议
-
-1. **敏感信息加密**：
-```yaml
-# application.yml
-sftp:
-  servers:
-    server1:
-      password: '{cipher}密文'
-      private-key: '{cipher}密文'
-```
-
-2. **访问审计**：
+### 2. 必须正确关闭 `SequenceWriter` 和 `JsonGenerator`
+使用 **try-with-resources** 确保资源释放：
 ```java
-@Aspect
-@Component
-public class SftpAuditAspect {
-    @Around("execution(* com.example.service.DynamicSftpService.*(..))")
-    public Object auditSftpOperation(ProceedingJoinPoint joinPoint) throws Throwable {
-        String serverId = (String) joinPoint.getArgs()[0];
-        long start = System.currentTimeMillis();
+try (SequenceWriter writer = mapper.writer().writeValues(generator)) {
+    // 写入逻辑
+    while (hasMoreData()) {
+        writer.write(getNextData());
+    }
+} // 自动调用 writer.close()
+```
+
+### 3. 异常处理方案
+当流写入过程中发生异常时：
+
+#### 方案 A：写入结构化错误信息
+```java
+try (SequenceWriter writer = mapper.writer().writeValues(generator)) {
+    // 业务逻辑
+} catch (Exception e) {
+    // 清空已缓冲但未发送的数据
+    generator.flush();
+    
+    // 写入错误信息（保持JSON结构）
+    generator.writeStartObject();
+    generator.writeStringField("error", e.getMessage());
+    generator.writeEndObject();
+}
+```
+
+#### 方案 B：使用全局异常处理
+```java
+@ControllerAdvice
+public class StreamExceptionHandler {
+
+    @ExceptionHandler(DataAccessException.class)
+    public ResponseEntity<String> handleStreamException(
+            DataAccessException ex, 
+            HttpServletResponse response) {
         
-        try {
-            Object result = joinPoint.proceed();
-            auditService.logOperation(serverId, "SUCCESS", 
-                System.currentTimeMillis() - start);
-            return result;
-        } catch (Exception e) {
-            auditService.logOperation(serverId, "FAILURE: " + e.getMessage(), 
-                System.currentTimeMillis() - start);
-            throw e;
+        if (!response.isCommitted()) {
+            return ResponseEntity.status(500).body(ex.getMessage());
         }
+        
+        // 响应已提交时记录日志
+        log.error("Stream failed after commit: {}", ex.getMessage());
+        return null; // 响应已提交，无法修改
     }
 }
 ```
 
-### 部署架构建议
+### 4. 关键注意事项
 
+#### 资源管理
+```java
+return outputStream -> {
+    // 正确：使用 try-with-resources 管理 Jackson 资源
+    try (JsonGenerator gen = mapper.createGenerator(outputStream);
+         SequenceWriter writer = mapper.writer().writeValues(gen)) {
+         
+        // 业务逻辑
+        
+    } // 自动关闭 writer 和 generator
+    
+    // 不要关闭 outputStream！
+};
 ```
-                       +-----------------+
-                       |  Config Server  |
-                       | (DB/Redis/Nacos)|
-                       +--------+--------+
-                                |
-                                |
-+----------------+       +------v------+       +-----------------+
-|  Application   |       |   SFTP     |       |  Monitoring     |
-|    Server      +------->  Service   +------->  System         |
-| (Spring Boot)  |       |  Cluster   |       | (Prometheus)    |
-+----------------+       +------------+       +-----------------+
+
+#### 异常处理优先级
+1. **前置验证**：在创建流之前检查参数
+   ```java
+   @GetMapping("/stream")
+   public StreamingResponseBody stream(@RequestParam String id) {
+       if (!isValid(id)) {
+           throw new IllegalArgumentException("Invalid ID"); // 可被全局异常处理器捕获
+       }
+       
+       return outputStream -> { /* 流逻辑 */ };
+   }
+   ```
+   
+2. **流内异常**：捕获并写入错误信息
+
+### 5. 完整示例
+```java
+@GetMapping("/data-stream")
+public StreamingResponseBody streamData() {
+    return outputStream -> {
+        ObjectMapper mapper = new ObjectMapper();
+        
+        try (JsonGenerator generator = mapper.getFactory().createGenerator(outputStream);
+             SequenceWriter writer = mapper.writer().writeValues(generator)) {
+            
+            generator.writeStartArray();
+            
+            while (dataSource.hasNext()) {
+                Data item = dataSource.next();
+                // 业务逻辑可能抛出异常
+                validateItem(item); 
+                
+                writer.write(item);
+            }
+            
+            generator.writeEndArray();
+            
+        } catch (Exception e) {
+            // 清空缓冲区
+            outputStream.flush();
+            
+            // 写入错误结构
+            String error = mapper.writeValueAsString(
+                Map.of("error", e.getMessage(), "code", 500)
+            );
+            outputStream.write(error.getBytes());
+        }
+    };
+}
 ```
 
-关键优势：
-1. **动态路由**：基于业务规则自动选择目标服务器
-2. **弹性扩展**：支持动态添加/移除SFTP服务器节点
-3. **集中管理**：所有SFTP配置统一存储管理
-4. **全面监控**：集成健康检查、性能监控和操作审计
+### 总结建议
+1. **使用 try-with-resources** 确保 `SequenceWriter` 和 `JsonGenerator` 被关闭
+2. **绝不手动关闭** Spring 传入的 `OutputStream`
+3. **双保险异常处理**：
+   - 前置验证避免流内异常
+   - 流内捕获异常并写入结构化错误
+   - 全局异常处理器作为最后防线
+4. **客户端兼容**：确保前端能处理混合了正常数据和错误信息的流
 
-该方案支持在不停机的情况下：
-- 动态添加新的SFTP服务器配置
-- 调整现有服务器的连接参数
-- 自动剔除不可用服务器节点
-- 实时监控所有SFTP连接状态
+这样的设计既能保证资源安全释放，又能确保异常信息正确传达给调用方。
