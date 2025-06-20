@@ -1,166 +1,100 @@
-是的，完全可以在 HTTP 响应头(Response Header)中设置编码类型。这是处理字符编码问题的推荐做法，因为它能确保客户端(浏览器、API 调用方等)正确解析响应内容。
+在Java中，如果你有一个`List<Map<String, String>>`，需要将每个`Map`中值为空字符串(`""`)的条目替换为指定的值，可以通过遍历列表和每个Map来实现。以下是详细步骤和示例代码：
 
-### 在 Spring Boot 中设置响应头编码的几种方法：
+### 实现步骤
+1. **遍历List中的每个Map**
+2. **遍历当前Map中的每个键值对**
+3. **检查值是否为空字符串**（使用`isEmpty()`或直接比较）
+4. **替换为空字符串的值**为指定值（注意：直接修改Map会改变原始数据，若需保留原数据需先复制）
 
-#### 方法 1: 使用 `ResponseEntity` 设置头信息（推荐）
+### 示例代码
 ```java
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
+import java.util.*;
 
-@GetMapping("/data")
-public ResponseEntity<String[]> getData() {
-    // 获取数据（假设这是转换后的字符串数组）
-    String[] data = yourService.getUtf8Data();
-    
-    // 创建响应头
-    HttpHeaders headers = new HttpHeaders();
-    headers.setContentType(MediaType.APPLICATION_JSON); // 明确声明 JSON 类型
-    headers.set(HttpHeaders.CONTENT_TYPE, "application/json; charset=UTF-8"); // 设置字符集
-    
-    return ResponseEntity.ok()
-            .headers(headers)
-            .body(data);
-}
-```
-
-#### 方法 2: 使用 `@RequestMapping` 的 produces 属性
-```java
-@GetMapping(value = "/data", produces = "application/json; charset=UTF-8")
-public String[] getData() {
-    return yourService.getUtf8Data();
-}
-```
-
-#### 方法 3: 使用过滤器全局设置（适用于所有响应）
-```java
-import org.springframework.stereotype.Component;
-import javax.servlet.*;
-import javax.servlet.http.HttpServletResponse;
-import java.io.IOException;
-
-@Component
-public class EncodingFilter implements Filter {
-
-    @Override
-    public void doFilter(ServletRequest request, ServletResponse response, 
-                         FilterChain chain) throws IOException, ServletException {
-        HttpServletResponse httpResponse = (HttpServletResponse) response;
-        httpResponse.setCharacterEncoding("UTF-8");
-        httpResponse.setHeader("Content-Type", "application/json; charset=UTF-8");
-        chain.doFilter(request, response);
+public class ReplaceEmptyMapValues {
+    public static void main(String[] args) {
+        // 1. 创建示例数据
+        List<Map<String, String>> listOfMaps = new ArrayList<>();
+        
+        Map<String, String> map1 = new HashMap<>();
+        map1.put("name", "Alice");
+        map1.put("email", "");      // 空字符串
+        map1.put("address", null);   // null值（不替换）
+        
+        Map<String, String> map2 = new HashMap<>();
+        map2.put("name", "Bob");
+        map2.put("email", "bob@example.com");
+        map2.put("phone", "");       // 空字符串
+        
+        listOfMaps.add(map1);
+        listOfMaps.add(map2);
+        
+        // 2. 替换空字符串为指定值（如："N/A"）
+        replaceEmptyValues(listOfMaps, "N/A");
+        
+        // 3. 验证结果
+        System.out.println(listOfMaps);
+        // 输出：[{name=Alice, email=N/A, address=null}, {name=Bob, phone=N/A, email=bob@example.com}]
     }
     
-    // init() 和 destroy() 方法...
-}
-```
-
-### 关键响应头说明：
-
-1. **Content-Type**
-   - 格式：`application/json; charset=UTF-8`
-   - 作用：告知客户端响应体的格式和编码
-   - 这是最重要的设置，确保客户端使用 UTF-8 解码
-
-2. **Content-Encoding** (当使用压缩时)
-   - 格式：`gzip` 或 `br`
-   - 作用：表示响应体是否被压缩
-   - 示例：`Content-Encoding: gzip`
-
-### 完整的控制器示例：
-
-```java
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.RestController;
-import java.util.Base64;
-
-@RestController
-public class DataController {
-    
-    @GetMapping("/encoded-data")
-    public ResponseEntity<String[]> getEncodedData() {
-        // 1. 模拟获取原始对象数组
-        Object[] objectArray = getRawDataFromSource();
-        
-        // 2. 转换为UTF-8字符串数组
-        String[] utf8Array = convertToUtf8Array(objectArray);
-        
-        // 3. 设置响应头
-        HttpHeaders headers = new HttpHeaders();
-        headers.set("Content-Type", "application/json; charset=UTF-8");
-        headers.set("X-Content-Encoding", "UTF-8"); // 自定义头，可选
-        
-        return ResponseEntity.ok()
-                .headers(headers)
-                .body(utf8Array);
-    }
-    
-    private String[] convertToUtf8Array(Object[] objects) {
-        // 实现转换逻辑（如前所述）
-        return ...;
-    }
-    
-    private Object[] getRawDataFromSource() {
-        // 模拟数据获取
-        return new Object[]{
-            new DataObject("MjAyMzAzMTc="),
-            new DataObject("MjAyMzAzMjA=")
-        };
-    }
-    
-    static class DataObject {
-        private String bytes;
-        
-        public DataObject(String bytes) {
-            this.bytes = bytes;
-        }
-        
-        public String getBytes() {
-            return bytes;
+    /**
+     * 替换List中所有Map的空字符串值为指定值
+     * @param listOfMaps 目标List
+     * @param replacement 用于替换的值
+     */
+    public static void replaceEmptyValues(
+        List<Map<String, String>> listOfMaps, 
+        String replacement
+    ) {
+        for (Map<String, String> map : listOfMaps) {
+            // 遍历当前Map的键集合（避免并发修改异常）
+            for (String key : new ArrayList<>(map.keySet())) {
+                String value = map.get(key);
+                // 检查是否为空字符串（注意：不处理null）
+                if (value != null && value.isEmpty()) {
+                    map.put(key, replacement); // 直接修改原Map
+                }
+            }
         }
     }
 }
 ```
 
-### 测试响应头效果：
+### 关键点说明
+1. **区分空字符串和null**：
+   - 仅替换`""`（使用`value.isEmpty()`判断）
+   - 保留`null`值不变（通过`value != null`过滤）
+   
+2. **直接修改原始Map**：
+   - 代码直接操作传入的`List`和`Map`，会改变原始数据
+   - 若需保留原数据，可先深拷贝（示例未展示，需用`new HashMap<>(map)`复制）
 
-使用 curl 测试：
-```bash
-curl -i http://localhost:8080/encoded-data
-```
+3. **避免并发修改**：
+   - 遍历时使用`new ArrayList<>(map.keySet())`创建键的副本
+   - 防止在遍历原始`keySet`时修改导致的`ConcurrentModificationException`
 
-预期响应头包含：
-```
-HTTP/1.1 200 OK
-Content-Type: application/json; charset=UTF-8
-Transfer-Encoding: chunked
-Date: Wed, 18 Jun 2025 00:00:00 GMT
-
-["20230317","20230320"]
-```
-
-### 为什么推荐在响应头设置编码？
-
-1. **明确声明**：避免客户端猜测编码导致乱码
-2. **标准合规**：符合 HTTP 规范 (RFC 7231)
-3. **跨平台兼容**：确保所有客户端（浏览器、移动端、API 调用）统一处理
-4. **预防性设置**：即使你的数据已经是 UTF-8，显式声明可以避免潜在问题
-5. **调试友好**：开发人员可以清晰看到响应的编码信息
-
-### 额外建议：
-
-对于 API 服务，还可以考虑添加这些响应头：
+### 其他方案：Java 8 Stream API（不修改原数据）
+如果需要生成新对象而非修改原数据：
 ```java
-// 防止 MIME 类型嗅探
-headers.set("X-Content-Type-Options", "nosniff");
-
-// 指定浏览器应该只使用 HTTPS
-headers.set("Strict-Transport-Security", "max-age=63072000");
-
-// 控制跨域资源共享
-headers.set("Access-Control-Allow-Origin", "*");
+public static List<Map<String, String>> replaceEmptyValuesStream(
+    List<Map<String, String>> originalList,
+    String replacement
+) {
+    return originalList.stream()
+        .map(map -> map.entrySet().stream()
+            .collect(Collectors.toMap(
+                Map.Entry::getKey,
+                e -> (e.getValue() != null && e.getValue().isEmpty()) 
+                    ? replacement 
+                    : e.getValue()
+            ))
+        )
+        .collect(Collectors.toList());
+}
 ```
 
-通过正确设置响应头中的编码类型，你可以确保客户端始终以 UTF-8 方式解析你的 JSON 响应，避免出现乱码问题，这是处理字符编码问题的最可靠方法。
+### 使用建议
+- **原地替换**：使用第一个示例，效率高且节省内存
+- **不可变数据**：若需保留原数据，选择Stream方案或先深拷贝
+- **复杂逻辑**：可在遍历时扩展其他校验规则（如空白字符串`isBlank()`）
+
+通过以上方法，你可以高效地将`List<Map>`中的空字符串值替换为指定内容。
