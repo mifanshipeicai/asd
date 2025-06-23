@@ -1,106 +1,230 @@
-根据您提供的JSON片段和描述，问题在于JSON结构被错误地序列化为多个独立对象而不是字符串数组。以下是原因分析和解决方案：
+在Spring Boot中配置两个Dremio数据源并实现负载均衡、健康检查及故障转移，可以通过以下步骤实现：
 
-### 问题原因
-1. **对象结构错误**：
-   - 您的JSON显示为多个独立对象（每个包含`bytes`、`length`、`buffer`字段）
-   - 实际需要的应是字符串数组：`["20230317", "20230320", ...]`
-
-2. **Base64双重编码**：
-   - 字段值（如`MjAyMzAzMTc=`）是Base64编码后的字符串
-   - 解码后应为原始字符串（如`20230317`）
-
-3. **数据库映射问题**：
-   - 查询结果可能映射到了包含多个字段的对象
-   - 而非直接映射到字符串列表
-
----
-
-### 解决方案
-
-#### 方法1：直接返回字符串列表（推荐）
-```java
-// Service层: 解码并提取字符串
-public List<String> getStringList() {
-    return yourRepository.findAll().stream()
-            .map(entity -> {
-                // 解码Base64 (示例用第一个字段)
-                byte[] decodedBytes = Base64.getDecoder().decode(entity.getBytes());
-                return new String(decodedBytes, StandardCharsets.UTF_8);
-            })
-            .collect(Collectors.toList());
-}
-
-// Controller层
-@GetMapping("/data")
-public List<String> getData() {
-    return yourService.getStringList();
-}
+### 1. 添加依赖
+```xml
+<dependencies>
+    <!-- Spring Boot JDBC -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-jdbc</artifactId>
+    </dependency>
+    
+    <!-- Dremio JDBC驱动（使用PostgreSQL协议） -->
+    <dependency>
+        <groupId>org.postgresql</groupId>
+        <artifactId>postgresql</artifactId>
+        <version>42.3.1</version>
+    </dependency>
+    
+    <!-- Spring Actuator（健康检查） -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+</dependencies>
 ```
 
-#### 方法2：使用DTO转换
-```java
-// DTO类
-public class SimpleDTO {
-    private String value; // 直接存储解码后的字符串
+### 2. 配置多数据源和负载均衡
+创建数据源配置类，使用`AbstractRoutingDataSource`实现动态路由：
 
-    // 构造方法中解码
-    public SimpleDTO(YourEntity entity) {
-        this.value = new String(
-            Base64.getDecoder().decode(entity.getBytes()),
-            StandardCharsets.UTF_8
-        );
+```java
+@Configuration
+public class DataSourceConfig {
+
+    @Bean
+    @ConfigurationProperties("dremio.datasource.ds1")
+    public DataSourceProperties ds1Properties() {
+        return new DataSourceProperties();
     }
-    // getter
-}
 
-// Controller层
-@GetMapping("/data")
-public List<SimpleDTO> getData() {
-    return yourRepository.findAll().stream()
-            .map(SimpleDTO::new)
-            .collect(Collectors.toList());
+    @Bean
+    @ConfigurationProperties("dremio.datasource.ds2")
+    public DataSourceProperties ds2Properties() {
+        return new DataSourceProperties();
+    }
+
+    @Bean
+    public DataSource dataSource() {
+        Map<Object, Object> targetDataSources = new HashMap<>();
+        DataSource ds1 = ds1Properties().initializeDataSourceBuilder().build();
+        DataSource ds2 = ds2Properties().initializeDataSourceBuilder().build();
+
+        targetDataSources.put("ds1", ds1);
+        targetDataSources.put("ds2", ds2);
+
+        DynamicDataSource routingDataSource = new DynamicDataSource();
+        routingDataSource.setTargetDataSources(targetDataSources);
+        routingDataSource.setDefaultTargetDataSource(ds1); // 默认数据源
+        return routingDataSource;
+    }
+
+    // 动态数据源路由
+    static class DynamicDataSource extends AbstractRoutingDataSource {
+        private final AtomicInteger counter = new AtomicInteger(-1);
+        private final Map<Object, Boolean> dataSourceHealth = new ConcurrentHashMap<>();
+
+        @Override
+        protected Object determineCurrentLookupKey() {
+            // 获取健康数据源列表
+            List<Object> healthyKeys = dataSourceHealth.entrySet().stream()
+                .filter(Map.Entry::getValue)
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toList());
+
+            if (healthyKeys.isEmpty()) {
+                throw new IllegalStateException("No available Dremio data sources");
+            }
+
+            // 轮询负载均衡
+            int index = counter.incrementAndGet() % healthyKeys.size();
+            return healthyKeys.get(Math.abs(index));
+        }
+
+        public void setHealthStatus(Object key, boolean isHealthy) {
+            dataSourceHealth.put(key, isHealthy);
+        }
+    }
 }
 ```
 
-#### 方法3：修复实体映射（需改库）
-如果数据库存的是原始字符串（非Base64）：
+### 3. 实现健康检查与故障转移
+创建健康检查服务，定期测试数据源连接：
+
 ```java
-@Entity
-public class YourEntity {
-    @Column(columnDefinition = "TEXT") // 直接存储原始字符串
-    private String rawValue; // 改为字符串字段
+@Component
+@EnableScheduling
+public class DataSourceHealthChecker {
+    private static final Logger logger = LoggerFactory.getLogger(DataSourceHealthChecker.class);
 
-    // 移除bytes/length/buffer等字段
+    @Autowired
+    private DynamicDataSource dynamicDataSource;
+
+    @Autowired
+    private Map<Object, DataSource> targetDataSources; // 注入所有数据源
+
+    // 每30秒检查一次
+    @Scheduled(fixedRate = 30000)
+    public void checkHealth() {
+        targetDataSources.forEach((key, dataSource) -> {
+            boolean isHealthy = testConnection(dataSource);
+            dynamicDataSource.setHealthStatus(key, isHealthy);
+            logger.info("Data source {} health status: {}", key, isHealthy ? "UP" : "DOWN");
+        });
+    }
+
+    private boolean testConnection(DataSource dataSource) {
+        try (Connection conn = dataSource.getConnection()) {
+            return conn.isValid(5); // 5秒超时测试
+        } catch (SQLException e) {
+            logger.error("Connection test failed: {}", e.getMessage());
+            return false;
+        }
+    }
 }
 ```
 
----
+### 4. 应用配置（application.yml）
+```yaml
+# Dremio 数据源配置 (使用PostgreSQL协议)
+dremio:
+  datasource:
+    ds1:
+      url: jdbc:postgresql://dremio-node1:31010/dremio
+      username: your_username
+      password: your_password
+      driver-class-name: org.postgresql.Driver
+    ds2:
+      url: jdbc:postgresql://dremio-node2:31010/dremio
+      username: your_username
+      password: your_password
+      driver-class-name: org.postgresql.Driver
 
-### 关键点说明
-1. **Base64解码**：
-   ```java
-   // 解码示例
-   String base64Str = "MjAyMzAzMTc=";
-   String decoded = new String(
-       Base64.getDecoder().decode(base64Str),
-       StandardCharsets.UTF_8
-   ); // 得到 "20230317"
-   ```
+# 暴露健康检查端点
+management:
+  endpoint:
+    health:
+      enabled: true
+      show-details: always
+  endpoints:
+    web:
+      exposure:
+        include: health
+```
 
-2. **JSON结构对比**：
-   ```json
-   // 当前错误结构
-   [
-     {"bytes": "MjAy...", "length":8, "buffer":"MjAy..."},
-     {...}
-   ]
+### 5. 自定义健康检查指示器
+```java
+@Component
+public class DremioHealthIndicator implements HealthIndicator {
+    @Autowired
+    private DynamicDataSource dynamicDataSource;
 
-   // 目标正确结构
-   ["20230317", "20230320", ...]
-   ```
+    @Override
+    public Health health() {
+        Map<String, Object> details = new HashMap<>();
+        dynamicDataSource.getDataSourceHealth().forEach((key, healthy) -> 
+            details.put(key.toString(), healthy ? "UP" : "DOWN")
+        );
+        
+        boolean allUp = details.values().stream().allMatch("UP"::equals);
+        return allUp ? 
+            Health.up().withDetails(details).build() :
+            Health.down().withDetails(details).build();
+    }
+}
+```
 
-3. **避免双重编码**：
-   - 检查数据库是否已存储Base64
-   - 确保服务层只做一次编解码
+### 6. 使用数据源
+在DAO层直接注入`JdbcTemplate`，路由会自动生效：
+```java
+@Repository
+public class DremioRepository {
+    @Autowired
+    private JdbcTemplate jdbcTemplate; // 自动使用动态数据源
 
-建议优先采用**方法1**直接返回字符串列表，这符合您期望的`"list": ["str1", "str2"]`结构。如果问题仍存在，请检查实体类字段定义是否包含多余对象属性。
+    public List<Map<String, Object>> queryData() {
+        return jdbcTemplate.queryForList("SELECT * FROM my_table");
+    }
+}
+```
+
+### 关键特性说明
+1. **负载均衡**：
+   - 通过轮询算法（`AtomicInteger`计数器）在健康数据源间分配请求
+   - 动态路由类`DynamicDataSource`继承`AbstractRoutingDataSource`
+
+2. **健康检查**：
+   - 定时任务每30秒检查所有数据源连接
+   - 使用`isValid()`方法进行快速连接测试（5秒超时）
+
+3. **故障转移**：
+   - 自动排除不可用数据源（`dataSourceHealth`映射）
+   - 当所有数据源不可用时抛出明确异常
+
+4. **恢复机制**：
+   - 健康检查会持续监控宕机数据源
+   - 连接恢复后自动重新加入负载均衡池
+
+5. **监控端点**：
+   - 通过`/actuator/health`端点查看详细状态
+   - 自定义`DremioHealthIndicator`展示各数据源状态
+
+### 测试验证
+1. 手动停止一个Dremio节点
+   - 日志显示该数据源状态变为`DOWN`
+   - 所有请求自动路由到健康节点
+   
+2. 恢复宕机节点
+   - 下一次健康检查后状态恢复`UP`
+   - 请求重新分配到两个节点
+
+此方案实现了：
+- 透明的数据源故障转移
+- 自动化的健康恢复
+- 轻量级轮询负载均衡
+- 集成Spring Boot Actuator监控
+- 无单点故障的查询高可用
+
+可根据实际需求调整：
+- 健康检查间隔（`@Scheduled`参数）
+- 负载均衡算法（如随机/加权）
+- 连接验证的超时时间
