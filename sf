@@ -1,125 +1,59 @@
-在 WebFlux 中使用 Spring JdbcTemplate 实现流式导出 CSV 并压缩为 ZIP 文件，需确保数据从数据库到客户端全程流式处理，避免内存溢出。以下是分步解决方案：
+在Pandas中，你可以通过以下步骤实现你的需求：
 
-### 1. 配置流式数据库查询
-确保 JdbcTemplate 使用流式结果集。以 PostgreSQL 为例，需设置 `fetchSize` 为 `Integer.MIN_VALUE`：
+1. 使用 `sort_values()` 对指定列进行升序排序
+2. 添加新列，使用 `range(1, len(df)+1)` 生成从1开始的连续排名
 
-```java
-jdbcTemplate.query(con -> {
-    PreparedStatement ps = con.prepareStatement(
-        "SELECT * FROM your_table",
-        ResultSet.TYPE_FORWARD_ONLY,
-        ResultSet.CONCUR_READ_ONLY
-    );
-    ps.setFetchSize(Integer.MIN_VALUE); // 启用流式结果集
-    return ps;
-}, rowCallbackHandler);
+### 示例代码：
+```python
+import pandas as pd
+
+# 假设你的DataFrame名为df，要排序的列名为"target_column"
+# 步骤1：按指定列升序排序
+df_sorted = df.sort_values(by="target_column", ascending=True)
+
+# 步骤2：添加排名列（从1开始）
+df_sorted["rank"] = range(1, len(df_sorted) + 1
+
+# 如果想保持原始行顺序，添加reset_index()
+df_sorted = df_sorted.reset_index(drop=True)
 ```
 
-### 2. 创建反应式 Controller 端点
-使用 `Flux<DataBuffer>` 作为返回类型，并设置正确的响应头：
+### 示例说明：
+假设原始数据：
+```python
+import pandas as pd
 
-```java
-@GetMapping(value = "/export", produces = "application/zip")
-public Flux<DataBuffer> exportAsZip() {
-    return Flux.using(
-        // 初始化资源：管道流和 ZipOutputStream
-        this::createStreams,
-        // 处理数据流
-        tuple -> {
-            startDbProcessing(tuple.getT1(), tuple.getT2());
-            return DataBufferUtils.readInputStream(() -> tuple.getT3(), new DefaultDataBufferFactory(), 4096);
-        },
-        // 释放资源
-        this::closeResources
-    );
+data = {
+    "product": ["A", "B", "C", "D", "E"],
+    "price": [30, 10, 20, 10, 40]
 }
-
-private Tuple3<ZipOutputStream, PipedOutputStream, PipedInputStream> createStreams() throws IOException {
-    PipedOutputStream pos = new PipedOutputStream();
-    PipedInputStream pis = new PipedInputStream(pos);
-    ZipOutputStream zos = new ZipOutputStream(pos);
-    zos.putNextEntry(new ZipEntry("data.csv"));
-    return Tuples.of(zos, pos, pis);
-}
-
-private void startDbProcessing(ZipOutputStream zos, PipedOutputStream pos) {
-    Schedulers.boundedElastic().schedule(() -> {
-        try {
-            jdbcTemplate.query(con -> { /* 如上配置流式查询 */ }, rs -> {
-                String csvLine = convertToCsv(rs);
-                zos.write(csvLine.getBytes(StandardCharsets.UTF_8));
-                zos.write('\n');
-            });
-            zos.closeEntry();
-            zos.close();
-            pos.close();
-        } catch (Exception e) {
-            // 异常处理
-        }
-    });
-}
-
-private void closeResources(Tuple3<ZipOutputStream, PipedOutputStream, PipedInputStream> tuple) {
-    try {
-        if (tuple.getT1() != null) tuple.getT1().close();
-        if (tuple.getT2() != null) tuple.getT2().close();
-        if (tuple.getT3() != null) tuple.getT3().close();
-    } catch (IOException e) {
-        // 处理关闭异常
-    }
-}
+df = pd.DataFrame(data)
 ```
 
-### 3. CSV 转换方法
-将 `ResultSet` 行转换为 CSV 格式，注意处理特殊字符：
-
-```java
-private String convertToCsv(ResultSet rs) throws SQLException {
-    StringBuilder sb = new StringBuilder();
-    ResultSetMetaData metaData = rs.getMetaData();
-    int columnCount = metaData.getColumnCount();
-    
-    for (int i = 1; i <= columnCount; i++) {
-        String value = rs.getString(i);
-        // 处理逗号和换行符
-        if (value.contains(",") || value.contains("\n")) {
-            value = "\"" + value.replace("\"", "\"\"") + "\"";
-        }
-        sb.append(value);
-        if (i < columnCount) sb.append(",");
-    }
-    return sb.toString();
-}
+执行排序和排名：
+```python
+df_sorted = df.sort_values("price", ascending=True)
+df_sorted["rank"] = range(1, len(df_sorted)+1)
 ```
 
-### 4. 处理响应头和文件名
-在 Controller 方法中设置 `Content-Disposition` 头：
-
-```java
-@GetMapping(...)
-public Flux<DataBuffer> exportAsZip(ServerHttpResponse response) {
-    response.getHeaders().setContentDisposition(
-        ContentDisposition.attachment().filename("data.zip").build()
-    );
-    // 其余代码同上
-}
+结果DataFrame：
+```
+  product  price  rank
+1       B     10     1
+3       D     10     2
+2       C     20     3
+0       A     30     4
+4       E     40     5
 ```
 
-### 关键点说明
-1. **流式数据库查询**：通过 JDBC 驱动特定的 `fetchSize` 设置实现真正的流式获取数据。
-2. **异步处理**：使用 `Schedulers.boundedElastic()` 执行阻塞的 JDBC 和 ZIP 操作，避免阻塞 Reactor 线程。
-3. **管道流连接**：通过 `PipedInputStream/PipedOutputStream` 将 ZIP 压缩与响应输出连接，实现流式压缩。
-4. **资源管理**：使用 `Flux.using` 确保流关闭时释放所有资源（数据库连接、流等）。
-5. **背压支持**：Spring WebFlux 自动处理背压，确保数据生成速度与客户端消费速度匹配。
+### 关键点说明：
+1. `sort_values(by="column", ascending=True)` 确保按指定列升序排列
+2. `range(1, len(df)+1)` 生成从1开始的连续整数排名
+3. `reset_index(drop=True)` 会重置索引（可选操作）
+4. 相同值处理：此方法会给相同值分配连续排名（如示例中的10元商品分别得1、2名）
 
-此方案实现了：
-- 数据库查询结果逐行处理
-- 实时 CSV 格式转换
-- 动态 ZIP 压缩
-- 非阻塞网络传输
-- 内存使用恒定（不随数据量增长）
-
-注意事项：
-- 不同数据库的流式查询配置可能不同（如 MySQL 需要 `useCursorFetch=true`）
-- 确保数据库事务和连接池配置支持长时间运行的流式查询
-- 生产环境需添加完善的错误处理和日志记录
+如果需要处理相同值的排名（如并列排名），可以使用Pandas内置的`rank()`方法：
+```python
+df["rank"] = df["price"].rank(method="dense").astype(int)
+```
+但这会得到不同的排名结果（相同值同排名），请根据你的具体需求选择合适的方法。
