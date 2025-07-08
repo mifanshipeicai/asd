@@ -249,6 +249,189 @@ public class DemoController {
 3. 生产环境建议：
    - 增加健康检查失败阈值（避免瞬时故障误判）
    - 添加熔断机制（如 Resilience4j）
-   - 实现更复杂的负载均衡算法（如加权轮询）
+   - 实现更复杂的负载均衡算法（如加权轮您提出了一个重要的点：当有多个数据源时，即使其中一个不可用，只要还有其他可用数据源，整体服务健康状态应该标记为 UP。让我修改方案来实现这个需求：
+
+### 修改健康指示器 (DremioHealthIndicator)
+```java
+@Component
+public class DremioHealthIndicator implements HealthIndicator {
+
+    private final LoadBalancedDataSource routingDataSource;
+
+    public DremioHealthIndicator(LoadBalancedDataSource routingDataSource) {
+        this.routingDataSource = routingDataSource;
+    }
+
+    @Override
+    public Health health() {
+        Map<String, Boolean> status = routingDataSource.getHealthStatus();
+        
+        // 计算健康状态：只要有一个可用就是 UP
+        boolean anyHealthy = status.values().stream().anyMatch(Boolean::valueOf);
+        Health.Builder builder = anyHealthy ? Health.up() : Health.down();
+        
+        // 添加每个数据源的详细状态
+        status.forEach((key, healthy) -> 
+            builder.withDetail("dremio." + key, healthy ? "UP" : "DOWN")
+        );
+        
+        // 添加整体可用数据源计数
+        long healthyCount = status.values().stream().filter(Boolean::valueOf).count();
+        builder.withDetail("availableDataSources", healthyCount + "/" + status.size());
+        
+        return builder.build();
+    }
+}
+```
+
+### 修改负载均衡数据源路由 (LoadBalancedDataSource)
+添加一个方法来检查是否有任何可用的数据源：
+```java
+public class LoadBalancedDataSource extends AbstractRoutingDataSource {
+
+    // ... [其他代码保持不变] ...
+
+    // 新增方法：检查是否有可用的数据源
+    public boolean hasAvailableDataSource() {
+        return healthStatus.values().stream().anyMatch(Boolean::valueOf);
+    }
+}
+```
+
+### 修改控制器使用前检查可用性
+```java
+@RestController
+@RequiredArgsConstructor
+public class DemoController {
+
+    private final JdbcTemplate jdbcTemplate;
+    private final LoadBalancedDataSource routingDataSource;
+
+    @GetMapping("/query")
+    public ResponseEntity<?> queryData() {
+        // 检查是否有可用数据源
+        if (!routingDataSource.hasAvailableDataSource()) {
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .body("All Dremio data sources are unavailable");
+        }
+        
+        try {
+            List<Map<String, Object>> result = jdbcTemplate.queryForList("SELECT * FROM my_table");
+            return ResponseEntity.ok(result);
+        } catch (DataAccessException ex) {
+            // 处理数据库异常
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body("Database error: " + ex.getMessage());
+        }
+    }
+}
+```
+
+### 修改健康检查端点配置 (application.yml)
+```yaml
+management:
+  endpoint:
+    health:
+      show-details: always
+      group:
+        custom:
+          include: dremioHealth # 使用自定义健康指示器
+  health:
+    status:
+      # 自定义状态映射：只要有可用数据源就返回UP
+      order: "DOWN, OUT_OF_SERVICE, UP"
+      http-mapping:
+        DOWN: 503
+        OUT_OF_SERVICE: 503
+        UP: 200
+```
+
+### 添加自定义健康组
+```java
+@Configuration
+public class HealthConfig {
+    
+    @Bean
+    public HealthContributorRegistryCustomizer healthContributorRegistryCustomizer(
+            DremioHealthIndicator dremioHealthIndicator) {
+        
+        return registry -> {
+            // 注册自定义健康组
+            registry.registerContributor("dremioHealth", 
+                (HealthContributor) () -> dremioHealthIndicator.health());
+        };
+    }
+}
+```
+
+### 健康检查端点行为说明
+
+现在健康检查端点会有以下行为：
+
+1. **当至少一个数据源可用时**：
+   ```json
+   {
+     "status": "UP",
+     "components": {
+       "dremioHealth": {
+         "status": "UP",
+         "details": {
+           "dremio.ds1": "UP",
+           "dremio.ds2": "DOWN",
+           "availableDataSources": "1/2"
+         }
+       }
+     }
+   }
+   ```
+
+2. **当所有数据源都不可用时**：
+   ```json
+   {
+     "status": "DOWN",
+     "components": {
+       "dremioHealth": {
+         "status": "DOWN",
+         "details": {
+           "dremio.ds1": "DOWN",
+           "dremio.ds2": "DOWN",
+           "availableDataSources": "0/2"
+         }
+       }
+     }
+   }
+   ```
+
+### 方案优化说明
+
+1. **健康状态逻辑**：
+   - 只要有一个数据源可用，整体状态就是 `UP`
+   - 所有数据源都不可用时才标记为 `DOWN`
+   - 提供详细的每个数据源状态和可用计数
+
+2. **API 响应增强**：
+   - 在查询前检查数据源可用性
+   - 返回明确的错误信息
+   - 使用正确的 HTTP 状态码 (503 服务不可用)
+
+3. **健康端点定制**：
+   - 创建独立的自定义健康组 (`dremioHealth`)
+   - 自定义状态映射规则
+   - 提供清晰的可用数据源计数
+
+4. **故障恢复机制**：
+   - 健康检查定时任务会持续监控
+   - 当数据源恢复时，自动重新加入负载均衡池
+   - 无需重启应用即可恢复
+
+这个方案确保：
+- 当有可用数据源时，健康状态为 UP
+- 即使部分数据源故障，服务仍然可用
+- 提供详细的状态信息用于监控
+- API 在无可用数据源时返回明确的错误
+
+
+
+
 
 此方案实现了动态负载均衡和自动故障转移，同时通过 Spring Actuator 提供监控接口，满足生产环境高可用要求。
