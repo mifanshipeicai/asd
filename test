@@ -1,106 +1,254 @@
-在 AWS S3 中，当使用 `listObjects` 或 `listObjectsV2` 方法列出对象时，默认最多返回 1000 个对象。要获取全部文件列表，你需要处理分页（Pagination），通过循环请求直到所有结果返回。以下是解决方案：
+在 Spring Boot 中集成 Spring JDBC 实现多 Dremio 数据源的负载均衡和健康检查，可以通过以下方案实现：
 
----
-
-### 1. 使用 **`listObjectsV2`** 并处理分页
-`listObjectsV2` 是推荐的方法，支持更高效的分页机制。通过检查返回的 **`isTruncated`** 标志和 **`nextContinuationToken`** 循环请求直到获取全部结果。
-
-```java
-import com.amazonaws.services.s3.AmazonS3;
-import com.amazonaws.services.s3.model.ListObjectsV2Request;
-import com.amazonaws.services.s3.model.ListObjectsV2Result;
-import com.amazonaws.services.s3.model.S3ObjectSummary;
-
-public List<S3ObjectSummary> listAllObjectsInDirectory(String bucketName, String prefix) {
-    AmazonS3 s3Client = AmazonS3ClientBuilder.standard().build(); // 确保正确初始化
-    List<S3ObjectSummary> allObjects = new ArrayList<>();
-
-    ListObjectsV2Request request = new ListObjectsV2Request()
-            .withBucketName(bucketName)
-            .withPrefix(prefix) // 指定目录前缀，例如 "my-folder/"
-            .withDelimiter("/"); // 可选：如果需模拟目录结构
-
-    ListObjectsV2Result result;
-    do {
-        result = s3Client.listObjectsV2(request);
-        allObjects.addAll(result.getObjectSummaries());
-        String token = result.getNextContinuationToken();
-        request.setContinuationToken(token);
-    } while (result.isTruncated());
-
-    return allObjects;
-}
+### 1. 添加依赖
+```xml
+<dependencies>
+    <!-- Spring JDBC -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-jdbc</artifactId>
+    </dependency>
+    
+    <!-- Dremio JDBC 驱动 -->
+    <dependency>
+        <groupId>com.dremio</groupId>
+        <artifactId>dremio-jdbc-driver</artifactId>
+        <version>24.0.0</version> <!-- 使用实际版本 -->
+    </dependency>
+    
+    <!-- 健康检查 -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+</dependencies>
 ```
 
----
+### 2. 配置文件 (`application.yml`)
+```yaml
+app:
+  datasources:
+    dremio:
+      ds1:
+        url: jdbc:dremio:direct=host1:31010;schema=my_schema
+        username: user1
+        password: pass1
+      ds2:
+        url: jdbc:dremio:direct=host2:31010;schema=my_schema
+        username: user2
+        password: pass2
 
-### 2. 关键参数说明
-- **`withPrefix(String prefix)`**: 指定目录前缀（例如 `"my-folder/subfolder/"`），S3 会返回匹配该前缀的所有对象。
-- **`withDelimiter("/")`**: 可选参数，用于模拟目录层级。如果不需要目录结构，可省略。
-- **`ContinuationToken`**: 分页标记，每次请求后更新以获取下一页结果。
+# Actuator 健康检查端点
+management:
+  endpoint:
+    health:
+      show-details: always
+```
 
----
+### 3. 核心实现类
 
-### 3. 注意事项
-- **性能优化**: 如果目录下文件极多（例如百万级），频繁调用 API 可能导致延迟或费用增加。考虑异步处理或缓存结果。
-- **权限检查**: 确保 IAM 角色或凭证有 `s3:ListBucket` 权限。
-- **SDK 版本**: 确保使用较新的 AWS SDK 版本（例如 2.x），但 `listObjectsV2` 在 1.x 中也有效。
-
----
-
-### 4. 完整示例（Spring Boot 中注入 AmazonS3）
+#### 3.1 数据源配置类
 ```java
-@Service
-public class S3Service {
-    @Autowired
-    private AmazonS3 amazonS3;
+@Configuration
+public class DremioDataSourceConfig {
 
-    public List<String> listAllFiles(String bucket, String prefix) {
-        List<String> fileKeys = new ArrayList<>();
-        ListObjectsV2Request request = new ListObjectsV2Request()
-                .withBucketName(bucket)
-                .withPrefix(prefix);
+    @Bean
+    @ConfigurationProperties("app.datasources.dremio.ds1")
+    public DataSource dremioDataSource1() {
+        return DataSourceBuilder.create().build();
+    }
+
+    @Bean
+    @ConfigurationProperties("app.datasources.dremio.ds2")
+    public DataSource dremioDataSource2() {
+        return DataSourceBuilder.create().build();
+    }
+
+    @Bean
+    public LoadBalancedDataSource loadBalancedDataSource(
+            @Qualifier("dremioDataSource1") DataSource ds1,
+            @Qualifier("dremioDataSource2") DataSource ds2) {
         
-        ListObjectsV2Result result;
-        do {
-            result = amazonS3.listObjectsV2(request);
-            result.getObjectSummaries().forEach(summary -> 
-                fileKeys.add(summary.getKey())
-            );
-            request.setContinuationToken(result.getNextContinuationToken());
-        } while (result.isTruncated());
+        Map<Object, Object> targetDataSources = new HashMap<>();
+        targetDataSources.put("ds1", ds1);
+        targetDataSources.put("ds2", ds2);
         
-        return fileKeys;
+        LoadBalancedDataSource routingDataSource = new LoadBalancedDataSource();
+        routingDataSource.setTargetDataSources(targetDataSources);
+        routingDataSource.setDefaultTargetDataSource(ds1); // 默认数据源
+        
+        return routingDataSource;
+    }
+
+    @Bean
+    public JdbcTemplate jdbcTemplate(@Qualifier("loadBalancedDataSource") DataSource dataSource) {
+        return new JdbcTemplate(dataSource);
     }
 }
 ```
 
----
-
-### 5. 扩展：使用 AWS SDK for Java 2.x
-如果升级到 AWS SDK 2.x，可使用 **`listObjectsV2Paginator`** 简化分页：
-
+#### 3.2 负载均衡数据源路由
 ```java
-import software.amazon.awssdk.services.s3.S3Client;
-import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
-import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
-import software.amazon.awssdk.services.s3.paginators.ListObjectsV2Iterable;
+public class LoadBalancedDataSource extends AbstractRoutingDataSource {
 
-public List<String> listAllFilesV2(String bucket, String prefix) {
-    S3Client s3 = S3Client.create();
-    ListObjectsV2Request request = ListObjectsV2Request.builder()
-            .bucket(bucket)
-            .prefix(prefix)
-            .build();
+    private final AtomicInteger counter = new AtomicInteger(0);
+    private final Map<Object, DataSource> dataSourceMap = new ConcurrentHashMap<>();
+    private final Map<String, Boolean> healthStatus = new ConcurrentHashMap<>();
 
-    ListObjectsV2Iterable response = s3.listObjectsV2Paginator(request);
-    List<String> keys = new ArrayList<>();
-    response.contents().forEach(object -> keys.add(object.key()));
-    
-    return keys;
+    @Override
+    public void setTargetDataSources(Map<Object, Object> targetDataSources) {
+        super.setTargetDataSources(targetDataSources);
+        dataSourceMap.clear();
+        targetDataSources.forEach((key, value) -> {
+            dataSourceMap.put(key, (DataSource) value);
+            healthStatus.put(key.toString(), true); // 初始状态健康
+        });
+    }
+
+    @Override
+    protected Object determineCurrentLookupKey() {
+        List<String> activeKeys = healthStatus.entrySet().stream()
+                .filter(Map.Entry::getValue)
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toList());
+
+        if (activeKeys.isEmpty()) {
+            throw new IllegalStateException("No available Dremio data sources");
+        }
+
+        int index = counter.getAndIncrement() % activeKeys.size();
+        return activeKeys.get(index);
+    }
+
+    // 更新健康状态
+    public void updateHealthStatus(String dataSourceKey, boolean isHealthy) {
+        healthStatus.put(dataSourceKey, isHealthy);
+    }
+
+    // 获取所有数据源状态
+    public Map<String, Boolean> getHealthStatus() {
+        return new HashMap<>(healthStatus);
+    }
 }
 ```
 
----
+#### 3.3 健康检查定时任务
+```java
+@Component
+@RequiredArgsConstructor
+public class DataSourceHealthChecker {
 
-通过正确处理分页逻辑，你可以突破 1000 个文件的限制，完整获取 S3 目录下的所有文件列表。
+    private final LoadBalancedDataSource routingDataSource;
+    private final Map<String, DataSource> dataSourceMap;
+
+    @PostConstruct
+    public void init() {
+        dataSourceMap = routingDataSource.getDataSourceMap(); // 从路由数据源获取所有DS
+    }
+
+    @Scheduled(fixedDelay = 5000) // 每5秒检查一次
+    public void checkDataSources() {
+        dataSourceMap.forEach((key, dataSource) -> {
+            boolean isHealthy = checkConnection(dataSource);
+            routingDataSource.updateHealthStatus(key, isHealthy);
+        });
+    }
+
+    private boolean checkConnection(DataSource dataSource) {
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement()) {
+            stmt.execute("SELECT 1"); // 简单查询验证连接
+            return true;
+        } catch (SQLException e) {
+            return false;
+        }
+    }
+}
+```
+
+#### 3.4 集成 Actuator 健康检查
+```java
+@Component
+public class DremioHealthIndicator implements HealthIndicator {
+
+    private final LoadBalancedDataSource routingDataSource;
+
+    public DremioHealthIndicator(LoadBalancedDataSource routingDataSource) {
+        this.routingDataSource = routingDataSource;
+    }
+
+    @Override
+    public Health health() {
+        Map<String, Boolean> status = routingDataSource.getHealthStatus();
+        boolean allHealthy = status.values().stream().allMatch(Boolean::valueOf);
+        
+        Health.Builder builder = allHealthy ? 
+                Health.up() : Health.down();
+        
+        status.forEach((key, healthy) -> 
+            builder.withDetail(key, healthy ? "UP" : "DOWN")
+        );
+        
+        return builder.build();
+    }
+}
+```
+
+### 4. 使用示例
+```java
+@RestController
+@RequiredArgsConstructor
+public class DemoController {
+
+    private final JdbcTemplate jdbcTemplate;
+
+    @GetMapping("/query")
+    public List<Map<String, Object>> queryData() {
+        return jdbcTemplate.queryForList("SELECT * FROM my_table");
+    }
+}
+```
+
+### 方案说明
+
+1. **负载均衡机制**：
+   - 轮询算法通过 `AtomicInteger` 计数器实现
+   - 只路由到标记为健康状态的数据源
+   - 自动跳过不可用节点
+
+2. **健康检查**：
+   - 定时任务每5秒执行一次 `SELECT 1` 验证
+   - 动态更新路由状态
+   - 通过 `/actuator/health` 端点可视化状态
+
+3. **故障转移**：
+   - 当数据源不可用时自动从路由池移除
+   - 恢复后自动重新加入路由池
+   - 所有数据源宕机时抛出明确异常
+
+4. **扩展性**：
+   - 轻松添加更多数据源（只需修改配置）
+   - 支持自定义负载均衡策略
+   - 可集成更复杂的健康检查逻辑
+
+### 注意事项
+
+1. Dremio JDBC URL 格式：
+   ```java
+   jdbc:dremio:direct=host:port;schema=your_schema
+   ```
+
+2. 建议在配置中增加连接池参数：
+   ```yaml
+   app.datasources.dremio.ds1:
+     hikari:
+       connection-timeout: 3000
+       max-lifetime: 600000
+   ```
+
+3. 生产环境建议：
+   - 增加健康检查失败阈值（避免瞬时故障误判）
+   - 添加熔断机制（如 Resilience4j）
+   - 实现更复杂的负载均衡算法（如加权轮询）
+
+此方案实现了动态负载均衡和自动故障转移，同时通过 Spring Actuator 提供监控接口，满足生产环境高可用要求。
