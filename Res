@@ -1,118 +1,24 @@
-在Spring Boot中使用`StreamingResponseBody`进行流式响应时，服务层抛出的异常可能无法正常返回给调用方，这是因为流式响应一旦开始写入数据，HTTP响应头（包括状态码）可能已被提交。以下是几种解决方案：
+import pandas as pd
+import pyarrow.parquet as pq
 
----
-
-### 方法1：在流写入前进行预检查（推荐）
-在开始流式写入之前，先执行所有可能抛出异常的业务逻辑验证：
-```java
-@GetMapping("/stream")
-public ResponseEntity<StreamingResponseBody> streamData() {
-    // 前置检查：提前抛出异常
-    someService.validateParameters(); // 可能抛出异常的方法
-
-    StreamingResponseBody stream = outputStream -> {
-        try {
-            // 流式写入逻辑
-            someService.streamData(outputStream);
-        } catch (Exception e) {
-            // 处理流过程中的异常（可选）
-            outputStream.write(("ERROR: " + e.getMessage()).getBytes());
-        }
-    };
+def create_header_only_parquet(input_path, output_path):
+    """
+    读取Parquet文件结构，创建仅包含文件头的新Parquet文件
     
-    return ResponseEntity.ok()
-            .contentType(MediaType.APPLICATION_JSON)
-            .body(stream);
-}
-```
-
----
-
-### 方法2：捕获异常并返回错误流
-在`StreamingResponseBody`内部捕获异常，并将错误信息写入输出流：
-```java
-@GetMapping("/stream")
-public ResponseEntity<StreamingResponseBody> streamData() {
-    StreamingResponseBody stream = outputStream -> {
-        try {
-            // 业务逻辑（包含可能抛出的异常）
-            someService.streamData(outputStream);
-        } catch (Exception e) {
-            // 清空已写入的数据（如果支持）
-            outputStream.flush();
-            // 写入结构化错误信息
-            String errorJson = "{\"error\": \"" + e.getMessage() + "\"}";
-            outputStream.write(errorJson.getBytes());
-        }
-    };
+    参数:
+        input_path: 原始Parquet文件路径
+        output_path: 输出文件路径
+    """
+    # 读取原始文件的schema（不加载数据）
+    schema = pq.read_schema(input_path)
     
-    return ResponseEntity.ok()
-            .contentType(MediaType.APPLICATION_JSON)
-            .body(stream);
-}
-```
-
----
-
-### 方法3：使用全局异常处理 + 中断响应
-通过`ResponseBodyEmitter`替代`StreamingResponseBody`，可在任意时刻发送错误：
-```java
-@GetMapping("/stream")
-public ResponseBodyEmitter streamData() {
-    ResponseBodyEmitter emitter = new ResponseBodyEmitter();
+    # 创建空DataFrame（保留原始列名和数据类型）
+    empty_df = pd.DataFrame({col: pd.Series(dtype=pa_dtype.to_pandas_dtype()) 
+                             for col, pa_dtype in zip(schema.names, schema.types)})
     
-    try {
-        // 前置验证（可抛出异常）
-        someService.validate();
-        
-        // 异步处理流
-        CompletableFuture.runAsync(() -> {
-            try (OutputStream outputStream = new ResponseBodyEmitterOutputStream(emitter)) {
-                someService.streamData(outputStream);
-                emitter.complete();
-            } catch (Exception e) {
-                emitter.completeWithError(e); // 关键：发送错误到客户端
-            }
-        });
-    } catch (Exception e) {
-        emitter.completeWithError(e); // 立即发送异常
-    }
-    
-    return emitter;
-}
-```
+    # 保存为新的Parquet文件
+    empty_df.to_parquet(output_path, index=False)
+    print(f"已创建仅含文件头的Parquet文件: {output_path}")
 
----
-
-### 方法4：自定义异常处理（Fallback方案）
-如果响应已提交，通过HTTP头传递错误码：
-```java
-@ExceptionHandler(CustomException.class)
-public void handleException(CustomException e, HttpServletResponse response) {
-    if (!response.isCommitted()) {
-        response.setStatus(HttpStatus.BAD_REQUEST.value());
-        response.getWriter().write(e.getMessage());
-    } else {
-        // 已提交响应：记录日志或发送告警
-        log.error("Response committed, error: {}", e.getMessage());
-    }
-}
-```
-
----
-
-### 关键注意事项：
-1. **响应头提交时机**：一旦开始写入响应体，HTTP状态码将无法修改（默认200）。
-2. **错误格式一致性**：若使用JSON流，错误信息也应保持JSON结构（如 `{"error": "message"}`）。
-3. **资源清理**：在异常时关闭数据库连接、文件流等资源。
-4. **客户端处理**：前端需检查流中是否包含错误标识（如以`ERROR:`开头的消息）。
-
----
-
-### 最佳实践总结：
-1. **优先前置验证**：在流写入前完成所有校验。
-2. **使用ResponseBodyEmitter**：更灵活控制异常发送。
-3. **结构化错误消息**：确保错误信息能被客户端解析。
-4. **全局异常处理兜底**：处理未预料异常。
-
-通过上述方法，可确保流式接口中的异常能被正确传递到调用方。
+# 示例用法
+create_header_only_parquet("input.parquet", "header_only.parquet")
