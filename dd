@@ -1,181 +1,87 @@
-在单元测试中使用 `@SpringBootTest` 无法运行时，常见原因及解决方案如下：
+使用JdbcTemplate防止SQL注入的核心是**严格使用参数化查询（PreparedStatement）**，避免直接拼接用户输入。以下是具体实践和注意事项：
 
-### 最常见原因及解决方案
+---
 
-#### 1. 数据源配置缺失（出现概率 60%）
-**错误现象**：`BeanCreationException: Failed to configure a DataSource`
+### **1. 使用 `?` 占位符 + 参数传递**
+**正确做法**：用 `?` 占位，通过`Object[]`或`PreparedStatementSetter`传递参数。
 ```java
-Caused by: org.springframework.boot.autoconfigure.jdbc.DataSourceProperties$DataSourceBeanCreationException: 
-Failed to determine a suitable driver class
+String sql = "SELECT * FROM users WHERE username = ? AND password = ?";
+jdbcTemplate.query(sql, new Object[]{userInputName, userInputPwd}, rowMapper);
 ```
 
-**解决方案**：
+**错误做法**（导致注入风险）：
 ```java
-// 在测试类上添加配置覆盖
-@SpringBootTest(properties = {
-    "dremio.datasource.ds1.url=jdbc:h2:mem:testdb1;DB_CLOSE_DELAY=-1",
-    "dremio.datasource.ds1.driver-class-name=org.h2.Driver",
-    "dremio.datasource.ds2.url=jdbc:h2:mem:testdb2;DB_CLOSE_DELAY=-1",
-    "dremio.datasource.ds2.driver-class-name=org.h2.Driver"
-})
+// 直接拼接用户输入！危险！
+String sql = "SELECT * FROM users WHERE username = '" + userInput + "'";
+jdbcTemplate.query(sql, rowMapper);
 ```
 
-#### 2. 健康检查定时任务冲突（出现概率 25%）
-**错误现象**：测试挂起或线程池错误
+---
 
-**解决方案**：
+### **2. 使用命名参数（`NamedParameterJdbcTemplate`）**
+更安全的替代方案，支持具名参数（如 `:paramName`）：
 ```java
-// 禁用定时任务自动配置
-@SpringBootTest
-@EnableAutoConfiguration(exclude = {
-    SchedulingAutoConfiguration.class
-})
-class MyTest {
-    // ...
-}
+NamedParameterJdbcTemplate namedTemplate = new NamedParameterJdbcTemplate(dataSource);
+
+String sql = "SELECT * FROM users WHERE username = :name";
+Map<String, Object> params = new HashMap<>();
+params.put("name", userInputName);
+
+namedTemplate.query(sql, params, rowMapper);
 ```
 
-#### 3. 动态数据源初始化问题（出现概率 10%）
-**错误现象**：`NullPointerException in DynamicDataSource`
+---
 
-**解决方案**（添加测试专用数据源）：
+### **3. 避免动态表名/列名拼接**
+若必须动态指定表名/列名（如 `ORDER BY`）：
+- **白名单校验**：只允许预定义的合法值（如 `id`, `name`）。
 ```java
-@TestConfiguration
-public class TestDataSourceConfig {
+// 示例：校验列名是否合法
+List<String> validColumns = Arrays.asList("id", "name", "email");
+String orderBy = validColumns.contains(inputColumn) ? inputColumn : "id";
 
-    @Bean
-    @Primary  // 覆盖主数据源
-    public DataSource dataSource() {
-        // 创建简化的测试数据源
-        return new EmbeddedDatabaseBuilder()
-            .setType(EmbeddedDatabaseType.H2)
-            .addScript("classpath:schema.sql")
-            .build();
-    }
-
-    @Bean
-    public DynamicDataSource dynamicDataSource() {
-        // 禁用健康检查逻辑的简化版本
-        DynamicDataSource ds = new DynamicDataSource();
-        ds.setDefaultTargetDataSource(dataSource());
-        return ds;
-    }
-}
+String sql = "SELECT * FROM users ORDER BY " + orderBy;
+jdbcTemplate.query(sql, rowMapper); // 此时SQL是固定的
 ```
 
-#### 4. Actuator 健康端点冲突（出现概率 5%）
-**错误现象**：`HealthIndicator` 实现类循环依赖
+---
 
-**解决方案**：
+### **4. 禁止`String.format()`/`+`拼接SQL**
+以下操作**极度危险**（JdbcTemplate无法提供保护）：
 ```java
-// 在测试配置中禁用健康指示器
-@TestConfiguration
-public class TestHealthConfig {
-    @Bean
-    @Primary
-    public HealthIndicator disabledHealthIndicator() {
-        return Health::up;
-    }
-}
+// ❌ 全部有注入风险！
+String sql1 = String.format("SELECT * FROM %s", userInputTable);
+String sql2 = "DELETE FROM users WHERE id = " + userInputId;
+jdbcTemplate.execute(sql1); // 相当于裸奔！
 ```
 
-### 完整可运行的测试示例
+---
 
+### **5. 特殊场景：`IN` 语句**
+使用 `NamedParameterJdbcTemplate` 安全处理 `IN` 子句：
 ```java
-@SpringBootTest
-@ActiveProfiles("test")
-@EnableAutoConfiguration(exclude = SchedulingAutoConfiguration.class)
-class ApplicationTests {
+String sql = "SELECT * FROM users WHERE id IN (:ids)";
+Map<String, Object> params = new HashMap<>();
+params.put("ids", Arrays.asList(1, 2, 3)); // 直接传List
 
-    // 解决数据源配置问题
-    @TestConfiguration
-    static class TestConfig {
-        @Bean
-        @Primary
-        DataSource testDataSource() {
-            return new EmbeddedDatabaseBuilder()
-                .setType(EmbeddedDatabaseType.H2)
-                .addScript("classpath:test-schema.sql")
-                .build();
-        }
-    }
-
-    // 禁用健康检查定时任务
-    @MockBean
-    DataSourceHealthChecker healthChecker;
-
-    @Test
-    void contextLoads() {
-        // 空测试验证Spring上下文加载
-    }
-}
+namedTemplate.query(sql, params, rowMapper);
 ```
 
-### 必要的依赖添加 (pom.xml)
-```xml
-<dependency>
-    <groupId>com.h2database</groupId>
-    <artifactId>h2</artifactId>
-    <scope>test</scope>
-</dependency>
-<dependency>
-    <groupId>org.springframework.boot</groupId>
-    <artifactId>spring-boot-starter-test</artifactId>
-    <scope>test</scope>
-</dependency>
-```
+---
 
-### 排查步骤：
-1. **检查异常堆栈**：前3行通常包含关键信息
-2. **简化测试**：先运行空`contextLoads()`测试
-3. **分步启用**：
-   ```java
-   // Step1: 仅加载上下文
-   @SpringBootTest(classes = {Application.class})
-   
-   // Step2: 添加数据源配置
-   @SpringBootTest(classes = {Application.class, TestDataSourceConfig.class})
-   
-   // Step3: 添加业务组件
-   @SpringBootTest(classes = {Application.class, TestDataSourceConfig.class, MyService.class})
-   ```
-4. **临时日志调整**：
-   ```yaml
-   # src/test/resources/application.yml
-   logging:
-     level:
-       root: DEBUG
-       org.springframework: WARN
-       com.yourpackage: DEBUG
-   ```
+### **为什么JdbcTemplate能防注入？**
+- **预编译机制**：底层使用`PreparedStatement`，用户输入会被视为数据而非SQL代码。
+- **参数转义**：数据库驱动会自动对特殊字符（如 `'`、`;`）转义处理。
+- **类型安全**：参数类型与占位符绑定，避免恶意构造类型破坏结构。
 
-### 最终解决方案模板
-```java
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
-@ExtendWith(SpringExtension.class)
-@EnableAutoConfiguration(exclude = {
-    DataSourceAutoConfiguration.class,
-    DataSourceTransactionManagerAutoConfiguration.class,
-    SchedulingAutoConfiguration.class
-})
-class SafeUnitTest {
+---
 
-    @MockBean
-    private DynamicDataSource dynamicDataSource; // 屏蔽真实数据源
+### **总结：安全准则**
+| **场景**               | **安全做法**                                      | **风险做法**               |
+|------------------------|-------------------------------------------------|--------------------------|
+| 普通条件查询           | 使用 `?` 占位符 + `Object[]`/`PreparedStatementSetter` | 字符串拼接SQL             |
+| 命名参数               | `NamedParameterJdbcTemplate` + `Map`             | 拼接命名参数              |
+| 动态表名/列名          | 白名单校验                                        | 直接使用用户输入          |
+| `IN` 语句              | 传 `List` 类型参数                                | 手动拼接 `(v1,v2,...)`   |
 
-    @Test
-    void businessLogicTest() {
-        // 使用Mockito测试纯业务逻辑
-    }
-}
-```
-
-> **关键提示**：对于包含复杂基础设施（如多数据源路由）的项目，建议将单元测试和集成测试分离：
-> 1. 单元测试：完全mock数据访问层，测试业务逻辑
-> 2. 集成测试：使用`@DataJpaTest`等切片测试
-> 3. 全功能测试：单独标记为`@IntegrationTest`，使用Testcontainers等方案
-
-如果问题仍未解决，请提供：
-1. 完整的异常堆栈信息（前20行）
-2. 测试类的完整代码
-3. 应用启动日志片段（包含数据源初始化部分）
+> 📌 **关键点**：**所有用户输入必须通过参数传递，而非嵌入SQL字符串**。JdbcTemplate本身是安全的，但错误使用（如拼接SQL）会绕过其保护机制。
