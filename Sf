@@ -1,150 +1,231 @@
-在使用 Jackson 的 `SequenceWriter` 进行流式 JSON 写入时，**不需要手动关闭底层的 `OutputStream`**，但需要正确处理 `SequenceWriter` 和相关的资源。以下是关键注意事项和最佳实践：
+在Spring Boot中整合Prometheus并自定义指标记录用户查询的JSON和查询时间，可以通过以下步骤实现。这里使用Micrometer作为指标收集库，它是Spring Boot Actuator的默认指标工具。
 
-### 1. 不需要手动关闭 Spring 提供的 `OutputStream`
-Spring MVC 会自动管理响应流的生命周期：
-```java
-@GetMapping("/stream")
-public StreamingResponseBody streamData() {
-    return outputStream -> {
-        // 不要关闭这个 outputStream！Spring 会处理
-        ObjectMapper mapper = new ObjectMapper();
-        JsonGenerator generator = mapper.getFactory().createGenerator(outputStream, JsonEncoding.UTF8);
-        
-        try (SequenceWriter writer = mapper.writer().writeValues(generator)) {
-            // 写入数据
-            for (Item item : itemList) {
-                writer.write(item);  // 流式写入
-            }
-        } // 自动关闭 SequenceWriter 和 Generator
-    };
-}
+---
+
+### 1. 添加依赖
+在`pom.xml`中添加依赖：
+```xml
+<dependencies>
+    <!-- Spring Boot Actuator + Prometheus -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>io.micrometer</groupId>
+        <artifactId>micrometer-registry-prometheus</artifactId>
+    </dependency>
+</dependencies>
 ```
 
-### 2. 必须正确关闭 `SequenceWriter` 和 `JsonGenerator`
-使用 **try-with-resources** 确保资源释放：
+---
+
+### 2. 配置Prometheus端点
+在`application.properties`中启用Prometheus端点：
+```properties
+# 暴露Prometheus指标端点
+management.endpoints.web.exposure.include=prometheus
+# 启用指标自动配置
+management.metrics.enable.all=true
+```
+
+---
+
+### 3. 自定义指标记录查询信息
+#### 方案一：使用AOP拦截查询请求（推荐）
+**步骤：**
+1. 创建自定义注解`@TrackQuery`
+2. 实现AOP切面记录指标
+3. 在Controller方法上添加注解
+
+**代码实现：**
+
+##### (1) 创建注解
 ```java
-try (SequenceWriter writer = mapper.writer().writeValues(generator)) {
-    // 写入逻辑
-    while (hasMoreData()) {
-        writer.write(getNextData());
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface TrackQuery {}
+```
+
+##### (2) 实现AOP切面
+```java
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+import org.aspectj.lang.ProceedingJoinPoint;
+import org.aspectj.lang.annotation.Around;
+import org.aspectj.lang.annotation.Aspect;
+import org.springframework.stereotype.Component;
+import org.springframework.util.StopWatch;
+
+import java.util.concurrent.TimeUnit;
+
+@Aspect
+@Component
+public class QueryMetricsAspect {
+
+    private final MeterRegistry meterRegistry;
+
+    public QueryMetricsAspect(MeterRegistry meterRegistry) {
+        this.meterRegistry = meterRegistry;
     }
-} // 自动调用 writer.close()
-```
 
-### 3. 异常处理方案
-当流写入过程中发生异常时：
-
-#### 方案 A：写入结构化错误信息
-```java
-try (SequenceWriter writer = mapper.writer().writeValues(generator)) {
-    // 业务逻辑
-} catch (Exception e) {
-    // 清空已缓冲但未发送的数据
-    generator.flush();
-    
-    // 写入错误信息（保持JSON结构）
-    generator.writeStartObject();
-    generator.writeStringField("error", e.getMessage());
-    generator.writeEndObject();
-}
-```
-
-#### 方案 B：使用全局异常处理
-```java
-@ControllerAdvice
-public class StreamExceptionHandler {
-
-    @ExceptionHandler(DataAccessException.class)
-    public ResponseEntity<String> handleStreamException(
-            DataAccessException ex, 
-            HttpServletResponse response) {
+    @Around("@annotation(TrackQuery)")
+    public Object trackQuery(ProceedingJoinPoint joinPoint) throws Throwable {
+        // 获取查询JSON参数（假设第一个参数是JSON字符串）
+        String queryJson = (String) joinPoint.getArgs()[0];
         
-        if (!response.isCommitted()) {
-            return ResponseEntity.status(500).body(ex.getMessage());
+        StopWatch stopWatch = new StopWatch();
+        stopWatch.start();
+        
+        try {
+            return joinPoint.proceed();
+        } finally {
+            stopWatch.stop();
+            long duration = stopWatch.getTotalTimeMillis();
+            
+            // 记录查询时间
+            Timer.builder("user.query.timer")
+                .tags("query", queryJson)  // 注意：高基数标签需谨慎使用
+                .register(meterRegistry)
+                .record(duration, TimeUnit.MILLISECONDS);
+            
+            // 记录查询次数
+            meterRegistry.counter("user.query.counter", "query", queryJson).increment();
         }
-        
-        // 响应已提交时记录日志
-        log.error("Stream failed after commit: {}", ex.getMessage());
-        return null; // 响应已提交，无法修改
     }
 }
 ```
 
-### 4. 关键注意事项
-
-#### 资源管理
+##### (3) 在Controller中使用
 ```java
-return outputStream -> {
-    // 正确：使用 try-with-resources 管理 Jackson 资源
-    try (JsonGenerator gen = mapper.createGenerator(outputStream);
-         SequenceWriter writer = mapper.writer().writeValues(gen)) {
-         
-        // 业务逻辑
-        
-    } // 自动关闭 writer 和 generator
+@RestController
+public class QueryController {
     
-    // 不要关闭 outputStream！
-};
-```
-
-#### 异常处理优先级
-1. **前置验证**：在创建流之前检查参数
-   ```java
-   @GetMapping("/stream")
-   public StreamingResponseBody stream(@RequestParam String id) {
-       if (!isValid(id)) {
-           throw new IllegalArgumentException("Invalid ID"); // 可被全局异常处理器捕获
-       }
-       
-       return outputStream -> { /* 流逻辑 */ };
-   }
-   ```
-   
-2. **流内异常**：捕获并写入错误信息
-
-### 5. 完整示例
-```java
-@GetMapping("/data-stream")
-public StreamingResponseBody streamData() {
-    return outputStream -> {
-        ObjectMapper mapper = new ObjectMapper();
-        
-        try (JsonGenerator generator = mapper.getFactory().createGenerator(outputStream);
-             SequenceWriter writer = mapper.writer().writeValues(generator)) {
-            
-            generator.writeStartArray();
-            
-            while (dataSource.hasNext()) {
-                Data item = dataSource.next();
-                // 业务逻辑可能抛出异常
-                validateItem(item); 
-                
-                writer.write(item);
-            }
-            
-            generator.writeEndArray();
-            
-        } catch (Exception e) {
-            // 清空缓冲区
-            outputStream.flush();
-            
-            // 写入错误结构
-            String error = mapper.writeValueAsString(
-                Map.of("error", e.getMessage(), "code", 500)
-            );
-            outputStream.write(error.getBytes());
-        }
-    };
+    @PostMapping("/query")
+    @TrackQuery // 添加自定义注解
+    public ResponseEntity<?> executeQuery(@RequestBody String queryJson) {
+        // 处理查询逻辑
+        return ResponseEntity.ok().build();
+    }
 }
 ```
 
-### 总结建议
-1. **使用 try-with-resources** 确保 `SequenceWriter` 和 `JsonGenerator` 被关闭
-2. **绝不手动关闭** Spring 传入的 `OutputStream`
-3. **双保险异常处理**：
-   - 前置验证避免流内异常
-   - 流内捕获异常并写入结构化错误
-   - 全局异常处理器作为最后防线
-4. **客户端兼容**：确保前端能处理混合了正常数据和错误信息的流
+---
 
-这样的设计既能保证资源安全释放，又能确保异常信息正确传达给调用方。
+#### 方案二：手动注册指标（直接使用MeterRegistry）
+在Service中直接注入`MeterRegistry`：
+
+```java
+import io.micrometer.core.instrument.MeterRegistry;
+import org.springframework.stereotype.Service;
+
+@Service
+public class QueryService {
+    
+    private final MeterRegistry meterRegistry;
+    
+    public QueryService(MeterRegistry meterRegistry) {
+        this.meterRegistry = meterRegistry;
+    }
+    
+    public void processQuery(String queryJson) {
+        long startTime = System.currentTimeMillis();
+        
+        try {
+            // 执行查询逻辑...
+        } finally {
+            long duration = System.currentTimeMillis() - startTime;
+            
+            // 记录指标
+            Timer.builder("user.query.timer")
+                .tags("query", queryJson)
+                .register(meterRegistry)
+                .record(duration, TimeUnit.MILLISECONDS);
+        }
+    }
+}
+```
+
+---
+
+### 4. 处理高基数标签问题
+**注意：** 直接将原始JSON作为标签会导致Prometheus高基数问题（每个唯一JSON创建一个新时间序列）。解决方案：
+
+#### 方案A：使用JSON摘要（推荐）
+```java
+// 在AOP切面中替换为：
+String queryHash = DigestUtils.sha256Hex(queryJson); // Apache Commons Codec
+
+Timer.builder("user.query.timer")
+    .tags("query_hash", queryHash) // 使用哈希代替原始JSON
+    .register(meterRegistry)
+    .record(duration, TimeUnit.MILLISECONDS);
+
+// 同时记录原始JSON到日志
+log.info("Query executed: hash={}, json={}", queryHash, queryJson);
+```
+
+#### 方案B：提取关键字段
+```java
+// 解析JSON提取关键字段
+JsonNode node = new ObjectMapper().readTree(queryJson);
+String queryType = node.get("type").asText();
+
+Timer.builder("user.query.timer")
+    .tags("query_type", queryType) // 使用有限值域的标签
+    .register(meterRegistry)
+    .record(duration, TimeUnit.MILLISECONDS);
+```
+
+---
+
+### 5. 配置Prometheus拉取数据
+在`prometheus.yml`中添加任务：
+```yaml
+scrape_configs:
+  - job_name: 'spring-query-service'
+    metrics_path: '/actuator/prometheus'
+    static_configs:
+      - targets: ['localhost:8080'] # 服务地址
+```
+
+---
+
+### 6. 验证指标
+启动应用后访问：  
+`http://localhost:8080/actuator/prometheus`
+
+应能看到类似指标：
+```
+# HELP user_query_timer_seconds  
+# TYPE user_query_timer_seconds summary
+user_query_timer_seconds_count{query_hash="a1b2c3...",} 5.0
+user_query_timer_seconds_sum{query_hash="a1b2c3...",} 0.45
+```
+
+---
+
+### 完整技术栈说明
+| 组件 | 作用 |
+|-------|------|
+| Spring Boot Actuator | 提供监控端点 |
+| Micrometer | 指标采集抽象库 |
+| Prometheus Registry | 将指标转为Prometheus格式 |
+| AOP (AspectJ) | 实现无侵入式指标收集 |
+| Prometheus Server | 存储和查询指标 |
+
+---
+
+### 关键注意事项
+1. **高基数问题**：避免使用无限值域的标签（如原始JSON）
+2. **性能影响**：指标收集应轻量，避免阻塞业务线程
+3. **数据安全**：避免记录敏感信息（可添加过滤逻辑）
+4. **采样策略**：高频查询可考虑采样记录
+5. **存储分离**：原始JSON建议存日志系统（如ELK）
+
+通过以上实现，您可以安全地记录用户查询的详细信息和性能指标，同时保持系统的可观测性和稳定性。
