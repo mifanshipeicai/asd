@@ -1,437 +1,246 @@
-在 Spring Boot 中集成 Spring JDBC 实现多 Dremio 数据源的负载均衡和健康检查，可以通过以下方案实现：
+在 Spring Boot WebFlux 中实现批量插入并处理事务回退的分批操作，可以通过 Reactor 的响应式编程模型实现。以下是完整实现方案：
 
-### 1. 添加依赖
-```xml
-<dependencies>
-    <!-- Spring JDBC -->
-    <dependency>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-starter-jdbc</artifactId>
-    </dependency>
+核心思路
+
+1. 批量模式：使用同一个事务 ID 插入所有数据，任一失败则回滚整个事务
+
+2. 回退单条模式：回滚后逐条插入，每条数据使用独立的事务
+
+3. 复用 Token：整个流程使用同一个认证 token
+
+4. 错误处理：记录失败数据，继续处理后续条目
+
+实现代码
+
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import org.springframework.web.reactive.function.client.WebClient;
+
+public class BatchDataInserter {
+
+    private final WebClient webClient;
     
-    <!-- Dremio JDBC 驱动 -->
-    <dependency>
-        <groupId>com.dremio</groupId>
-        <artifactId>dremio-jdbc-driver</artifactId>
-        <version>24.0.0</version> <!-- 使用实际版本 -->
-    </dependency>
+    public BatchDataInserter(WebClient.Builder webClientBuilder) {
+        this.webClient = webClientBuilder.build();
+    }
+
+    // 主入口方法
+    public Flux<InsertionResult> processBatch(List<Data> dataList) {
+        return getAuthToken()
+            .flatMap(token -> processBatchWithToken(token, dataList))
+            .flatMapIterable(result -> result); // 展开批处理结果
+    }
+
+    private Mono<List<InsertionResult>> processBatchWithToken(String token, List<Data> dataList) {
+        // 1. 获取批量事务ID
+        return getTransactionId(token, true)
+            .flatMap(transactionId -> {
+                // 2. 批量插入所有数据
+                Flux<InsertionResult> batchResults = Flux.fromIterable(dataList)
+                    .flatMap(data -> 
+                        insertData(token, transactionId, data)
+                            .map(success -> new InsertionResult(data, success, transactionId))
+                            .onErrorReturn(new InsertionResult(data, false, transactionId))
+                    );
+
+                // 3. 收集结果并判断是否全部成功
+                return batchResults.collectList()
+                    .flatMap(results -> {
+                        boolean allSuccess = results.stream().allMatch(InsertionResult::isSuccess);
+                        
+                        if (allSuccess) {
+                            // 全部成功 - 提交事务
+                            return closeTransaction(token, transactionId)
+                                .thenReturn(results);
+                        } else {
+                            // 部分失败 - 回滚整个事务
+                            return rollbackTransaction(token, transactionId)
+                                .then(processIndividualItems(token, dataList)) // 进入单条重试
+                                .flatMap(individualResults -> 
+                                    // 合并两次尝试的结果
+                                    Flux.fromIterable(results)
+                                        .filter(InsertionResult::isSuccess)
+                                        .concatWith(Flux.fromIterable(individualResults))
+                                        .collectList()
+                                );
+                        }
+                    });
+            });
+    }
+
+    // 单条插入模式（每条数据独立事务）
+    private Mono<List<InsertionResult>> processIndividualItems(String token, List<Data> dataList) {
+        return Flux.fromIterable(dataList)
+            .flatMap(data -> 
+                getTransactionId(token, false)  // 为每条数据获取新事务ID
+                    .flatMap(transactionId -> 
+                        insertData(token, transactionId, data)
+                            .flatMap(success -> {
+                                if (success) {
+                                    return closeTransaction(token, transactionId)
+                                        .thenReturn(new InsertionResult(data, true, transactionId));
+                                } else {
+                                    return rollbackTransaction(token, transactionId)
+                                        .thenReturn(new InsertionResult(data, false, transactionId));
+                                }
+                            })
+                            .onErrorResume(ex -> 
+                                rollbackTransaction(token, transactionId)
+                                    .thenReturn(new InsertionResult(data, false, transactionId))
+                            )
+                    )
+            )
+            .collectList();
+    }
+
+    // --- 第三方API调用方法（根据实际API调整） ---
+    private Mono<String> getAuthToken() {
+        return webClient.post()
+            .uri("/auth")
+            .retrieve()
+            .bodyToMono(TokenResponse.class)
+            .map(TokenResponse::token);
+    }
+
+    private Mono<String> getTransactionId(String token, boolean isBatch) {
+        return webClient.post()
+            .uri("/transactions")
+            .header("Authorization", "Bearer " + token)
+            .header("X-Batch-Mode", String.valueOf(isBatch))
+            .retrieve()
+            .bodyToMono(TransactionResponse.class)
+            .map(TransactionResponse::transactionId);
+    }
+
+    private Mono<Boolean> insertData(String token, String transactionId, Data data) {
+        return webClient.post()
+            .uri("/data")
+            .header("Authorization", "Bearer " + token)
+            .header("X-Transaction-Id", transactionId)
+            .bodyValue(data)
+            .exchangeToMono(response -> {
+                if (response.statusCode().is2xxSuccessful()) {
+                    return Mono.just(true);
+                } else {
+                    return response.createException()
+                        .flatMap(ex -> Mono.just(false));
+                }
+            });
+    }
+
+    private Mono<Boolean> closeTransaction(String token, String transactionId) {
+        return webClient.post()
+            .uri("/transactions/" + transactionId + "/commit")
+            .header("Authorization", "Bearer " + token)
+            .retrieve()
+            .bodyToMono(TransactionResult.class)
+            .map(TransactionResult::success);
+    }
+
+    private Mono<Boolean> rollbackTransaction(String token, String transactionId) {
+        return webClient.post()
+            .uri("/transactions/" + transactionId + "/rollback")
+            .header("Authorization", "Bearer " + token)
+            .retrieve()
+            .bodyToMono(TransactionResult.class)
+            .map(TransactionResult::success);
+    }
+
+    // --- 辅助类 ---
+    private record TokenResponse(String token) {}
+    private record TransactionResponse(String transactionId) {}
+    private record TransactionResult(boolean success) {}
     
-    <!-- 健康检查 -->
-    <dependency>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-starter-actuator</artifactId>
-    </dependency>
-</dependencies>
-```
+    public static class InsertionResult {
+        private final Data data;
+        private final boolean success;
+        private final String transactionId;
 
-### 2. 配置文件 (`application.yml`)
-```yaml
-app:
-  datasources:
-    dremio:
-      ds1:
-        url: jdbc:dremio:direct=host1:31010;schema=my_schema
-        username: user1
-        password: pass1
-      ds2:
-        url: jdbc:dremio:direct=host2:31010;schema=my_schema
-        username: user2
-        password: pass2
-
-# Actuator 健康检查端点
-management:
-  endpoint:
-    health:
-      show-details: always
-```
-
-### 3. 核心实现类
-
-#### 3.1 数据源配置类
-```java
-@Configuration
-public class DremioDataSourceConfig {
-
-    @Bean
-    @ConfigurationProperties("app.datasources.dremio.ds1")
-    public DataSource dremioDataSource1() {
-        return DataSourceBuilder.create().build();
-    }
-
-    @Bean
-    @ConfigurationProperties("app.datasources.dremio.ds2")
-    public DataSource dremioDataSource2() {
-        return DataSourceBuilder.create().build();
-    }
-
-    @Bean
-    public LoadBalancedDataSource loadBalancedDataSource(
-            @Qualifier("dremioDataSource1") DataSource ds1,
-            @Qualifier("dremioDataSource2") DataSource ds2) {
-        
-        Map<Object, Object> targetDataSources = new HashMap<>();
-        targetDataSources.put("ds1", ds1);
-        targetDataSources.put("ds2", ds2);
-        
-        LoadBalancedDataSource routingDataSource = new LoadBalancedDataSource();
-        routingDataSource.setTargetDataSources(targetDataSources);
-        routingDataSource.setDefaultTargetDataSource(ds1); // 默认数据源
-        
-        return routingDataSource;
-    }
-
-    @Bean
-    public JdbcTemplate jdbcTemplate(@Qualifier("loadBalancedDataSource") DataSource dataSource) {
-        return new JdbcTemplate(dataSource);
+        // 构造函数、getters 等
     }
 }
-```
 
-#### 3.2 负载均衡数据源路由
-```java
-public class LoadBalancedDataSource extends AbstractRoutingDataSource {
 
-    private final AtomicInteger counter = new AtomicInteger(0);
-    private final Map<Object, DataSource> dataSourceMap = new ConcurrentHashMap<>();
-    private final Map<String, Boolean> healthStatus = new ConcurrentHashMap<>();
+关键设计说明
 
-    @Override
-    public void setTargetDataSources(Map<Object, Object> targetDataSources) {
-        super.setTargetDataSources(targetDataSources);
-        dataSourceMap.clear();
-        targetDataSources.forEach((key, value) -> {
-            dataSourceMap.put(key, (DataSource) value);
-            healthStatus.put(key.toString(), true); // 初始状态健康
-        });
-    }
+1. 事务模式标识
 
-    @Override
-    protected Object determineCurrentLookupKey() {
-        List<String> activeKeys = healthStatus.entrySet().stream()
-                .filter(Map.Entry::getValue)
-                .map(Map.Entry::getKey)
-                .collect(Collectors.toList());
+  ◦ 在 getTransactionId 方法中添加 X-Batch-Mode 头，让第三方区分批量/独立事务
 
-        if (activeKeys.isEmpty()) {
-            throw new IllegalStateException("No available Dremio data sources");
-        }
+  ◦ 批量模式使用同一个事务ID，单条模式每次获取新事务ID
 
-        int index = counter.getAndIncrement() % activeKeys.size();
-        return activeKeys.get(index);
-    }
+2. 错误恢复流程
 
-    // 更新健康状态
-    public void updateHealthStatus(String dataSourceKey, boolean isHealthy) {
-        healthStatus.put(dataSourceKey, isHealthy);
-    }
+graph TD
+  A[开始批量处理] --> B[获取事务ID]
+  B --> C{所有插入成功?}
+  C -->|是| D[提交事务]
+  C -->|否| E[回滚批量事务]
+  E --> F[逐条插入数据]
+  F -->|获取新事务ID| G[单条插入]
+  G -->|成功| H[提交单条事务]
+  G -->|失败| I[回滚单条事务]
+  H --> J[记录结果]
+  I --> J
 
-    // 获取所有数据源状态
-    public Map<String, Boolean> getHealthStatus() {
-        return new HashMap<>(healthStatus);
-    }
-}
-```
 
-#### 3.3 健康检查定时任务
-```java
-@Component
-@RequiredArgsConstructor
-public class DataSourceHealthChecker {
+3. 结果合并策略
 
-    private final LoadBalancedDataSource routingDataSource;
-    private final Map<String, DataSource> dataSourceMap;
+  ◦ 批量成功的数据：保留第一次插入结果
 
-    @PostConstruct
-    public void init() {
-        dataSourceMap = routingDataSource.getDataSourceMap(); // 从路由数据源获取所有DS
-    }
+  ◦ 批量失败的数据：在单条重试中更新结果
 
-    @Scheduled(fixedDelay = 5000) // 每5秒检查一次
-    public void checkDataSources() {
-        dataSourceMap.forEach((key, dataSource) -> {
-            boolean isHealthy = checkConnection(dataSource);
-            routingDataSource.updateHealthStatus(key, isHealthy);
-        });
-    }
+  ◦ 最终返回合并后的结果列表
 
-    private boolean checkConnection(DataSource dataSource) {
-        try (Connection conn = dataSource.getConnection();
-             Statement stmt = conn.createStatement()) {
-            stmt.execute("SELECT 1"); // 简单查询验证连接
-            return true;
-        } catch (SQLException e) {
-            return false;
-        }
-    }
-}
-```
+4. 弹性控制
 
-#### 3.4 集成 Actuator 健康检查
-```java
-@Component
-public class DremioHealthIndicator implements HealthIndicator {
+  ◦ flatMap 用于并发控制（可添加参数控制并发量）
 
-    private final LoadBalancedDataSource routingDataSource;
+  ◦ onErrorResume 确保单条失败不中断整个流程
 
-    public DremioHealthIndicator(LoadBalancedDataSource routingDataSource) {
-        this.routingDataSource = routingDataSource;
-    }
+  ◦ WebClient 的响应处理考虑各种 HTTP 状态
 
-    @Override
-    public Health health() {
-        Map<String, Boolean> status = routingDataSource.getHealthStatus();
-        boolean allHealthy = status.values().stream().allMatch(Boolean::valueOf);
-        
-        Health.Builder builder = allHealthy ? 
-                Health.up() : Health.down();
-        
-        status.forEach((key, healthy) -> 
-            builder.withDetail(key, healthy ? "UP" : "DOWN")
-        );
-        
-        return builder.build();
-    }
-}
-```
+使用示例
 
-### 4. 使用示例
-```java
 @RestController
-@RequiredArgsConstructor
-public class DemoController {
+public class DataController {
 
-    private final JdbcTemplate jdbcTemplate;
+    private final BatchDataInserter inserter;
 
-    @GetMapping("/query")
-    public List<Map<String, Object>> queryData() {
-        return jdbcTemplate.queryForList("SELECT * FROM my_table");
+    // 批量插入入口
+    @PostMapping("/batch-insert")
+    public Flux<BatchDataInserter.InsertionResult> batchInsert(@RequestBody List<Data> data) {
+        return inserter.processBatch(data);
     }
 }
-```
-
-### 方案说明
-
-1. **负载均衡机制**：
-   - 轮询算法通过 `AtomicInteger` 计数器实现
-   - 只路由到标记为健康状态的数据源
-   - 自动跳过不可用节点
-
-2. **健康检查**：
-   - 定时任务每5秒执行一次 `SELECT 1` 验证
-   - 动态更新路由状态
-   - 通过 `/actuator/health` 端点可视化状态
-
-3. **故障转移**：
-   - 当数据源不可用时自动从路由池移除
-   - 恢复后自动重新加入路由池
-   - 所有数据源宕机时抛出明确异常
-
-4. **扩展性**：
-   - 轻松添加更多数据源（只需修改配置）
-   - 支持自定义负载均衡策略
-   - 可集成更复杂的健康检查逻辑
-
-### 注意事项
-
-1. Dremio JDBC URL 格式：
-   ```java
-   jdbc:dremio:direct=host:port;schema=your_schema
-   ```
-
-2. 建议在配置中增加连接池参数：
-   ```yaml
-   app.datasources.dremio.ds1:
-     hikari:
-       connection-timeout: 3000
-       max-lifetime: 600000
-   ```
-
-3. 生产环境建议：
-   - 增加健康检查失败阈值（避免瞬时故障误判）
-   - 添加熔断机制（如 Resilience4j）
-   - 实现更复杂的负载均衡算法（如加权轮您提出了一个重要的点：当有多个数据源时，即使其中一个不可用，只要还有其他可用数据源，整体服务健康状态应该标记为 UP。让我修改方案来实现这个需求：
-
-### 修改健康指示器 (DremioHealthIndicator)
-```java
-@Component
-public class DremioHealthIndicator implements HealthIndicator {
-
-    private final LoadBalancedDataSource routingDataSource;
-
-    public DremioHealthIndicator(LoadBalancedDataSource routingDataSource) {
-        this.routingDataSource = routingDataSource;
-    }
-
-    @Override
-    public Health health() {
-        Map<String, Boolean> status = routingDataSource.getHealthStatus();
-        
-        // 计算健康状态：只要有一个可用就是 UP
-        boolean anyHealthy = status.values().stream().anyMatch(Boolean::valueOf);
-        Health.Builder builder = anyHealthy ? Health.up() : Health.down();
-        
-        // 添加每个数据源的详细状态
-        status.forEach((key, healthy) -> 
-            builder.withDetail("dremio." + key, healthy ? "UP" : "DOWN")
-        );
-        
-        // 添加整体可用数据源计数
-        long healthyCount = status.values().stream().filter(Boolean::valueOf).count();
-        builder.withDetail("availableDataSources", healthyCount + "/" + status.size());
-        
-        return builder.build();
-    }
-}
-```
-
-### 修改负载均衡数据源路由 (LoadBalancedDataSource)
-添加一个方法来检查是否有任何可用的数据源：
-```java
-public class LoadBalancedDataSource extends AbstractRoutingDataSource {
-
-    // ... [其他代码保持不变] ...
-
-    // 新增方法：检查是否有可用的数据源
-    public boolean hasAvailableDataSource() {
-        return healthStatus.values().stream().anyMatch(Boolean::valueOf);
-    }
-}
-```
-
-### 修改控制器使用前检查可用性
-```java
-@RestController
-@RequiredArgsConstructor
-public class DemoController {
-
-    private final JdbcTemplate jdbcTemplate;
-    private final LoadBalancedDataSource routingDataSource;
-
-    @GetMapping("/query")
-    public ResponseEntity<?> queryData() {
-        // 检查是否有可用数据源
-        if (!routingDataSource.hasAvailableDataSource()) {
-            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
-                    .body("All Dremio data sources are unavailable");
-        }
-        
-        try {
-            List<Map<String, Object>> result = jdbcTemplate.queryForList("SELECT * FROM my_table");
-            return ResponseEntity.ok(result);
-        } catch (DataAccessException ex) {
-            // 处理数据库异常
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                    .body("Database error: " + ex.getMessage());
-        }
-    }
-}
-```
-
-### 修改健康检查端点配置 (application.yml)
-```yaml
-management:
-  endpoint:
-    health:
-      show-details: always
-      group:
-        custom:
-          include: dremioHealth # 使用自定义健康指示器
-  health:
-    status:
-      # 自定义状态映射：只要有可用数据源就返回UP
-      order: "DOWN, OUT_OF_SERVICE, UP"
-      http-mapping:
-        DOWN: 503
-        OUT_OF_SERVICE: 503
-        UP: 200
-```
-
-### 添加自定义健康组
-```java
-@Configuration
-public class HealthConfig {
-    
-    @Bean
-    public HealthContributorRegistryCustomizer healthContributorRegistryCustomizer(
-            DremioHealthIndicator dremioHealthIndicator) {
-        
-        return registry -> {
-            // 注册自定义健康组
-            registry.registerContributor("dremioHealth", 
-                (HealthContributor) () -> dremioHealthIndicator.health());
-        };
-    }
-}
-```
-
-### 健康检查端点行为说明
-
-现在健康检查端点会有以下行为：
-
-1. **当至少一个数据源可用时**：
-   ```json
-   {
-     "status": "UP",
-     "components": {
-       "dremioHealth": {
-         "status": "UP",
-         "details": {
-           "dremio.ds1": "UP",
-           "dremio.ds2": "DOWN",
-           "availableDataSources": "1/2"
-         }
-       }
-     }
-   }
-   ```
-
-2. **当所有数据源都不可用时**：
-   ```json
-   {
-     "status": "DOWN",
-     "components": {
-       "dremioHealth": {
-         "status": "DOWN",
-         "details": {
-           "dremio.ds1": "DOWN",
-           "dremio.ds2": "DOWN",
-           "availableDataSources": "0/2"
-         }
-       }
-     }
-   }
-   ```
-
-### 方案优化说明
-
-1. **健康状态逻辑**：
-   - 只要有一个数据源可用，整体状态就是 `UP`
-   - 所有数据源都不可用时才标记为 `DOWN`
-   - 提供详细的每个数据源状态和可用计数
-
-2. **API 响应增强**：
-   - 在查询前检查数据源可用性
-   - 返回明确的错误信息
-   - 使用正确的 HTTP 状态码 (503 服务不可用)
-
-3. **健康端点定制**：
-   - 创建独立的自定义健康组 (`dremioHealth`)
-   - 自定义状态映射规则
-   - 提供清晰的可用数据源计数
-
-4. **故障恢复机制**：
-   - 健康检查定时任务会持续监控
-   - 当数据源恢复时，自动重新加入负载均衡池
-   - 无需重启应用即可恢复
-
-这个方案确保：
-- 当有可用数据源时，健康状态为 UP
-- 即使部分数据源故障，服务仍然可用
-- 提供详细的状态信息用于监控
-- API 在无可用数据源时返回明确的错误
 
 
+注意事项
 
+1. API 适配
 
+  ◦ 替换方法中的 URI 和响应体结构为实际第三方 API
 
-此方案实现了动态负载均衡和自动故障转移，同时通过 Spring Actuator 提供监控接口，满足生产环境高可用要求。
+  ◦ 根据 API 认证要求调整请求头
+
+2. 并发控制
+
+  ◦ 在 flatMap 中添加参数控制并发量（如 .flatMap(data -> ..., 5) 限制5并发）
+
+  ◦ 批量操作中考虑使用 buffer 分片处理超大列表
+
+3. Token 管理
+
+  ◦ 当前实现每个批次获取新 token，如需复用可添加缓存
+
+  ◦ 考虑添加 token 刷新机制处理过期
+
+4. 监控增强
+
+  ◦ 添加日志记录各阶段耗时
+
+  ◦ 集成 Metrics 监控成功/失败率
+
+  ◦ 使用 doOnError 记录详细错误信息
+
+此实现确保了在响应式环境下正确处理批量事务和失败重试，同时保持系统的弹性和可观察性。
