@@ -1,112 +1,83 @@
-在Spring Boot中，可以通过自定义`HealthIndicator`并配置健康组来实现**只根据自定义健康检查的状态**判断服务是否为UP/DOWN。以下是详细步骤：
+为了解决这个问题，我们需要将包含文件路径的实体列表按照文件大小进行分组，确保每组文件的总大小不超过100MB，同时处理单个文件超过100MB的情况。以下是详细的解决方案：
 
-### 1. 创建自定义健康指示器
+### 方法思路
+1. **初始化**：创建结果列表和临时列表来存储当前分组的实体和累计大小。
+2. **遍历实体列表**：对于每个实体，获取其文件大小。
+3. **处理大文件**：如果文件大小超过100MB，确保当前分组（如果有）被添加到结果中，然后将该大文件单独作为一组添加到结果中。
+4. **处理小文件**：如果文件大小未超过100MB，检查将其添加到当前分组是否会超过100MB。如果是，则将当前分组添加到结果中并新建分组；否则，将其添加到当前分组并更新累计大小。
+5. **处理剩余文件**：遍历结束后，将剩余的实体（如果有）作为最后一组添加到结果中。
+
+### 解决代码
 ```java
-import org.springframework.boot.actuate.health.Health;
-import org.springframework.boot.actuate.health.HealthIndicator;
-import org.springframework.stereotype.Component;
+import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
 
-@Component("customHealth") // 命名组件（关键！）
-public class CustomHealthIndicator implements HealthIndicator {
+public class GroupingService {
 
-    private volatile boolean isServiceHealthy = true; // 自定义健康状态
+    private static final long MB_100 = 100L * 1024 * 1024;
 
-    @Override
-    public Health health() {
-        // 核心逻辑：仅根据自定义状态返回健康信息
-        if (isServiceHealthy) {
-            return Health.up()
-                    .withDetail("message", "服务运行正常")
-                    .build();
-        } else {
-            return Health.down()
-                    .withDetail("error", "自定义健康检查失败")
-                    .build();
+    public List<List<Entity>> groupEntities(List<Entity> entityList) {
+        List<List<Entity>> result = new ArrayList<>();
+        List<Entity> currentGroup = new ArrayList<>();
+        long currentGroupSize = 0;
+
+        for (Entity entity : entityList) {
+            File file = new File(entity.getFilePath());
+            long fileSize = file.length();
+
+            if (fileSize >= MB_100) {
+                if (!currentGroup.isEmpty()) {
+                    result.add(currentGroup);
+                    currentGroup = new ArrayList<>();
+                    currentGroupSize = 0;
+                }
+                List<Entity> singleGroup = new ArrayList<>();
+                singleGroup.add(entity);
+                result.add(singleGroup);
+            } else {
+                if (currentGroupSize + fileSize >= MB_100) {
+                    result.add(currentGroup);
+                    currentGroup = new ArrayList<>();
+                    currentGroup.add(entity);
+                    currentGroupSize = fileSize;
+                } else {
+                    currentGroup.add(entity);
+                    currentGroupSize += fileSize;
+                }
+            }
+        }
+
+        if (!currentGroup.isEmpty()) {
+            result.add(currentGroup);
+        }
+
+        return result;
+    }
+
+    public static class Entity {
+        private String filePath;
+
+        public Entity(String filePath) {
+            this.filePath = filePath;
+        }
+
+        public String getFilePath() {
+            return filePath;
+        }
+
+        public void setFilePath(String filePath) {
+            this.filePath = filePath;
         }
     }
-
-    // 提供方法动态修改健康状态（可选）
-    public void setHealthy(boolean healthy) {
-        isServiceHealthy = healthy;
-    }
 }
 ```
 
-### 2. 配置健康组（关键步骤）
-在`application.properties`/`application.yml`中配置**只包含自定义检查**的健康组：
-```properties
-# 将默认健康组指向自定义检查（覆盖默认行为）
-management.endpoint.health.group.default.include = customHealth
+### 代码解释
+1. **常量定义**：`MB_100`常量表示100MB的字节数，用于比较文件大小。
+2. **分组逻辑**：
+   - **大文件处理**：当文件大小超过100MB时，当前分组（如果有）被添加到结果中，然后该大文件单独成组添加到结果中。
+   - **小文件处理**：检查当前分组累计大小加上当前文件大小是否超过100MB。如果是，则当前分组添加到结果中，并新建分组；否则，将文件添加到当前分组并更新累计大小。
+3. **剩余处理**：遍历结束后，确保最后的分组（如果有）被添加到结果中。
 
-# 隐藏其他健康细节（可选）
-management.endpoint.health.show-details = never
-```
-
-### 3. 验证结果
-访问健康端点：`http://localhost:8080/actuator/health`
-```json
-// 当服务健康时
-{
-  "status": "UP"
-}
-
-// 当服务异常时
-{
-  "status": "DOWN"
-}
-```
-
-### 原理解析
-1. **命名组件**  
-   通过`@Component("customHealth")`为自定义指示器命名，确保在配置中可引用。
-
-2. **健康组配置**  
-   `management.endpoint.health.group.default.include = customHealth` 覆盖了默认健康组的行为：
-   - 仅包含`customHealth`指示器
-   - 忽略其他内置检查（如DB、DiskSpace等）
-
-3. **状态聚合规则**  
-   Spring Boot自动将健康组中**最差状态**作为整体状态（单个指示器时即其自身状态）。
-
-### 动态控制健康状态（可选）
-添加测试接口模拟状态切换：
-```java
-@RestController
-public class HealthController {
-    
-    @Autowired
-    private CustomHealthIndicator healthIndicator;
-
-    @PostMapping("/setHealth/{status}")
-    public String setHealth(@PathVariable boolean status) {
-        healthIndicator.setHealthy(status);
-        return "健康状态设置为: " + (status ? "UP" : "DOWN");
-    }
-}
-```
-测试流程：
-```bash
-curl -X POST http://localhost:8080/setHealth/false
-curl http://localhost:8080/actuator/health  # 应返回 {"status":"DOWN"}
-```
-
-### 注意事项
-1. **Spring Boot版本**  
-   健康组功能需≥2.3.x（早期版本需自定义`HealthAggregator`）
-
-2. **彻底禁用其他检查**  
-   若需完全禁用内置检查，添加配置：
-   ```properties
-   management.health.db.enabled=false
-   management.health.diskspace.enabled=false
-   # 其他检查同理
-   ```
-
-3. **多指示器场景**  
-   若需组合多个自定义检查，配置改为：
-   ```properties
-   management.endpoint.health.group.default.include = customHealth,anotherHealth
-   ```
-   此时整体状态取最差结果（任一DOWN则整体DOWN）
-
-通过此方案，服务的健康状态将完全由你的业务逻辑控制，与基础设施检查解耦。
+这种方法确保文件被合理分组，满足每组总大小不超过100MB的要求，同时处理了大文件单独成组的情况。
