@@ -1,181 +1,155 @@
-在单元测试中使用 `@SpringBootTest` 无法运行时，常见原因及解决方案如下：
+使用Pandas处理JSON时间数据并生成统计报告
 
-### 最常见原因及解决方案
+以下是使用Pandas库实现的解决方案，它更简洁高效：
 
-#### 1. 数据源配置缺失（出现概率 60%）
-**错误现象**：`BeanCreationException: Failed to configure a DataSource`
-```java
-Caused by: org.springframework.boot.autoconfigure.jdbc.DataSourceProperties$DataSourceBeanCreationException: 
-Failed to determine a suitable driver class
-```
+import pandas as pd
+import json
 
-**解决方案**：
-```java
-// 在测试类上添加配置覆盖
-@SpringBootTest(properties = {
-    "dremio.datasource.ds1.url=jdbc:h2:mem:testdb1;DB_CLOSE_DELAY=-1",
-    "dremio.datasource.ds1.driver-class-name=org.h2.Driver",
-    "dremio.datasource.ds2.url=jdbc:h2:mem:testdb2;DB_CLOSE_DELAY=-1",
-    "dremio.datasource.ds2.driver-class-name=org.h2.Driver"
-})
-```
+def process_time_data_with_pandas(json_file_path, csv_file_path):
+    """
+    使用Pandas处理JSON时间数据并生成CSV文件和统计报告
+    
+    参数:
+    json_file_path: JSON文件路径
+    csv_file_path: 输出CSV文件路径
+    """
+    
+    # 读取JSON文件
+    try:
+        df = pd.read_json(json_file_path)
+    except FileNotFoundError:
+        print(f"错误：找不到文件 {json_file_path}")
+        return
+    except ValueError as e:
+        print(f"错误：JSON文件格式不正确 - {e}")
+        return
+    
+    # 检查数据是否为空
+    if df.empty:
+        print("警告：JSON文件中没有数据")
+        return
+    
+    # 检查必要的列是否存在
+    required_columns = ['id', 'starttime', 'endtime']
+    if not all(col in df.columns for col in required_columns):
+        print("错误：JSON文件中缺少必要的列（id, starttime, endtime）")
+        return
+    
+    # 计算时间花费
+    df['time_spent'] = df['endtime'] - df['starttime']
+    
+    # 保存为CSV文件
+    try:
+        df.to_csv(csv_file_path, index=False)
+        print(f"CSV文件已生成: {csv_file_path}")
+    except Exception as e:
+        print(f"错误：无法写入CSV文件 - {e}")
+        return
+    
+    # 按ID分组计算总时间花费
+    id_time_totals = df.groupby('id')['time_spent'].sum()
+    
+    # 计算最早和最晚时间花费
+    min_time = df['time_spent'].min()
+    max_time = df['time_spent'].max()
+    
+    # 输出统计结果
+    print("\n=== 时间花费统计 ===")
+    print("各ID总时间花费:")
+    for item_id, total_time in id_time_totals.items():
+        print(f"  ID {item_id}: {total_time} 秒")
+    
+    print(f"\n最早时间花费: {min_time} 秒")
+    print(f"最晚时间花费: {max_time} 秒")
+    
+    # 创建统计DataFrame并保存
+    stats_df = pd.DataFrame({
+        'ID': id_time_totals.index,
+        '总时间花费(秒)': id_time_totals.values
+    })
+    
+    # 添加最早和最晚时间花费
+    stats_df = pd.concat([
+        stats_df,
+        pd.DataFrame({
+            'ID': ['最早时间花费', '最晚时间花费'],
+            '总时间花费(秒)': [min_time, max_time]
+        })
+    ], ignore_index=True)
+    
+    # 保存统计报告
+    stats_file = csv_file_path.replace('.csv', '_stats.csv')
+    try:
+        stats_df.to_csv(stats_file, index=False)
+        print(f"\n统计报告已保存: {stats_file}")
+    except Exception as e:
+        print(f"警告：无法保存统计报告文件 - {e}")
 
-#### 2. 健康检查定时任务冲突（出现概率 25%）
-**错误现象**：测试挂起或线程池错误
+# 使用示例
+if __name__ == "__main__":
+    # 请替换为你的JSON文件路径
+    json_file_path = "data.json"
+    
+    # 输出CSV文件路径
+    csv_file_path = "time_data.csv"
+    
+    # 处理数据
+    process_time_data_with_pandas(json_file_path, csv_file_path)
 
-**解决方案**：
-```java
-// 禁用定时任务自动配置
-@SpringBootTest
-@EnableAutoConfiguration(exclude = {
-    SchedulingAutoConfiguration.class
-})
-class MyTest {
-    // ...
-}
-```
 
-#### 3. 动态数据源初始化问题（出现概率 10%）
-**错误现象**：`NullPointerException in DynamicDataSource`
+更简洁的版本（如果你不需要详细的错误处理）
 
-**解决方案**（添加测试专用数据源）：
-```java
-@TestConfiguration
-public class TestDataSourceConfig {
+import pandas as pd
 
-    @Bean
-    @Primary  // 覆盖主数据源
-    public DataSource dataSource() {
-        // 创建简化的测试数据源
-        return new EmbeddedDatabaseBuilder()
-            .setType(EmbeddedDatabaseType.H2)
-            .addScript("classpath:schema.sql")
-            .build();
-    }
+# 读取JSON文件
+df = pd.read_json("data.json")
 
-    @Bean
-    public DynamicDataSource dynamicDataSource() {
-        // 禁用健康检查逻辑的简化版本
-        DynamicDataSource ds = new DynamicDataSource();
-        ds.setDefaultTargetDataSource(dataSource());
-        return ds;
-    }
-}
-```
+# 计算时间花费
+df['time_spent'] = df['endtime'] - df['starttime']
 
-#### 4. Actuator 健康端点冲突（出现概率 5%）
-**错误现象**：`HealthIndicator` 实现类循环依赖
+# 保存为CSV
+df.to_csv("time_data.csv", index=False)
 
-**解决方案**：
-```java
-// 在测试配置中禁用健康指示器
-@TestConfiguration
-public class TestHealthConfig {
-    @Bean
-    @Primary
-    public HealthIndicator disabledHealthIndicator() {
-        return Health::up;
-    }
-}
-```
+# 按ID分组计算总时间花费
+id_time_totals = df.groupby('id')['time_spent'].sum()
 
-### 完整可运行的测试示例
+# 计算最早和最晚时间花费
+min_time = df['time_spent'].min()
+max_time = df['time_spent'].max()
 
-```java
-@SpringBootTest
-@ActiveProfiles("test")
-@EnableAutoConfiguration(exclude = SchedulingAutoConfiguration.class)
-class ApplicationTests {
+# 输出结果
+print("各ID总时间花费:")
+print(id_time_totals)
+print(f"\n最早时间花费: {min_time} 秒")
+print(f"最晚时间花费: {max_time} 秒")
 
-    // 解决数据源配置问题
-    @TestConfiguration
-    static class TestConfig {
-        @Bean
-        @Primary
-        DataSource testDataSource() {
-            return new EmbeddedDatabaseBuilder()
-                .setType(EmbeddedDatabaseType.H2)
-                .addScript("classpath:test-schema.sql")
-                .build();
-        }
-    }
 
-    // 禁用健康检查定时任务
-    @MockBean
-    DataSourceHealthChecker healthChecker;
+使用说明
 
-    @Test
-    void contextLoads() {
-        // 空测试验证Spring上下文加载
-    }
-}
-```
+1. 确保已安装pandas库：pip install pandas
 
-### 必要的依赖添加 (pom.xml)
-```xml
-<dependency>
-    <groupId>com.h2database</groupId>
-    <artifactId>h2</artifactId>
-    <scope>test</scope>
-</dependency>
-<dependency>
-    <groupId>org.springframework.boot</groupId>
-    <artifactId>spring-boot-starter-test</artifactId>
-    <scope>test</scope>
-</dependency>
-```
+2. 将上述代码保存为Python脚本
 
-### 排查步骤：
-1. **检查异常堆栈**：前3行通常包含关键信息
-2. **简化测试**：先运行空`contextLoads()`测试
-3. **分步启用**：
-   ```java
-   // Step1: 仅加载上下文
-   @SpringBootTest(classes = {Application.class})
-   
-   // Step2: 添加数据源配置
-   @SpringBootTest(classes = {Application.class, TestDataSourceConfig.class})
-   
-   // Step3: 添加业务组件
-   @SpringBootTest(classes = {Application.class, TestDataSourceConfig.class, MyService.class})
-   ```
-4. **临时日志调整**：
-   ```yaml
-   # src/test/resources/application.yml
-   logging:
-     level:
-       root: DEBUG
-       org.springframework: WARN
-       com.yourpackage: DEBUG
-   ```
+3. 修改文件路径为你的实际文件路径
 
-### 最终解决方案模板
-```java
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
-@ExtendWith(SpringExtension.class)
-@EnableAutoConfiguration(exclude = {
-    DataSourceAutoConfiguration.class,
-    DataSourceTransactionManagerAutoConfiguration.class,
-    SchedulingAutoConfiguration.class
-})
-class SafeUnitTest {
+4. 运行脚本
 
-    @MockBean
-    private DynamicDataSource dynamicDataSource; // 屏蔽真实数据源
+Pandas方法的优势
 
-    @Test
-    void businessLogicTest() {
-        // 使用Mockito测试纯业务逻辑
-    }
-}
-```
+1. 代码简洁：使用Pandas可以大大减少代码量
 
-> **关键提示**：对于包含复杂基础设施（如多数据源路由）的项目，建议将单元测试和集成测试分离：
-> 1. 单元测试：完全mock数据访问层，测试业务逻辑
-> 2. 集成测试：使用`@DataJpaTest`等切片测试
-> 3. 全功能测试：单独标记为`@IntegrationTest`，使用Testcontainers等方案
+2. 性能高效：Pandas针对大数据集进行了优化
 
-如果问题仍未解决，请提供：
-1. 完整的异常堆栈信息（前20行）
-2. 测试类的完整代码
-3. 应用启动日志片段（包含数据源初始化部分）
+3. 功能强大：内置的数据处理功能丰富
+
+4. 易于扩展：可以轻松添加更多分析功能
+
+注意事项
+
+• 确保JSON文件格式正确，可以直接被Pandas读取
+
+• 如果JSON文件是数组格式，Pandas可以直接读取
+
+• 如果JSON文件是对象格式（包含嵌套结构），可能需要使用pd.json_normalize()进行处理
+
+如果你的JSON结构比较复杂，或者需要更高级的时间处理功能（如转换时间格式），请提供更多细节，我可以进一步调整代码。
