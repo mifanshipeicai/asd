@@ -1,110 +1,208 @@
-在Spring Boot中，同一个Bean名称不能注册多个实例（会覆盖），但可以通过策略模式+工厂Bean实现需求。核心步骤如下：
+# 在Spring Boot中实现基于用户权限组的缓存
 
-1. 定义接口与多个实现类
+在Spring Boot中，你可以通过自定义缓存配置来实现基于用户权限组的缓存机制，而无需借助外部中间件。下面是一个完整的实现方案：
 
-public interface MyService {
-    void execute();
-}
+## 实现思路
 
-@Component("serviceImpl1") // 不同实现用不同名称
-public class ServiceImpl1 implements MyService {
+1. 自定义缓存键生成器，将查询条件和用户权限组信息组合成缓存键
+2. 使用Spring的ConcurrentMapCacheManager作为缓存管理器
+3. 实现带有过期时间的缓存机制
+4. 在需要缓存的方法上使用@Cacheable注解
+
+## 代码实现
+
+### 1. 创建自定义缓存键生成器
+
+```java
+import org.springframework.cache.interceptor.KeyGenerator;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.GrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.stereotype.Component;
+import org.springframework.util.StringUtils;
+
+import java.lang.reflect.Method;
+import java.util.Collection;
+import java.util.StringJoiner;
+
+@Component("permissionBasedKeyGenerator")
+public class PermissionBasedKeyGenerator implements KeyGenerator {
+
     @Override
-    public void execute() {
-        System.out.println("Service 1 called");
+    public Object generate(Object target, Method method, Object... params) {
+        // 获取当前用户的权限信息
+        String permissionKey = getCurrentUserPermissionKey();
+        
+        // 组合查询条件和权限信息生成缓存键
+        StringJoiner keyJoiner = new StringJoiner(":");
+        keyJoiner.add(permissionKey);
+        
+        // 添加方法名
+        keyJoiner.add(target.getClass().getSimpleName() + "." + method.getName());
+        
+        // 添加参数信息
+        if (params != null) {
+            for (Object param : params) {
+                if (param != null) {
+                    keyJoiner.add(param.toString());
+                }
+            }
+        }
+        
+        return keyJoiner.toString();
+    }
+    
+    private String getCurrentUserPermissionKey() {
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        if (authentication == null || !authentication.isAuthenticated()) {
+            return "anonymous";
+        }
+        
+        // 获取用户权限并生成权限键
+        Collection<? extends GrantedAuthority> authorities = authentication.getAuthorities();
+        StringJoiner permissionJoiner = new StringJoiner(",");
+        for (GrantedAuthority authority : authorities) {
+            permissionJoiner.add(authority.getAuthority());
+        }
+        
+        // 使用权限的哈希值作为权限键的一部分
+        return String.valueOf(permissionJoiner.toString().hashCode());
     }
 }
+```
 
-@Component("serviceImpl2")
-public class ServiceImpl2 implements MyService {
-    @Override
-    public void execute() {
-        System.out.println("Service 2 called");
-    }
-}
+### 2. 创建带过期时间的缓存管理器
 
+```java
+import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.cache.concurrent.ConcurrentMapCache;
+import org.springframework.cache.concurrent.ConcurrentMapCacheManager;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.annotation.Scheduled;
 
-2. 创建随机工厂Bean
-
-@Component
-public class ServiceFactory {
-    private final List<MyService> services;
-    private final Random random = new Random();
-
-    // 注入所有MyService实现
-    @Autowired
-    public ServiceFactory(List<MyService> services) {
-        this.services = services;
-    }
-
-    // 随机获取实例
-    public MyService getRandomService() {
-        return services.get(random.nextInt(services.size()));
-    }
-}
-
-
-3. 使用示例
-
-@RestController
-public class MyController {
-    private final ServiceFactory serviceFactory;
-
-    @Autowired
-    public MyController(ServiceFactory serviceFactory) {
-        this.serviceFactory = serviceFactory;
-    }
-
-    @GetMapping("/execute")
-    public void execute() {
-        // 每次调用随机获取Bean
-        MyService service = serviceFactory.getRandomService();
-        service.execute();
-    }
-}
-
-
-关键说明：
-
-1. Bean命名规则
-
-  ◦ 各实现类使用不同名称（如@Component("serviceImpl1")）
-
-  ◦ 不直接注册同名Bean（违反Spring规范）
-
-2. 随机获取原理
-
-  ◦ ServiceFactory 自动收集所有 MyService 实现
-
-  ◦ 调用 getRandomService() 时通过随机索引获取实例
-
-3. 性能优化
-
-// 如需优化频繁调用，可缓存实例列表
-private final MyService[] serviceArray; // 初始化时转换数组
-
-public MyService getRandomService() {
-    return serviceArray[random.nextInt(serviceArray.length)];
-}
-
-
-4. 动态添加实现
-
-  ◦ 新增MyService实现类并加@Component即可自动加入随机池
-
-替代方案（谨慎使用）
-
-若坚持使用同名Bean（需特殊场景）：
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 @Configuration
-public class ServiceConfig {
-    @Bean(name = "myService")
-    @Scope(value = WebApplicationContext.SCOPE_REQUEST, proxyMode = ScopedProxyMode.INTERFACES)
-    public MyService randomService(List<MyService> services) {
-        return services.get(new Random().nextInt(services.size()));
+@EnableCaching
+public class CacheConfig {
+
+    // 缓存过期时间（毫秒）
+    private static final long CACHE_EXPIRATION_TIME = TimeUnit.MINUTES.toMillis(30);
+    
+    // 存储缓存创建时间
+    private final Map<String, Long> cacheCreationTimes = new ConcurrentHashMap<>();
+    
+    @Bean
+    public CacheManager cacheManager() {
+        return new ConcurrentMapCacheManager() {
+            @Override
+            protected Cache createConcurrentMapCache(String name) {
+                // 记录缓存创建时间
+                cacheCreationTimes.put(name, System.currentTimeMillis());
+                return new ConcurrentMapCache(name);
+            }
+        };
+    }
+    
+    // 定期清理过期缓存
+    @Scheduled(fixedRate = TimeUnit.MINUTES.toMillis(5))
+    public void evictExpiredCaches() {
+        long currentTime = System.currentTimeMillis();
+        CacheManager manager = cacheManager();
+        
+        for (String cacheName : manager.getCacheNames()) {
+            Long creationTime = cacheCreationTimes.get(cacheName);
+            if (creationTime != null && 
+                currentTime - creationTime > CACHE_EXPIRATION_TIME) {
+                // 清除过期缓存
+                Cache cache = manager.getCache(cacheName);
+                if (cache != null) {
+                    cache.clear();
+                }
+                // 更新缓存创建时间
+                cacheCreationTimes.put(cacheName, currentTime);
+            }
+        }
     }
 }
+```
 
+### 3. 在Service中使用缓存
 
-注意：此方案在每次请求时生成新代理，可能有性能损耗和线程安全问题。
+```java
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.stereotype.Service;
 
-推荐使用工厂模式，符合Spring设计理念，避免潜在冲突。
+@Service
+public class DataService {
+
+    // 使用自定义的keyGenerator和缓存名称
+    @Cacheable(value = "userDataCache", keyGenerator = "permissionBasedKeyGenerator")
+    public Object getDataWithPermissions(String queryParam1, String queryParam2) {
+        // 这里是模拟的数据查询逻辑
+        // 实际应用中，这里会是从数据库或其他数据源获取数据的代码
+        simulateSlowService();
+        
+        // 返回查询结果
+        return "Data for query: " + queryParam1 + ", " + queryParam2 + 
+               " with user permissions";
+    }
+    
+    // 模拟耗时操作
+    private void simulateSlowService() {
+        try {
+            Thread.sleep(3000);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+    }
+}
+```
+
+### 4. 控制器示例
+
+```java
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class DataController {
+
+    @Autowired
+    private DataService dataService;
+    
+    @GetMapping("/data")
+    public Object getData(@RequestParam String param1, @RequestParam String param2) {
+        return dataService.getDataWithPermissions(param1, param2);
+    }
+}
+```
+
+## 配置说明
+
+1. **缓存键生成**：`PermissionBasedKeyGenerator` 会基于当前用户的权限组和查询参数生成唯一的缓存键
+2. **缓存过期**：通过定时任务每5分钟检查一次缓存，清理超过30分钟的缓存
+3. **缓存使用**：在Service方法上使用`@Cacheable`注解，指定缓存名称和键生成器
+
+## 使用注意事项
+
+1. 确保已配置Spring Security来获取用户权限信息
+2. 如果用户权限发生变化，可能需要手动清除相关缓存
+3. 这种方法适用于单机应用，对于分布式环境仍需考虑分布式缓存解决方案
+
+## 扩展功能
+
+如果需要更精细的缓存控制，可以考虑：
+
+1. 添加手动清除特定用户组缓存的方法
+2. 实现基于LRU(最近最少使用)算法的缓存淘汰策略
+3. 添加缓存统计信息监控
+
+这个实现方案完全基于Spring Boot的内置功能，不需要任何外部缓存中间件，同时满足了基于用户权限组的缓存需求。
