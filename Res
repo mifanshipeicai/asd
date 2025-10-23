@@ -1,24 +1,514 @@
-import pandas as pd
-import pyarrow.parquet as pq
+我来为您详细介绍如何在Spring Boot中整合DuckDB，实现数据持久化到S3对象存储的功能。
 
-def create_header_only_parquet(input_path, output_path):
-    """
-    读取Parquet文件结构，创建仅包含文件头的新Parquet文件
-    
-    参数:
-        input_path: 原始Parquet文件路径
-        output_path: 输出文件路径
-    """
-    # 读取原始文件的schema（不加载数据）
-    schema = pq.read_schema(input_path)
-    
-    # 创建空DataFrame（保留原始列名和数据类型）
-    empty_df = pd.DataFrame({col: pd.Series(dtype=pa_dtype.to_pandas_dtype()) 
-                             for col, pa_dtype in zip(schema.names, schema.types)})
-    
-    # 保存为新的Parquet文件
-    empty_df.to_parquet(output_path, index=False)
-    print(f"已创建仅含文件头的Parquet文件: {output_path}")
+1. 项目依赖配置
 
-# 示例用法
-create_header_only_parquet("input.parquet", "header_only.parquet")
+首先在pom.xml中添加必要的依赖：
+
+```xml
+<dependencies>
+    <!-- Spring Boot Starter -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    
+    <!-- DuckDB JDBC Driver -->
+    <dependency>
+        <groupId>org.duckdb</groupId>
+        <artifactId>duckdb_jdbc</artifactId>
+        <version>0.9.2</version>
+    </dependency>
+    
+    <!-- AWS S3 SDK -->
+    <dependency>
+        <groupId>software.amazon.awssdk</groupId>
+        <artifactId>s3</artifactId>
+        <version>2.20.0</version>
+    </dependency>
+    
+    <!-- 配置处理器 -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-configuration-processor</artifactId>
+        <optional>true</optional>
+    </dependency>
+</dependencies>
+```
+
+2. 配置文件
+
+在application.yml中配置相关参数：
+
+```yaml
+app:
+  duckdb:
+    # 本地DuckDB文件路径（用于缓存和临时存储）
+    local-db-path: ./data/local_duckdb.db
+    # S3配置
+    s3:
+      region: us-east-1
+      bucket: your-bucket-name
+      access-key: ${AWS_ACCESS_KEY_ID:}
+      secret-key: ${AWS_SECRET_ACCESS_KEY:}
+      endpoint: ${AWS_ENDPOINT:}  # 可选，用于兼容S3的存储服务
+      
+spring:
+  datasource:
+    url: jdbc:duckdb:./data/local_duckdb.db
+    driver-class-name: org.duckdb.DuckDBDriver
+```
+
+3. 配置类
+
+```java
+@Configuration
+@ConfigurationProperties(prefix = "app.duckdb")
+@Data
+public class DuckDBConfig {
+    private String localDbPath;
+    private S3Config s3;
+    
+    @Data
+    public static class S3Config {
+        private String region;
+        private String bucket;
+        private String accessKey;
+        private String secretKey;
+        private String endpoint;
+    }
+}
+
+@Configuration
+@Slf4j
+public class DuckDBConfiguration {
+    
+    @Autowired
+    private DuckDBConfig duckDBConfig;
+    
+    @Bean
+    @Primary
+    public DataSource duckDBDataSource() {
+        try {
+            // 初始化本地DuckDB连接
+            Connection connection = DriverManager.getConnection("jdbc:duckdb:" + duckDBConfig.getLocalDbPath());
+            
+            // 配置S3扩展
+            configureS3Extension(connection);
+            
+            return new SingleConnectionDataSource(connection, true);
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to initialize DuckDB data source", e);
+        }
+    }
+    
+    private void configureS3Extension(Connection connection) throws SQLException {
+        // 安装并加载S3扩展
+        try (Statement stmt = connection.createStatement()) {
+            stmt.execute("INSTALL httpfs");
+            stmt.execute("LOAD httpfs");
+            
+            // 配置S3凭证
+            if (StringUtils.hasText(duckDBConfig.getS3().getAccessKey())) {
+                stmt.execute("SET s3_region='" + duckDBConfig.getS3().getRegion() + "'");
+                stmt.execute("SET s3_access_key_id='" + duckDBConfig.getS3().getAccessKey() + "'");
+                stmt.execute("SET s3_secret_access_key='" + duckDBConfig.getS3().getSecretKey() + "'");
+                
+                // 如果使用兼容S3的存储服务（如MinIO）
+                if (StringUtils.hasText(duckDBConfig.getS3().getEndpoint())) {
+                    stmt.execute("SET s3_endpoint='" + duckDBConfig.getS3().getEndpoint() + "'");
+                    stmt.execute("SET s3_url_style='path'");
+                }
+            }
+            
+            log.info("DuckDB S3 extension configured successfully");
+        }
+    }
+}
+```
+
+4. 数据模型和服务类
+
+```java
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class ApiData {
+    private Long id;
+    private String name;
+    private Double value;
+    private LocalDateTime timestamp;
+    private Map<String, Object> metadata;
+}
+
+@Service
+@Slf4j
+public class DuckDBService {
+    
+    @Autowired
+    private DataSource dataSource;
+    
+    @Autowired
+    private DuckDBConfig duckDBConfig;
+    
+    /**
+     * 创建表用于存储API数据
+     */
+    public void createTableIfNotExists(String tableName) throws SQLException {
+        String sql = String.format(
+            "CREATE TABLE IF NOT EXISTS %s (" +
+            "id BIGINT, " +
+            "name VARCHAR, " +
+            "value DOUBLE, " +
+            "timestamp TIMESTAMP, " +
+            "metadata JSON" +
+            ")", tableName
+        );
+        
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement()) {
+            stmt.execute(sql);
+            log.info("Table {} created or already exists", tableName);
+        }
+    }
+    
+    /**
+     * 插入API数据到本地DuckDB
+     */
+    public void insertApiData(List<ApiData> dataList, String tableName) throws SQLException {
+        String sql = String.format(
+            "INSERT INTO %s (id, name, value, timestamp, metadata) VALUES (?, ?, ?, ?, ?)",
+            tableName
+        );
+        
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            
+            for (ApiData data : dataList) {
+                pstmt.setLong(1, data.getId());
+                pstmt.setString(2, data.getName());
+                pstmt.setDouble(3, data.getValue());
+                pstmt.setTimestamp(4, Timestamp.valueOf(data.getTimestamp()));
+                
+                // 将metadata转换为JSON字符串
+                ObjectMapper mapper = new ObjectMapper();
+                String metadataJson = mapper.writeValueAsString(data.getMetadata());
+                pstmt.setString(5, metadataJson);
+                
+                pstmt.addBatch();
+            }
+            
+            pstmt.executeBatch();
+            log.info("Inserted {} records into table {}", dataList.size(), tableName);
+        } catch (JsonProcessingException e) {
+            throw new SQLException("Failed to serialize metadata to JSON", e);
+        }
+    }
+    
+    /**
+     * 将本地表数据导出为Parquet格式到S3
+     */
+    public void exportToS3AsParquet(String tableName, String s3Path) throws SQLException {
+        String fullS3Path = String.format("s3://%s/%s", duckDBConfig.getS3().getBucket(), s3Path);
+        
+        String sql = String.format(
+            "COPY %s TO '%s' (FORMAT PARQUET)",
+            tableName, fullS3Path
+        );
+        
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement()) {
+            stmt.execute(sql);
+            log.info("Successfully exported table {} to S3: {}", tableName, fullS3Path);
+        }
+    }
+    
+    /**
+     * 从S3读取Parquet文件到DuckDB
+     */
+    public List<ApiData> readFromS3Parquet(String s3Path) throws SQLException {
+        String fullS3Path = String.format("s3://%s/%s", duckDBConfig.getS3().getBucket(), s3Path);
+        
+        String sql = String.format(
+            "SELECT * FROM read_parquet('%s')",
+            fullS3Path
+        );
+        
+        List<ApiData> result = new ArrayList<>();
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            
+            while (rs.next()) {
+                ApiData data = new ApiData();
+                data.setId(rs.getLong("id"));
+                data.setName(rs.getString("name"));
+                data.setValue(rs.getDouble("value"));
+                data.setTimestamp(rs.getTimestamp("timestamp").toLocalDateTime());
+                
+                // 解析JSON metadata
+                String metadataJson = rs.getString("metadata");
+                ObjectMapper mapper = new ObjectMapper();
+                Map<String, Object> metadata = mapper.readValue(metadataJson, new TypeReference<Map<String, Object>>() {});
+                data.setMetadata(metadata);
+                
+                result.add(data);
+            }
+        } catch (JsonProcessingException e) {
+            throw new SQLException("Failed to parse metadata JSON", e);
+        }
+        
+        return result;
+    }
+    
+    /**
+     * 直接从S3查询Parquet数据（无需导入到本地表）
+     */
+    public List<ApiData> queryS3ParquetDirectly(String s3Path, String whereClause) throws SQLException {
+        String fullS3Path = String.format("s3://%s/%s", duckDBConfig.getS3().getBucket(), s3Path);
+        
+        String sql = String.format(
+            "SELECT * FROM read_parquet('%s') WHERE %s",
+            fullS3Path, whereClause
+        );
+        
+        List<ApiData> result = new ArrayList<>();
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            
+            while (rs.next()) {
+                ApiData data = new ApiData();
+                data.setId(rs.getLong("id"));
+                data.setName(rs.getString("name"));
+                data.setValue(rs.getDouble("value"));
+                data.setTimestamp(rs.getTimestamp("timestamp").toLocalDateTime());
+                
+                String metadataJson = rs.getString("metadata");
+                ObjectMapper mapper = new ObjectMapper();
+                Map<String, Object> metadata = mapper.readValue(metadataJson, new TypeReference<Map<String, Object>>() {});
+                data.setMetadata(metadata);
+                
+                result.add(data);
+            }
+        } catch (JsonProcessingException e) {
+            throw new SQLException("Failed to parse metadata JSON", e);
+        }
+        
+        return result;
+    }
+}
+```
+
+5. 第三方API集成服务
+
+```java
+@Service
+@Slf4j
+public class ThirdPartyApiService {
+    
+    @Value("${app.third-party.api-url}")
+    private String apiUrl;
+    
+    @Value("${app.third-party.api-key}")
+    private String apiKey;
+    
+    private final RestTemplate restTemplate;
+    
+    public ThirdPartyApiService(RestTemplateBuilder restTemplateBuilder) {
+        this.restTemplate = restTemplateBuilder.build();
+    }
+    
+    /**
+     * 从第三方API获取数据
+     */
+    public List<ApiData> fetchDataFromApi() {
+        try {
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("Authorization", "Bearer " + apiKey);
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            
+            HttpEntity<String> entity = new HttpEntity<>(headers);
+            
+            ResponseEntity<Map> response = restTemplate.exchange(
+                apiUrl, HttpMethod.GET, entity, Map.class);
+            
+            return convertApiResponseToData(response.getBody());
+            
+        } catch (Exception e) {
+            log.error("Failed to fetch data from third-party API", e);
+            throw new RuntimeException("API data fetch failed", e);
+        }
+    }
+    
+    private List<ApiData> convertApiResponseToData(Map<String, Object> apiResponse) {
+        List<ApiData> dataList = new ArrayList<>();
+        
+        // 根据实际的API响应结构进行转换
+        List<Map<String, Object>> items = (List<Map<String, Object>>) apiResponse.get("data");
+        
+        for (Map<String, Object> item : items) {
+            ApiData data = new ApiData();
+            data.setId(Long.valueOf(item.get("id").toString()));
+            data.setName((String) item.get("name"));
+            data.setValue(Double.valueOf(item.get("value").toString()));
+            data.setTimestamp(LocalDateTime.now());
+            
+            // 将其他字段放入metadata
+            Map<String, Object> metadata = new HashMap<>(item);
+            metadata.remove("id");
+            metadata.remove("name");
+            metadata.remove("value");
+            data.setMetadata(metadata);
+            
+            dataList.add(data);
+        }
+        
+        return dataList;
+    }
+}
+```
+
+6. 控制器
+
+```java
+@RestController
+@RequestMapping("/api/data")
+@Slf4j
+public class DataController {
+    
+    @Autowired
+    private ThirdPartyApiService apiService;
+    
+    @Autowired
+    private DuckDBService duckDBService;
+    
+    @PostMapping("/fetch-and-store")
+    public ResponseEntity<String> fetchAndStoreData(@RequestParam String tableName) {
+        try {
+            // 创建表
+            duckDBService.createTableIfNotExists(tableName);
+            
+            // 从API获取数据
+            List<ApiData> apiData = apiService.fetchDataFromApi();
+            
+            // 存储到本地DuckDB
+            duckDBService.insertApiData(apiData, tableName);
+            
+            return ResponseEntity.ok("Successfully fetched and stored " + apiData.size() + " records");
+            
+        } catch (Exception e) {
+            log.error("Failed to fetch and store data", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body("Error: " + e.getMessage());
+        }
+    }
+    
+    @PostMapping("/export-to-s3")
+    public ResponseEntity<String> exportToS3(
+            @RequestParam String tableName,
+            @RequestParam String s3Path) {
+        try {
+            duckDBService.exportToS3AsParquet(tableName, s3Path);
+            return ResponseEntity.ok("Successfully exported data to S3: " + s3Path);
+        } catch (Exception e) {
+            log.error("Failed to export data to S3", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body("Error: " + e.getMessage());
+        }
+    }
+    
+    @GetMapping("/from-s3")
+    public ResponseEntity<List<ApiData>> readFromS3(@RequestParam String s3Path) {
+        try {
+            List<ApiData> data = duckDBService.readFromS3Parquet(s3Path);
+            return ResponseEntity.ok(data);
+        } catch (Exception e) {
+            log.error("Failed to read data from S3", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
+    }
+    
+    @GetMapping("/query-s3")
+    public ResponseEntity<List<ApiData>> queryS3Directly(
+            @RequestParam String s3Path,
+            @RequestParam String condition) {
+        try {
+            List<ApiData> data = duckDBService.queryS3ParquetDirectly(s3Path, condition);
+            return ResponseEntity.ok(data);
+        } catch (Exception e) {
+            log.error("Failed to query data from S3", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
+    }
+}
+```
+
+7. 完整的数据处理流程
+
+```java
+@Service
+@Slf4j
+public class DataPipelineService {
+    
+    @Autowired
+    private ThirdPartyApiService apiService;
+    
+    @Autowired
+    private DuckDBService duckDBService;
+    
+    /**
+     * 完整的数据处理管道：从API获取 -> 本地存储 -> 导出到S3
+     */
+    @Async
+    public void executeDataPipeline(String tableName, String s3Path) {
+        try {
+            log.info("Starting data pipeline for table: {}", tableName);
+            
+            // 1. 创建表
+            duckDBService.createTableIfNotExists(tableName);
+            
+            // 2. 从API获取数据
+            List<ApiData> apiData = apiService.fetchDataFromApi();
+            log.info("Fetched {} records from API", apiData.size());
+            
+            // 3. 存储到本地DuckDB
+            duckDBService.insertApiData(apiData, tableName);
+            
+            // 4. 导出到S3作为Parquet
+            duckDBService.exportToS3AsParquet(tableName, s3Path);
+            
+            log.info("Data pipeline completed successfully for table: {}", tableName);
+            
+        } catch (Exception e) {
+            log.error("Data pipeline failed for table: {}", tableName, e);
+            throw new RuntimeException("Data pipeline execution failed", e);
+        }
+    }
+}
+```
+
+主要特性说明
+
+1. 本地DuckDB集成：使用DuckDB作为本地数据处理引擎
+2. S3对象存储：通过httpfs扩展直接读写S3上的Parquet文件
+3. 数据转换：将API数据转换为结构化格式并支持JSON元数据
+4. 灵活查询：支持从S3直接查询Parquet数据，无需下载到本地
+5. 错误处理：完善的异常处理和日志记录
+
+使用示例
+
+```bash
+# 1. 从API获取数据并存储到本地
+curl -X POST "http://localhost:8080/api/data/fetch-and-store?tableName=api_data"
+
+# 2. 导出到S3
+curl -X POST "http://localhost:8080/api/data/export-to-s3?tableName=api_data&s3Path=exports/api_data.parquet"
+
+# 3. 从S3读取数据
+curl "http://localhost:8080/api/data/from-s3?s3Path=exports/api_data.parquet"
+
+# 4. 直接从S3查询
+curl "http://localhost:8080/api/data/query-s3?s3Path=exports/api_data.parquet&condition=value>100"
+```
+
+这个方案提供了完整的从API数据获取到S3持久化的流水线，同时保持了DuckDB的高性能查询能力。
