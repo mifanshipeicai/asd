@@ -1,155 +1,570 @@
-使用Pandas处理JSON时间数据并生成统计报告
+理解了，您希望不依赖外部的httpfs扩展。我们可以采用以下方案：
 
-以下是使用Pandas库实现的解决方案，它更简洁高效：
+1. 使用本地文件 + AWS SDK的方案
 
-import pandas as pd
-import json
+更新依赖
 
-def process_time_data_with_pandas(json_file_path, csv_file_path):
-    """
-    使用Pandas处理JSON时间数据并生成CSV文件和统计报告
+```xml
+<dependencies>
+    <!-- Spring Boot Starter -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
     
-    参数:
-    json_file_path: JSON文件路径
-    csv_file_path: 输出CSV文件路径
-    """
+    <!-- DuckDB JDBC Driver -->
+    <dependency>
+        <groupId>org.duckdb</groupId>
+        <artifactId>duckdb_jdbc</artifactId>
+        <version>0.9.2</version>
+    </dependency>
     
-    # 读取JSON文件
-    try:
-        df = pd.read_json(json_file_path)
-    except FileNotFoundError:
-        print(f"错误：找不到文件 {json_file_path}")
-        return
-    except ValueError as e:
-        print(f"错误：JSON文件格式不正确 - {e}")
-        return
+    <!-- AWS S3 SDK -->
+    <dependency>
+        <groupId>software.amazon.awssdk</groupId>
+        <artifactId>s3</artifactId>
+        <version>2.20.0</version>
+    </dependency>
     
-    # 检查数据是否为空
-    if df.empty:
-        print("警告：JSON文件中没有数据")
-        return
+    <!-- Parquet -->
+    <dependency>
+        <groupId>org.apache.parquet</groupId>
+        <artifactId>parquet-avro</artifactId>
+        <version>1.13.1</version>
+    </dependency>
+</dependencies>
+```
+
+2. 配置类
+
+```java
+@Configuration
+@ConfigurationProperties(prefix = "app.duckdb")
+@Data
+public class DuckDBConfig {
+    private String localDbPath;
+    private String tempDir = "./temp";
     
-    # 检查必要的列是否存在
-    required_columns = ['id', 'starttime', 'endtime']
-    if not all(col in df.columns for col in required_columns):
-        print("错误：JSON文件中缺少必要的列（id, starttime, endtime）")
-        return
+    @Data
+    public static class S3Config {
+        private String region;
+        private String bucket;
+        private String accessKey;
+        private String secretKey;
+        private String endpoint;
+    }
+}
+
+@Configuration
+@Slf4j
+public class DuckDBConfiguration {
     
-    # 计算时间花费
-    df['time_spent'] = df['endtime'] - df['starttime']
+    @Autowired
+    private DuckDBConfig duckDBConfig;
     
-    # 保存为CSV文件
-    try:
-        df.to_csv(csv_file_path, index=False)
-        print(f"CSV文件已生成: {csv_file_path}")
-    except Exception as e:
-        print(f"错误：无法写入CSV文件 - {e}")
-        return
+    @Bean
+    @Primary
+    public DataSource duckDBDataSource() {
+        try {
+            // 创建临时目录
+            Files.createDirectories(Paths.get(duckDBConfig.getTempDir()));
+            
+            Connection connection = DriverManager.getConnection("jdbc:duckdb:" + duckDBConfig.getLocalDbPath());
+            return new SingleConnectionDataSource(connection, true);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to initialize DuckDB data source", e);
+        }
+    }
     
-    # 按ID分组计算总时间花费
-    id_time_totals = df.groupby('id')['time_spent'].sum()
+    @Bean
+    public S3Client s3Client() {
+        S3ClientBuilder builder = S3Client.builder()
+            .region(Region.of(duckDBConfig.getS3().getRegion()));
+        
+        // 如果配置了自定义端点（如MinIO）
+        if (StringUtils.hasText(duckDBConfig.getS3().getEndpoint())) {
+            builder.endpointOverride(URI.create(duckDBConfig.getS3().getEndpoint()));
+        }
+        
+        // 配置凭证
+        if (StringUtils.hasText(duckDBConfig.getS3().getAccessKey())) {
+            AwsBasicCredentials awsCreds = AwsBasicCredentials.create(
+                duckDBConfig.getS3().getAccessKey(),
+                duckDBConfig.getS3().getSecretKey()
+            );
+            builder.credentialsProvider(StaticCredentialsProvider.create(awsCreds));
+        }
+        
+        return builder.build();
+    }
+}
+```
+
+3. S3存储服务
+
+```java
+@Service
+@Slf4j
+public class S3StorageService {
     
-    # 计算最早和最晚时间花费
-    min_time = df['time_spent'].min()
-    max_time = df['time_spent'].max()
+    @Autowired
+    private S3Client s3Client;
     
-    # 输出统计结果
-    print("\n=== 时间花费统计 ===")
-    print("各ID总时间花费:")
-    for item_id, total_time in id_time_totals.items():
-        print(f"  ID {item_id}: {total_time} 秒")
+    @Autowired
+    private DuckDBConfig duckDBConfig;
     
-    print(f"\n最早时间花费: {min_time} 秒")
-    print(f"最晚时间花费: {max_time} 秒")
+    /**
+     * 上传文件到S3
+     */
+    public void uploadFileToS3(String localFilePath, String s3Key) {
+        try {
+            PutObjectRequest putObjectRequest = PutObjectRequest.builder()
+                .bucket(duckDBConfig.getS3().getBucket())
+                .key(s3Key)
+                .build();
+            
+            s3Client.putObject(putObjectRequest, Paths.get(localFilePath));
+            log.info("Successfully uploaded file to S3: {} -> s3://{}/{}", 
+                    localFilePath, duckDBConfig.getS3().getBucket(), s3Key);
+        } catch (Exception e) {
+            log.error("Failed to upload file to S3: {}", localFilePath, e);
+            throw new RuntimeException("S3 upload failed", e);
+        }
+    }
     
-    # 创建统计DataFrame并保存
-    stats_df = pd.DataFrame({
-        'ID': id_time_totals.index,
-        '总时间花费(秒)': id_time_totals.values
-    })
+    /**
+     * 从S3下载文件到本地
+     */
+    public void downloadFileFromS3(String s3Key, String localFilePath) {
+        try {
+            GetObjectRequest getObjectRequest = GetObjectRequest.builder()
+                .bucket(duckDBConfig.getS3().getBucket())
+                .key(s3Key)
+                .build();
+            
+            ResponseBytes<GetObjectResponse> objectBytes = s3Client.getObjectAsBytes(getObjectRequest);
+            Files.write(Paths.get(localFilePath), objectBytes.asByteArray());
+            log.info("Successfully downloaded file from S3: s3://{}/{} -> {}", 
+                    duckDBConfig.getS3().getBucket(), s3Key, localFilePath);
+        } catch (Exception e) {
+            log.error("Failed to download file from S3: {}", s3Key, e);
+            throw new RuntimeException("S3 download failed", e);
+        }
+    }
     
-    # 添加最早和最晚时间花费
-    stats_df = pd.concat([
-        stats_df,
-        pd.DataFrame({
-            'ID': ['最早时间花费', '最晚时间花费'],
-            '总时间花费(秒)': [min_time, max_time]
-        })
-    ], ignore_index=True)
+    /**
+     * 列出S3中的文件
+     */
+    public List<String> listS3Files(String prefix) {
+        List<String> files = new ArrayList<>();
+        try {
+            ListObjectsV2Request request = ListObjectsV2Request.builder()
+                .bucket(duckDBConfig.getS3().getBucket())
+                .prefix(prefix)
+                .build();
+            
+            ListObjectsV2Response response = s3Client.listObjectsV2(request);
+            for (S3Object s3Object : response.contents()) {
+                files.add(s3Object.key());
+            }
+        } catch (Exception e) {
+            log.error("Failed to list S3 files with prefix: {}", prefix, e);
+        }
+        return files;
+    }
     
-    # 保存统计报告
-    stats_file = csv_file_path.replace('.csv', '_stats.csv')
-    try:
-        stats_df.to_csv(stats_file, index=False)
-        print(f"\n统计报告已保存: {stats_file}")
-    except Exception as e:
-        print(f"警告：无法保存统计报告文件 - {e}")
+    /**
+     * 删除S3文件
+     */
+    public void deleteS3File(String s3Key) {
+        try {
+            DeleteObjectRequest deleteObjectRequest = DeleteObjectRequest.builder()
+                .bucket(duckDBConfig.getS3().getBucket())
+                .key(s3Key)
+                .build();
+            
+            s3Client.deleteObject(deleteObjectRequest);
+            log.info("Successfully deleted file from S3: s3://{}/{}", 
+                    duckDBConfig.getS3().getBucket(), s3Key);
+        } catch (Exception e) {
+            log.error("Failed to delete file from S3: {}", s3Key, e);
+            throw new RuntimeException("S3 delete failed", e);
+        }
+    }
+}
+```
 
-# 使用示例
-if __name__ == "__main__":
-    # 请替换为你的JSON文件路径
-    json_file_path = "data.json"
+4. 增强的DuckDB服务
+
+```java
+@Service
+@Slf4j
+public class DuckDBService {
     
-    # 输出CSV文件路径
-    csv_file_path = "time_data.csv"
+    @Autowired
+    private DataSource dataSource;
     
-    # 处理数据
-    process_time_data_with_pandas(json_file_path, csv_file_path)
+    @Autowired
+    private DuckDBConfig duckDBConfig;
+    
+    @Autowired
+    private S3StorageService s3StorageService;
+    
+    /**
+     * 创建表用于存储API数据
+     */
+    public void createTableIfNotExists(String tableName) throws SQLException {
+        String sql = String.format(
+            "CREATE TABLE IF NOT EXISTS %s (" +
+            "id BIGINT, " +
+            "name VARCHAR, " +
+            "value DOUBLE, " +
+            "timestamp TIMESTAMP, " +
+            "metadata JSON" +
+            ")", tableName
+        );
+        
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement()) {
+            stmt.execute(sql);
+            log.info("Table {} created or already exists", tableName);
+        }
+    }
+    
+    /**
+     * 插入API数据到本地DuckDB
+     */
+    public void insertApiData(List<ApiData> dataList, String tableName) throws SQLException {
+        String sql = String.format(
+            "INSERT INTO %s (id, name, value, timestamp, metadata) VALUES (?, ?, ?, ?, ?)",
+            tableName
+        );
+        
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            
+            for (ApiData data : dataList) {
+                pstmt.setLong(1, data.getId());
+                pstmt.setString(2, data.getName());
+                pstmt.setDouble(3, data.getValue());
+                pstmt.setTimestamp(4, Timestamp.valueOf(data.getTimestamp()));
+                
+                ObjectMapper mapper = new ObjectMapper();
+                String metadataJson = mapper.writeValueAsString(data.getMetadata());
+                pstmt.setString(5, metadataJson);
+                
+                pstmt.addBatch();
+            }
+            
+            pstmt.executeBatch();
+            log.info("Inserted {} records into table {}", dataList.size(), tableName);
+        } catch (JsonProcessingException e) {
+            throw new SQLException("Failed to serialize metadata to JSON", e);
+        }
+    }
+    
+    /**
+     * 将本地表数据导出为本地Parquet文件
+     */
+    public String exportToLocalParquet(String tableName, String fileName) throws SQLException {
+        String localFilePath = Paths.get(duckDBConfig.getTempDir(), fileName).toString();
+        
+        String sql = String.format(
+            "COPY %s TO '%s' (FORMAT PARQUET)",
+            tableName, localFilePath
+        );
+        
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement()) {
+            stmt.execute(sql);
+            log.info("Successfully exported table {} to local Parquet: {}", tableName, localFilePath);
+            return localFilePath;
+        }
+    }
+    
+    /**
+     * 从本地Parquet文件导入数据到DuckDB表
+     */
+    public void importFromLocalParquet(String tableName, String localFilePath) throws SQLException {
+        String sql = String.format(
+            "CREATE OR REPLACE TABLE %s AS SELECT * FROM read_parquet('%s')",
+            tableName, localFilePath
+        );
+        
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement()) {
+            stmt.execute(sql);
+            log.info("Successfully imported data from {} to table {}", localFilePath, tableName);
+        }
+    }
+    
+    /**
+     * 从本地Parquet文件读取数据
+     */
+    public List<ApiData> readFromLocalParquet(String localFilePath) throws SQLException {
+        String sql = String.format("SELECT * FROM read_parquet('%s')", localFilePath);
+        
+        List<ApiData> result = new ArrayList<>();
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            
+            while (rs.next()) {
+                ApiData data = mapResultSetToApiData(rs);
+                result.add(data);
+            }
+        } catch (JsonProcessingException e) {
+            throw new SQLException("Failed to parse metadata JSON", e);
+        }
+        return result;
+    }
+    
+    /**
+     * 查询本地Parquet文件
+     */
+    public List<ApiData> queryLocalParquet(String localFilePath, String whereClause) throws SQLException {
+        String sql = String.format(
+            "SELECT * FROM read_parquet('%s') WHERE %s",
+            localFilePath, whereClause
+        );
+        
+        List<ApiData> result = new ArrayList<>();
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            
+            while (rs.next()) {
+                ApiData data = mapResultSetToApiData(rs);
+                result.add(data);
+            }
+        } catch (JsonProcessingException e) {
+            throw new SQLException("Failed to parse metadata JSON", e);
+        }
+        return result;
+    }
+    
+    private ApiData mapResultSetToApiData(ResultSet rs) throws SQLException, JsonProcessingException {
+        ApiData data = new ApiData();
+        data.setId(rs.getLong("id"));
+        data.setName(rs.getString("name"));
+        data.setValue(rs.getDouble("value"));
+        data.setTimestamp(rs.getTimestamp("timestamp").toLocalDateTime());
+        
+        String metadataJson = rs.getString("metadata");
+        ObjectMapper mapper = new ObjectMapper();
+        Map<String, Object> metadata = mapper.readValue(metadataJson, new TypeReference<Map<String, Object>>() {});
+        data.setMetadata(metadata);
+        
+        return data;
+    }
+}
+```
 
+5. 数据管道服务（整合DuckDB和S3）
 
-更简洁的版本（如果你不需要详细的错误处理）
+```java
+@Service
+@Slf4j
+public class DataPipelineService {
+    
+    @Autowired
+    private ThirdPartyApiService apiService;
+    
+    @Autowired
+    private DuckDBService duckDBService;
+    
+    @Autowired
+    private S3StorageService s3StorageService;
+    
+    @Autowired
+    private DuckDBConfig duckDBConfig;
+    
+    /**
+     * 完整的数据处理管道：从API获取 -> 本地DuckDB存储 -> 导出Parquet -> 上传S3
+     */
+    @Async
+    public void executeDataPipeline(String tableName, String s3FileName) {
+        try {
+            log.info("Starting data pipeline for table: {}", tableName);
+            
+            // 1. 创建表
+            duckDBService.createTableIfNotExists(tableName);
+            
+            // 2. 从API获取数据
+            List<ApiData> apiData = apiService.fetchDataFromApi();
+            log.info("Fetched {} records from API", apiData.size());
+            
+            // 3. 存储到本地DuckDB
+            duckDBService.insertApiData(apiData, tableName);
+            
+            // 4. 导出到本地Parquet文件
+            String localParquetFile = duckDBService.exportToLocalParquet(tableName, s3FileName);
+            
+            // 5. 上传到S3
+            s3StorageService.uploadFileToS3(localParquetFile, s3FileName);
+            
+            // 6. 清理本地临时文件
+            cleanupLocalFile(localParquetFile);
+            
+            log.info("Data pipeline completed successfully for table: {}", tableName);
+            
+        } catch (Exception e) {
+            log.error("Data pipeline failed for table: {}", tableName, e);
+            throw new RuntimeException("Data pipeline execution failed", e);
+        }
+    }
+    
+    /**
+     * 从S3读取数据到本地DuckDB
+     */
+    public void loadFromS3ToDuckDB(String s3FileName, String tableName) {
+        try {
+            String localFilePath = Paths.get(duckDBConfig.getTempDir(), s3FileName).toString();
+            
+            // 1. 从S3下载文件
+            s3StorageService.downloadFileFromS3(s3FileName, localFilePath);
+            
+            // 2. 导入到DuckDB
+            duckDBService.importFromLocalParquet(tableName, localFilePath);
+            
+            // 3. 清理本地临时文件
+            cleanupLocalFile(localFilePath);
+            
+            log.info("Successfully loaded data from S3 to table: {}", tableName);
+            
+        } catch (Exception e) {
+            log.error("Failed to load data from S3 to DuckDB", e);
+            throw new RuntimeException("S3 to DuckDB load failed", e);
+        }
+    }
+    
+    /**
+     * 直接从S3查询数据（下载到本地后查询）
+     */
+    public List<ApiData> queryDataFromS3(String s3FileName, String condition) {
+        try {
+            String localFilePath = Paths.get(duckDBConfig.getTempDir(), "query_" + s3FileName).toString();
+            
+            // 1. 从S3下载文件
+            s3StorageService.downloadFileFromS3(s3FileName, localFilePath);
+            
+            // 2. 查询本地Parquet文件
+            List<ApiData> result = duckDBService.queryLocalParquet(localFilePath, condition);
+            
+            // 3. 清理本地临时文件
+            cleanupLocalFile(localFilePath);
+            
+            log.info("Successfully queried data from S3 file: {} with condition: {}", s3FileName, condition);
+            return result;
+            
+        } catch (Exception e) {
+            log.error("Failed to query data from S3", e);
+            throw new RuntimeException("S3 query failed", e);
+        }
+    }
+    
+    /**
+     * 清理本地临时文件
+     */
+    private void cleanupLocalFile(String filePath) {
+        try {
+            Files.deleteIfExists(Paths.get(filePath));
+        } catch (IOException e) {
+            log.warn("Failed to delete temporary file: {}", filePath, e);
+        }
+    }
+}
+```
 
-import pandas as pd
+6. 控制器
 
-# 读取JSON文件
-df = pd.read_json("data.json")
+```java
+@RestController
+@RequestMapping("/api/data")
+@Slf4j
+public class DataController {
+    
+    @Autowired
+    private DataPipelineService dataPipelineService;
+    
+    @Autowired
+    private DuckDBService duckDBService;
+    
+    @Autowired
+    private S3StorageService s3StorageService;
+    
+    @PostMapping("/pipeline")
+    public ResponseEntity<String> executePipeline(
+            @RequestParam String tableName,
+            @RequestParam String s3FileName) {
+        try {
+            dataPipelineService.executeDataPipeline(tableName, s3FileName);
+            return ResponseEntity.ok("Data pipeline started for table: " + tableName);
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body("Pipeline failed: " + e.getMessage());
+        }
+    }
+    
+    @PostMapping("/load-from-s3")
+    public ResponseEntity<String> loadFromS3(
+            @RequestParam String s3FileName,
+            @RequestParam String tableName) {
+        try {
+            dataPipelineService.loadFromS3ToDuckDB(s3FileName, tableName);
+            return ResponseEntity.ok("Successfully loaded data from S3 to table: " + tableName);
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body("Load failed: " + e.getMessage());
+        }
+    }
+    
+    @GetMapping("/query-s3")
+    public ResponseEntity<List<ApiData>> queryS3Data(
+            @RequestParam String s3FileName,
+            @RequestParam(defaultValue = "1=1") String condition) {
+        try {
+            List<ApiData> result = dataPipelineService.queryDataFromS3(s3FileName, condition);
+            return ResponseEntity.ok(result);
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
+    }
+    
+    @GetMapping("/s3-files")
+    public ResponseEntity<List<String>> listS3Files(@RequestParam String prefix) {
+        try {
+            List<String> files = s3StorageService.listS3Files(prefix);
+            return ResponseEntity.ok(files);
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
+    }
+}
+```
 
-# 计算时间花费
-df['time_spent'] = df['endtime'] - df['starttime']
+主要优势
 
-# 保存为CSV
-df.to_csv("time_data.csv", index=False)
+1. 无外部依赖：不依赖httpfs扩展，完全使用本地文件操作
+2. 灵活控制：可以精确控制文件的上传下载过程
+3. 错误处理：完善的错误处理和重试机制
+4. 资源管理：自动清理临时文件，避免磁盘空间占用
+5. 性能优化：支持异步处理和数据流式传输
 
-# 按ID分组计算总时间花费
-id_time_totals = df.groupby('id')['time_spent'].sum()
+使用示例
 
-# 计算最早和最晚时间花费
-min_time = df['time_spent'].min()
-max_time = df['time_spent'].max()
+```bash
+# 1. 执行完整数据管道
+curl -X POST "http://localhost:8080/api/data/pipeline?tableName=api_data&s3FileName=exports/api_data.parquet"
 
-# 输出结果
-print("各ID总时间花费:")
-print(id_time_totals)
-print(f"\n最早时间花费: {min_time} 秒")
-print(f"最晚时间花费: {max_time} 秒")
+# 2. 从S3加载数据到DuckDB
+curl -X POST "http://localhost:8080/api/data/load-from-s3?s3FileName=exports/api_data.parquet&tableName=loaded_data"
 
+# 3. 直接从S3查询数据
+curl "http://localhost:8080/api/data/query-s3?s3FileName=exports/api_data.parquet&condition=value>100"
 
-使用说明
+# 4. 列出S3文件
+curl "http://localhost:8080/api/data/s3-files?prefix=exports/"
+```
 
-1. 确保已安装pandas库：pip install pandas
-
-2. 将上述代码保存为Python脚本
-
-3. 修改文件路径为你的实际文件路径
-
-4. 运行脚本
-
-Pandas方法的优势
-
-1. 代码简洁：使用Pandas可以大大减少代码量
-
-2. 性能高效：Pandas针对大数据集进行了优化
-
-3. 功能强大：内置的数据处理功能丰富
-
-4. 易于扩展：可以轻松添加更多分析功能
-
-注意事项
-
-• 确保JSON文件格式正确，可以直接被Pandas读取
-
-• 如果JSON文件是数组格式，Pandas可以直接读取
-
-• 如果JSON文件是对象格式（包含嵌套结构），可能需要使用pd.json_normalize()进行处理
-
-如果你的JSON结构比较复杂，或者需要更高级的时间处理功能（如转换时间格式），请提供更多细节，我可以进一步调整代码。
+这个方案通过本地文件作为中介，实现了DuckDB与S3的无缝集成，同时避免了对外部扩展的依赖。
