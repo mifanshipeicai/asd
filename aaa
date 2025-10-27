@@ -1,63 +1,33 @@
-在Spring Boot中，可以通过以下步骤在启动时执行schema.sql文件创建数据库表：
+在Spring Boot中整合DuckDB并自定义DataSource后，可以通过以下步骤实现项目启动时自动执行schema.sql创建表：
 
-方法一：使用Spring Boot自动执行SQL脚本（推荐）
+方案一：使用Spring Boot内置初始化机制（推荐）
 
 1. 放置SQL文件
 
-将schema.sql文件放在项目的src/main/resources目录下。
+将schema.sql文件放在src/main/resources目录下
 
-Spring Boot启动时会自动检测并执行该文件。
+2. 配置application.properties
 
-2. 配置数据源
-
-在application.properties或application.yml中配置数据库连接：
-
-spring.datasource.url=jdbc:mysql://localhost:3306/your_db
-spring.datasource.username=root
-spring.datasource.password=your_password
-spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver
-
-
-3. 启用SQL初始化（Spring Boot 2.5+）
-
-添加配置确保脚本执行：
-
-spring.sql.init.mode=always  # 总是初始化
-spring.sql.init.platform=mysql  # 指定数据库类型（可选）
-
-
-4. 禁用Hibernate自动DDL（如果使用JPA）
-
-避免与Hibernate的建表冲突：
-
-spring.jpa.hibernate.ddl-auto=none
-
-
-
-------
-
-方法二：自定义DataSource初始化
-
-1. 配置初始化模式
-
-在application.properties中：
-
+# 启用数据库初始化
 spring.datasource.initialization-mode=always
+# 指定初始化脚本（默认会加载schema.sql）
+spring.datasource.schema=classpath:schema.sql
 
 
-2. 指定自定义脚本路径（可选）
+3. 配置自定义DataSource
 
-如果SQL文件不在默认位置：
+确保你的自定义DataSource配置支持初始化：
 
-spring.datasource.schema=classpath:custom/schema.sql
+@Bean
+public DataSource dataSource() {
+    return DataSourceBuilder.create()
+        .type(DuckDBDataSource.class) // 你的DuckDB数据源类
+        .url("jdbc:duckdb:mydb.db")
+        .build();
+}
 
 
-
-------
-
-方法三：使用Spring JDBC手动执行
-
-1. 创建DataSourceInitializer Bean：
+方案二：编程式初始化（更灵活）
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Bean;
@@ -69,66 +39,102 @@ import javax.sql.DataSource;
 
 @Configuration
 public class DatabaseConfig {
-    
+
     @Autowired
     private DataSource dataSource;
 
     @Bean
     public DataSourceInitializer dataSourceInitializer() {
         ResourceDatabasePopulator populator = new ResourceDatabasePopulator();
-        populator.addScript(new ClassPathResource("schema.sql")); // 添加SQL脚本
-        
+        populator.addScript(new ClassPathResource("schema.sql"));
+        populator.setSeparator(";"); // DuckDB需要明确分隔符
+
         DataSourceInitializer initializer = new DataSourceInitializer();
         initializer.setDataSource(dataSource);
         initializer.setDatabasePopulator(populator);
+        initializer.setEnabled(true); // 确保启用
         return initializer;
     }
 }
 
 
+方案三：使用JPA自动建表（需Hibernate支持）
 
-------
-
-验证执行结果
-
-启动应用时观察日志：
-
-Executing SQL script from class path resource [schema.sql]
+# application.properties
+spring.jpa.hibernate.ddl-auto=create
+spring.jpa.show-sql=true
 
 
-注意事项
+@Entity
+public class User {
+    @Id
+    @GeneratedValue
+    private Long id;
+    private String name;
+    // getters/setters
+}
 
-1. 脚本幂等性
 
-确保SQL语句可重复执行（例如使用CREATE TABLE IF NOT EXISTS）。
+DuckDB注意事项
 
-2. 执行顺序
+1. SQL语法兼容性
 
-schema.sql在data.sql之前执行（如果存在数据初始化）。
+确保schema.sql使用DuckDB兼容语法：
 
-3. 多数据源
-
-自定义初始化时需为每个数据源单独配置。
-
-4. 生产环境
-
-考虑使用专业迁移工具（如Flyway或Liquibase）替代。
-
-完整示例schema.sql
-
-CREATE TABLE IF NOT EXISTS users (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    username VARCHAR(50) NOT NULL UNIQUE,
-    email VARCHAR(100) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS orders (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    user_id INT,
-    total DECIMAL(10,2),
-    FOREIGN KEY (user_id) REFERENCES users(id)
+CREATE TABLE users (
+  id BIGINT PRIMARY KEY,
+  name VARCHAR(255)
 );
 
 
-选择适合项目需求的方式即可实现启动时自动建表。
+2. 多语句执行
+
+在单个schema.sql中包含多个语句时，确保用分号分隔：
+
+CREATE TABLE table1 (...);
+CREATE TABLE table2 (...);
+
+
+3. 文件路径处理
+
+如果使用相对路径，DuckDB会在当前工作目录创建数据库文件：
+
+spring.datasource.url=jdbc:duckdb:file:./mydb.db
+
+
+验证是否生效
+
+1. 查看启动日志中的SQL执行记录
+
+2. 添加测试端点检查表是否存在：
+
+@RestController
+public class HealthController {
+    
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
+    @GetMapping("/tables")
+    public List<String> listTables() {
+        return jdbcTemplate.queryForList(
+            "SELECT table_name FROM information_schema.tables", 
+            String.class
+        );
+    }
+}
+
+
+完整示例结构
+
+src/main/resources/
+├── application.properties
+└── schema.sql
+
+src/main/java/
+└── com/example/
+    ├── config/
+    │   └── DataSourceConfig.java
+    └── Application.java
+
+
+选择最适合你项目需求的方式，通常方案一最简单直接，方案二提供更多控制权。对于DuckDB这种嵌入式数据库，初始化建表是确保应用正常启动的关键步骤。
