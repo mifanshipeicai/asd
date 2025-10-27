@@ -1,207 +1,134 @@
-在 Spring Boot WebFlux 中使用 `@HttpExchange` 调用第三方接口并实现负载均衡，可以通过以下步骤实现。核心思路是 **自定义负载均衡的 `WebClient`**，结合 Spring Cloud LoadBalancer 或自定义的负载均衡策略。
+在Spring Boot中，可以通过以下步骤在启动时执行schema.sql文件创建数据库表：
 
-### 方案概览
-1. **配置多个服务实例**：在配置文件中列出所有第三方服务的可用节点
-2. **创建负载均衡器**：使用 Spring Cloud LoadBalancer 或自定义轮询策略
-3. **构建负载均衡的 `WebClient`**：在每次请求时动态选择目标节点
-4. **在 `@HttpExchange` 接口中使用负载均衡客户端**
+方法一：使用Spring Boot自动执行SQL脚本（推荐）
 
----
+1. 放置SQL文件
 
-### 详细实现步骤
+将schema.sql文件放在项目的src/main/resources目录下。
 
-#### 1. 添加依赖 (pom.xml)
-```xml
-<dependency>
-    <groupId>org.springframework.cloud</groupId>
-    <artifactId>spring-cloud-starter-loadbalancer</artifactId>
-</dependency>
-<dependency>
-    <groupId>org.springframework.boot</groupId>
-    <artifactId>spring-boot-starter-webflux</artifactId>
-</dependency>
-```
+Spring Boot启动时会自动检测并执行该文件。
 
-#### 2. 配置服务节点 (application.yml)
-```yaml
-external-service:
-  instances:
-    - http://service1.example.com
-    - http://service2.example.com
-    - http://service3.example.com
-```
+2. 配置数据源
 
-#### 3. 创建配置类读取节点列表
-```java
+在application.properties或application.yml中配置数据库连接：
+
+spring.datasource.url=jdbc:mysql://localhost:3306/your_db
+spring.datasource.username=root
+spring.datasource.password=your_password
+spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver
+
+
+3. 启用SQL初始化（Spring Boot 2.5+）
+
+添加配置确保脚本执行：
+
+spring.sql.init.mode=always  # 总是初始化
+spring.sql.init.platform=mysql  # 指定数据库类型（可选）
+
+
+4. 禁用Hibernate自动DDL（如果使用JPA）
+
+避免与Hibernate的建表冲突：
+
+spring.jpa.hibernate.ddl-auto=none
+
+
+
+------
+
+方法二：自定义DataSource初始化
+
+1. 配置初始化模式
+
+在application.properties中：
+
+spring.datasource.initialization-mode=always
+
+
+2. 指定自定义脚本路径（可选）
+
+如果SQL文件不在默认位置：
+
+spring.datasource.schema=classpath:custom/schema.sql
+
+
+
+------
+
+方法三：使用Spring JDBC手动执行
+
+1. 创建DataSourceInitializer Bean：
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.jdbc.datasource.init.DataSourceInitializer;
+import org.springframework.jdbc.datasource.init.ResourceDatabasePopulator;
+import javax.sql.DataSource;
+
 @Configuration
-@ConfigurationProperties(prefix = "external-service")
-public class ServiceConfig {
-    private List<String> instances = new ArrayList<>();
-
-    // Getter/Setter
-    public List<String> getInstances() {
-        return instances;
-    }
-
-    public void setInstances(List<String> instances) {
-        this.instances = instances;
-    }
-}
-```
-
-#### 4. 实现轮询负载均衡器
-```java
-@Component
-public class RoundRobinLoadBalancer {
-    private final List<String> instances;
-    private final AtomicInteger counter = new AtomicInteger(0);
-
+public class DatabaseConfig {
+    
     @Autowired
-    public RoundRobinLoadBalancer(ServiceConfig config) {
-        this.instances = config.getInstances();
-    }
-
-    public String getNextInstance() {
-        if (instances.isEmpty()) {
-            throw new IllegalStateException("No available instances");
-        }
-        int index = counter.getAndIncrement() % instances.size();
-        if (counter.get() >= Integer.MAX_VALUE - 10000) { // 防止整数溢出
-            counter.set(0);
-        }
-        return instances.get(index);
-    }
-}
-```
-
-#### 5. 创建负载均衡的 WebClient
-```java
-@Configuration
-public class WebClientConfig {
+    private DataSource dataSource;
 
     @Bean
-    public WebClient.Builder loadBalancedWebClientBuilder(
-            RoundRobinLoadBalancer loadBalancer) {
+    public DataSourceInitializer dataSourceInitializer() {
+        ResourceDatabasePopulator populator = new ResourceDatabasePopulator();
+        populator.addScript(new ClassPathResource("schema.sql")); // 添加SQL脚本
         
-        return WebClient.builder()
-                .filter((request, next) -> {
-                    // 动态修改请求URL
-                    String baseUrl = loadBalancer.getNextInstance();
-                    ClientRequest newRequest = ClientRequest.from(request)
-                            .url(baseUrl + request.url().getPath())
-                            .build();
-                    return next.exchange(newRequest);
-                });
+        DataSourceInitializer initializer = new DataSourceInitializer();
+        initializer.setDataSource(dataSource);
+        initializer.setDatabasePopulator(populator);
+        return initializer;
     }
 }
-```
 
-#### 6. 定义 HttpExchange 接口
-```java
-@HttpExchange
-public interface ExternalServiceClient {
 
-    @GetExchange("/api/data")
-    Flux<Data> getData();
-}
-```
 
-#### 7. 配置声明式客户端使用负载均衡
-```java
-@Configuration
-public class ClientConfig {
+------
 
-    @Bean
-    public ExternalServiceClient externalServiceClient(
-            WebClient.Builder loadBalancedWebClientBuilder) {
-        
-        HttpServiceProxyFactory factory = HttpServiceProxyFactory
-                .builder(WebClientAdapter.forClient(
-                        loadBalancedWebClientBuilder.build()
-                ))
-                .build();
+验证执行结果
 
-        return factory.createClient(ExternalServiceClient.class);
-    }
-}
-```
+启动应用时观察日志：
 
----
+Executing SQL script from class path resource [schema.sql]
 
-### 使用示例
-```java
-@Service
-public class MyService {
 
-    private final ExternalServiceClient client;
+注意事项
 
-    public MyService(ExternalServiceClient client) {
-        this.client = client;
-    }
+1. 脚本幂等性
 
-    public Flux<Data> fetchData() {
-        return client.getData();
-    }
-}
-```
+确保SQL语句可重复执行（例如使用CREATE TABLE IF NOT EXISTS）。
 
----
+2. 执行顺序
 
-### 关键点说明
-1. **负载均衡策略**：
-   - 示例实现了简单的轮询策略（`RoundRobinLoadBalancer`）
-   - 可替换为随机策略、权重策略等
-   ```java
-   // 随机策略示例
-   public String getRandomInstance() {
-       return instances.get(ThreadLocalRandom.current().nextInt(instances.size()));
-   }
-   ```
+schema.sql在data.sql之前执行（如果存在数据初始化）。
 
-2. **故障处理增强**：
-   - 添加重试机制（使用 `retryWhen`）
-   - 实现健康检查（定期 ping 节点）
-   ```java
-   .filter((request, next) -> 
-        next.exchange(request)
-            .retryWhen(Retry.backoff(3, Duration.ofMillis(100)))
-   )
-   ```
+3. 多数据源
 
-3. **动态配置更新**：
-   - 使用 `@RefreshScope` 支持配置热更新
-   - 监听 `EnvironmentChangeEvent` 重新初始化节点列表
+自定义初始化时需为每个数据源单独配置。
 
----
+4. 生产环境
 
-### 备选方案：使用 Spring Cloud LoadBalancer
-如果第三方服务注册在服务发现中（如 Consul/Nacos），可直接使用 `@LoadBalanced`：
+考虑使用专业迁移工具（如Flyway或Liquibase）替代。
 
-```java
-@Bean
-@LoadBalanced
-public WebClient.Builder loadBalancedWebClientBuilder() {
-    return WebClient.builder();
-}
+完整示例schema.sql
 
-// 接口中使用 service-id
-@HttpExchange(url = "lb://SERVICE-NAME/api/data")
-public interface ExternalServiceClient {
-    // ...
-}
-```
+CREATE TABLE IF NOT EXISTS users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(50) NOT NULL UNIQUE,
+    email VARCHAR(100) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 
----
+CREATE TABLE IF NOT EXISTS orders (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT,
+    total DECIMAL(10,2),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
 
-### 总结
-通过以上方案，你可以：
-1. 动态轮询多个第三方服务节点
-2. 灵活扩展负载均衡策略
-3. 无缝集成 Spring WebFlux 的声明式 HTTP 客户端
-4. 支持故障转移和弹性处理
 
-实际生产中建议增加：
-- 请求超时配置
-- 断路器（Resilience4j）
-- 详细的监控指标
-- 节点健康检查机制
+选择适合项目需求的方式即可实现启动时自动建表。
