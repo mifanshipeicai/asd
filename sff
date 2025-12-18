@@ -1,83 +1,252 @@
-为了解决这个问题，我们需要将包含文件路径的实体列表按照文件大小进行分组，确保每组文件的总大小不超过100MB，同时处理单个文件超过100MB的情况。以下是详细的解决方案：
+在Spring Boot全局异常处理器中获取请求头中的request id，有以下几种实现方式：
 
-### 方法思路
-1. **初始化**：创建结果列表和临时列表来存储当前分组的实体和累计大小。
-2. **遍历实体列表**：对于每个实体，获取其文件大小。
-3. **处理大文件**：如果文件大小超过100MB，确保当前分组（如果有）被添加到结果中，然后将该大文件单独作为一组添加到结果中。
-4. **处理小文件**：如果文件大小未超过100MB，检查将其添加到当前分组是否会超过100MB。如果是，则将当前分组添加到结果中并新建分组；否则，将其添加到当前分组并更新累计大小。
-5. **处理剩余文件**：遍历结束后，将剩余的实体（如果有）作为最后一组添加到结果中。
+1. 通过 HttpServletRequest 获取（推荐）
 
-### 解决代码
-```java
-import java.io.File;
-import java.util.ArrayList;
-import java.util.List;
-
-public class GroupingService {
-
-    private static final long MB_100 = 100L * 1024 * 1024;
-
-    public List<List<Entity>> groupEntities(List<Entity> entityList) {
-        List<List<Entity>> result = new ArrayList<>();
-        List<Entity> currentGroup = new ArrayList<>();
-        long currentGroupSize = 0;
-
-        for (Entity entity : entityList) {
-            File file = new File(entity.getFilePath());
-            long fileSize = file.length();
-
-            if (fileSize >= MB_100) {
-                if (!currentGroup.isEmpty()) {
-                    result.add(currentGroup);
-                    currentGroup = new ArrayList<>();
-                    currentGroupSize = 0;
-                }
-                List<Entity> singleGroup = new ArrayList<>();
-                singleGroup.add(entity);
-                result.add(singleGroup);
-            } else {
-                if (currentGroupSize + fileSize >= MB_100) {
-                    result.add(currentGroup);
-                    currentGroup = new ArrayList<>();
-                    currentGroup.add(entity);
-                    currentGroupSize = fileSize;
-                } else {
-                    currentGroup.add(entity);
-                    currentGroupSize += fileSize;
-                }
-            }
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+    
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ErrorResponse> handleException(
+            Exception ex, 
+            HttpServletRequest request) {
+        
+        // 从请求头中获取 request id
+        String requestId = request.getHeader("X-Request-ID");
+        // 或者使用其他常见的 header 名称
+        // String requestId = request.getHeader("X-Request-Id");
+        // String requestId = request.getHeader("requestId");
+        
+        // 如果没有传递，可以生成一个默认的
+        if (StringUtils.isEmpty(requestId)) {
+            requestId = UUID.randomUUID().toString();
         }
-
-        if (!currentGroup.isEmpty()) {
-            result.add(currentGroup);
-        }
-
-        return result;
+        
+        // 记录日志，包含 request id
+        log.error("Request ID: {}, Error: {}", requestId, ex.getMessage(), ex);
+        
+        // 返回响应
+        ErrorResponse error = ErrorResponse.builder()
+                .requestId(requestId)
+                .timestamp(LocalDateTime.now())
+                .message(ex.getMessage())
+                .path(request.getRequestURI())
+                .build();
+        
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(error);
     }
+}
 
-    public static class Entity {
-        private String filePath;
 
-        public Entity(String filePath) {
-            this.filePath = filePath;
+2. 通过 @RequestHeader 注解获取
+
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+    
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ErrorResponse> handleException(
+            Exception ex,
+            @RequestHeader(value = "X-Request-ID", required = false) String requestId,
+            HttpServletRequest request) {
+        
+        if (StringUtils.isEmpty(requestId)) {
+            requestId = generateRequestId();
         }
+        
+        // 处理异常...
+        return buildErrorResponse(ex, requestId, request);
+    }
+}
 
-        public String getFilePath() {
-            return filePath;
+
+3. 通过 RequestContextHolder 获取（线程安全）
+
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+    
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ErrorResponse> handleException(Exception ex) {
+        
+        // 从当前请求上下文中获取
+        ServletRequestAttributes attributes = 
+            (ServletRequestAttributes) RequestContextHolder.getRequestAttributes();
+        
+        if (attributes != null) {
+            HttpServletRequest request = attributes.getRequest();
+            String requestId = request.getHeader("X-Request-ID");
+            
+            // 处理异常...
         }
+        
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+    }
+}
 
-        public void setFilePath(String filePath) {
-            this.filePath = filePath;
+
+4. 完整示例：带有日志追踪的全局异常处理
+
+@Slf4j
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+    
+    // 处理所有异常
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ApiError> handleAllExceptions(
+            Exception ex, 
+            WebRequest request) {
+        
+        // 获取 request id
+        String requestId = ((ServletRequestAttributes) 
+                RequestContextHolder.currentRequestAttributes())
+                .getRequest()
+                .getHeader("X-Request-ID");
+        
+        // 如果没有，从 MDC 中获取（如果使用了日志框架）
+        if (StringUtils.isEmpty(requestId)) {
+            requestId = MDC.get("requestId");
+        }
+        
+        // 如果还是没有，生成一个
+        if (StringUtils.isEmpty(requestId)) {
+            requestId = UUID.randomUUID().toString().substring(0, 8);
+        }
+        
+        // 记录带 request id 的日志
+        log.error("[RequestId: {}] 系统异常: {}", requestId, ex.getMessage(), ex);
+        
+        // 构建错误响应
+        ApiError apiError = ApiError.builder()
+                .requestId(requestId)
+                .timestamp(Instant.now())
+                .status(HttpStatus.INTERNAL_SERVER_ERROR.value())
+                .error("Internal Server Error")
+                .message("系统繁忙，请稍后重试")
+                .path(((ServletWebRequest) request).getRequest().getRequestURI())
+                .build();
+        
+        return new ResponseEntity<>(apiError, HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+    
+    // 处理业务异常
+    @ExceptionHandler(BusinessException.class)
+    public ResponseEntity<ApiError> handleBusinessException(
+            BusinessException ex, 
+            HttpServletRequest request) {
+        
+        String requestId = request.getHeader("X-Request-ID");
+        
+        log.warn("[RequestId: {}] 业务异常: {}", requestId, ex.getMessage());
+        
+        ApiError apiError = ApiError.builder()
+                .requestId(requestId)
+                .timestamp(Instant.now())
+                .status(ex.getCode())
+                .error("Business Error")
+                .message(ex.getMessage())
+                .path(request.getRequestURI())
+                .build();
+        
+        return new ResponseEntity<>(apiError, HttpStatus.BAD_REQUEST);
+    }
+}
+
+// 错误响应 DTO
+@Data
+@Builder
+@AllArgsConstructor
+@NoArgsConstructor
+class ApiError {
+    private String requestId;
+    private Instant timestamp;
+    private int status;
+    private String error;
+    private String message;
+    private String path;
+}
+
+
+5. 使用 Filter 或 Interceptor 预先处理 request id
+
+@Component
+public class RequestIdFilter extends OncePerRequestFilter {
+    
+    @Override
+    protected void doFilterInternal(
+            HttpServletRequest request, 
+            HttpServletResponse response, 
+            FilterChain filterChain) throws ServletException, IOException {
+        
+        // 获取或生成 request id
+        String requestId = request.getHeader("X-Request-ID");
+        if (StringUtils.isEmpty(requestId)) {
+            requestId = UUID.randomUUID().toString();
+        }
+        
+        // 设置到请求属性中，方便后续获取
+        request.setAttribute("requestId", requestId);
+        
+        // 设置到响应头
+        response.setHeader("X-Request-ID", requestId);
+        
+        // 设置到 MDC，用于日志追踪
+        MDC.put("requestId", requestId);
+        
+        try {
+            filterChain.doFilter(request, response);
+        } finally {
+            // 清除 MDC
+            MDC.clear();
         }
     }
 }
-```
 
-### 代码解释
-1. **常量定义**：`MB_100`常量表示100MB的字节数，用于比较文件大小。
-2. **分组逻辑**：
-   - **大文件处理**：当文件大小超过100MB时，当前分组（如果有）被添加到结果中，然后该大文件单独成组添加到结果中。
-   - **小文件处理**：检查当前分组累计大小加上当前文件大小是否超过100MB。如果是，则当前分组添加到结果中，并新建分组；否则，将文件添加到当前分组并更新累计大小。
-3. **剩余处理**：遍历结束后，确保最后的分组（如果有）被添加到结果中。
 
-这种方法确保文件被合理分组，满足每组总大小不超过100MB的要求，同时处理了大文件单独成组的情况。
+// 异常处理器中从请求属性获取
+@ExceptionHandler(Exception.class)
+public ResponseEntity<ApiError> handleException(
+        Exception ex, 
+        HttpServletRequest request) {
+    
+    String requestId = (String) request.getAttribute("requestId");
+    // ...
+}
+
+
+6. 使用 Spring Cloud Sleuth（分布式追踪）
+
+如果使用微服务架构，建议使用 Sleuth 自动生成 traceId：
+
+# application.yml
+spring:
+  sleuth:
+    enabled: true
+
+
+@ExceptionHandler(Exception.class)
+public ResponseEntity<ErrorResponse> handleException(Exception ex) {
+    // 自动注入 TraceId
+    String traceId = org.slf4j.MDC.get("traceId");
+    
+    log.error("TraceId: {}, Error: {}", traceId, ex.getMessage(), ex);
+    
+    return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+            .header("X-Trace-Id", traceId)
+            .body(new ErrorResponse(traceId, ex.getMessage()));
+}
+
+
+最佳实践建议：
+
+1. 统一命名：团队内统一定义 request id 的 header 名称，如 X-Request-ID
+
+2. 客户端传递：建议前端/客户端在请求时自动生成并传递 request id
+
+3. 服务端兜底：如果客户端未传递，服务端应自动生成
+
+4. 日志关联：将 request id 记录到所有相关日志中，便于问题追踪
+
+5. 响应头返回：在响应头中也返回 request id，方便客户端调试
+
+6. 异步处理：如果是异步处理，需要手动传递 request id 到子线程
+
+这样配置后，无论系统哪个地方发生异常，都能在全局异常处理器中获取到 request id，便于问题排查和日志追踪。
