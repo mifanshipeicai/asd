@@ -1,232 +1,827 @@
-在配置过滤器时，为了确保不影响流式传输功能，需要注意以下关键点和最佳实践：
+我来详细介绍Service层验证的设计，并展示几种常见的设计模式。
 
-### 7个关键注意事项
+一、Service层验证的必要性
 
-1. **避免响应包装器缓冲**
-   ```java
-   // ❌ 避免使用会缓冲响应的包装器
-   public class BadFilter implements Filter {
-       public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain) {
-           HttpServletResponse response = (HttpServletResponse) res;
-           // 此包装器会导致缓冲
-           chain.doFilter(req, new HttpServletResponseWrapper(response));
-       }
-   }
-   
-   // ✅ 直接使用原始响应
-   public class GoodFilter implements Filter {
-       public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain) {
-           chain.doFilter(req, res); // 直接传递原始响应
-       }
-   }
-   ```
+为什么需要Service层验证？
 
-2. **禁用压缩中间件**
-   ```java
-   // 在过滤器或配置中禁用压缩
-   public class CompressionDisableFilter implements Filter {
-       public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain) {
-           HttpServletResponse response = (HttpServletResponse) res;
-           response.setHeader("Content-Encoding", "identity"); // 禁用压缩
-           chain.doFilter(req, res);
-       }
-   }
-   ```
+1. 业务规则验证：复杂的业务逻辑验证
+2. 跨字段验证：涉及多个字段的关联验证
+3. 依赖数据的验证：需要查询数据库或其他服务的验证
+4. 幂等性验证：防止重复操作
+5. 状态机验证：业务流程状态校验
 
-3. **设置缓冲区大小**
-   ```java
-   public class BufferControlFilter implements Filter {
-       public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain) {
-           HttpServletResponse response = (HttpServletResponse) res;
-           // 设置较小的缓冲区（可选）
-           response.setBufferSize(1024 * 8); // 8KB
-           chain.doFilter(req, res);
-       }
-   }
-   ```
+二、Service层验证设计模式
 
-4. **正确处理异常**
-   ```java
-   public class ExceptionHandlingFilter implements Filter {
-       public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain) {
-           try {
-               chain.doFilter(req, res);
-           } catch (ClientAbortException e) {
-               // 客户端中断连接，无需处理
-               log.debug("Client aborted connection");
-           } catch (IOException e) {
-               log.error("Streaming error", e);
-           }
-       }
-   }
-   ```
-
-5. **避免内容修改**
-   ```java
-   // ❌ 禁止在过滤器中修改响应内容
-   public class BadModifyingFilter implements Filter {
-       public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain) {
-           chain.doFilter(req, res);
-           // 流结束后修改会导致问题
-           res.getOutputStream().write("Footer".getBytes());
-       }
-   }
-   ```
-
-6. **正确配置过滤器顺序**
-   ```java
-   @Configuration
-   public class FilterConfig {
-       @Bean
-       public FilterRegistrationBean<StreamSafeFilter> streamSafeFilter() {
-           FilterRegistrationBean<StreamSafeFilter> reg = new FilterRegistrationBean<>();
-           reg.setFilter(new StreamSafeFilter());
-           reg.setOrder(Ordered.HIGHEST_PRECEDENCE); // 设为最高优先级
-           return reg;
-       }
-   }
-   ```
-
-7. **跳过特定路径**
-   ```java
-   public class SkipStreamingFilter implements Filter {
-       public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain) {
-           HttpServletRequest request = (HttpServletRequest) req;
-           if (request.getRequestURI().contains("/stream-export")) {
-               // 直接放行流式端点
-               chain.doFilter(req, res);
-           } else {
-               // 其他请求的正常处理
-               handleNormalRequest(req, res, chain);
-           }
-       }
-   }
-   ```
-
-### 推荐的安全过滤器配置
+1. 领域驱动设计（DDD）验证模式
 
 ```java
-public class StreamingSafeFilter implements Filter {
+// service/validator/BusinessValidator.java
+@Component
+@Slf4j
+public class BusinessValidator {
     
-    @Override
-    public void doFilter(ServletRequest request, ServletResponse response, 
-                         FilterChain chain) throws IOException, ServletException {
+    /**
+     * 验证订单创建
+     */
+    public void validateOrderCreation(OrderCreateRequest request, 
+                                     Customer customer, 
+                                     List<Product> products) {
         
-        HttpServletResponse httpResponse = (HttpServletResponse) response;
+        // 1. 基础验证（与Controller层验证互补）
+        validateRequest(request);
         
-        // 1. 禁用压缩
-        httpResponse.setHeader("Content-Encoding", "identity");
+        // 2. 客户状态验证
+        validateCustomer(customer);
         
-        // 2. 设置缓冲区大小（可选）
-        httpResponse.setBufferSize(1024 * 16); // 16KB
+        // 3. 商品库存验证
+        validateProducts(products, request.getItems());
         
-        // 3. 直接传递原始响应
-        chain.doFilter(request, response);
+        // 4. 支付方式验证
+        validatePaymentMethod(request.getPaymentMethod(), customer);
         
-        // 4. 确保不添加尾部内容
+        // 5. 业务规则验证（如促销活动）
+        validateBusinessRules(request, customer, products);
     }
     
-    @Override
-    public void destroy() {
-        // 清理资源
+    private void validateRequest(OrderCreateRequest request) {
+        if (request.getItems() == null || request.getItems().isEmpty()) {
+            throw new BusinessException("订单商品不能为空", ErrorCode.ORDER_ITEMS_EMPTY);
+        }
+        
+        if (request.getTotalAmount() == null || 
+            request.getTotalAmount().compareTo(BigDecimal.ZERO) <= 0) {
+            throw new BusinessException("订单金额必须大于0", ErrorCode.ORDER_AMOUNT_INVALID);
+        }
+    }
+    
+    private void validateCustomer(Customer customer) {
+        if (customer.getStatus() != CustomerStatus.ACTIVE) {
+            throw new BusinessException("客户状态异常，无法下单", 
+                ErrorCode.CUSTOMER_STATUS_INVALID);
+        }
+        
+        if (customer.getCreditScore() < 60) {
+            throw new BusinessException("客户信用分不足，无法下单", 
+                ErrorCode.CUSTOMER_CREDIT_INSUFFICIENT);
+        }
+    }
+    
+    private void validateProducts(List<Product> products, List<OrderItemRequest> items) {
+        // 构建商品ID到库存的映射
+        Map<Long, Integer> productStockMap = products.stream()
+            .collect(Collectors.toMap(
+                Product::getId,
+                Product::getStock
+            ));
+        
+        // 验证每个商品
+        for (OrderItemRequest item : items) {
+            Integer stock = productStockMap.get(item.getProductId());
+            if (stock == null) {
+                throw new BusinessException(
+                    String.format("商品ID %d 不存在", item.getProductId()),
+                    ErrorCode.PRODUCT_NOT_FOUND
+                );
+            }
+            
+            if (stock < item.getQuantity()) {
+                throw new BusinessException(
+                    String.format("商品 %s 库存不足，当前库存: %d", 
+                        item.getProductName(), stock),
+                    ErrorCode.PRODUCT_STOCK_INSUFFICIENT
+                );
+            }
+        }
+    }
+    
+    private void validatePaymentMethod(PaymentMethod paymentMethod, Customer customer) {
+        // 根据支付方式验证
+        switch (paymentMethod.getType()) {
+            case CREDIT_CARD:
+                validateCreditCard(paymentMethod.getCardInfo(), customer);
+                break;
+            case PAYPAL:
+                validatePaypalAccount(paymentMethod.getPaypalAccount());
+                break;
+            case BANK_TRANSFER:
+                validateBankAccount(paymentMethod.getBankAccount());
+                break;
+            default:
+                throw new BusinessException("不支持的支付方式", 
+                    ErrorCode.PAYMENT_METHOD_UNSUPPORTED);
+        }
+    }
+    
+    private void validateBusinessRules(OrderCreateRequest request, 
+                                     Customer customer, 
+                                     List<Product> products) {
+        // 复杂的业务规则验证
+        validateOrderLimit(customer, request.getTotalAmount());
+        validatePromotionRules(request, customer);
+        validateShippingRules(request, products);
+    }
+    
+    /**
+     * 验证用户订单限制（每日/每月限额）
+     */
+    private void validateOrderLimit(Customer customer, BigDecimal orderAmount) {
+        // 查询今日已下单金额
+        BigDecimal todayOrderAmount = orderRepository
+            .sumAmountByCustomerAndDate(customer.getId(), LocalDate.now());
+        
+        // 验证每日限额
+        BigDecimal dailyLimit = customer.getDailyOrderLimit();
+        if (dailyLimit != null) {
+            BigDecimal total = todayOrderAmount.add(orderAmount);
+            if (total.compareTo(dailyLimit) > 0) {
+                throw new BusinessException(
+                    String.format("超过每日订单限额 %.2f，今日已下单: %.2f", 
+                        dailyLimit, todayOrderAmount),
+                    ErrorCode.ORDER_DAILY_LIMIT_EXCEEDED
+                );
+            }
+        }
     }
 }
 ```
 
-### 需要特别注意的过滤器类型
-
-以下类型的过滤器最容易破坏流式传输：
-
-1. **压缩过滤器** (如GzipFilter)
-   - 解决方案：排除流式端点或禁用压缩
-
-2. **缓存过滤器** (如CacheControlFilter)
-   - 解决方案：设置`Cache-Control: no-store`
-
-3. **安全头过滤器** (如添加CORS、XSS保护)
-   - 解决方案：提前设置安全头，避免包装响应
-
-4. **审计/日志过滤器**
-   - 解决方案：避免读取响应体内容
-
-5. **响应修改过滤器**
-   - 解决方案：完全避免对流式响应进行修改
-
-### 测试过滤器是否影响流式传输
-
-使用此测试方法验证过滤器配置：
+2. 验证器接口模式
 
 ```java
-@Test
-void testFilterWithStreaming() throws Exception {
-    // 模拟带过滤器的请求
-    MvcResult result = mockMvc.perform(get("/stream-export"))
-        .andExpect(request().asyncStarted()) // 验证异步启动
-        .andReturn();
+// service/validator/ValidationRule.java
+@FunctionalInterface
+public interface ValidationRule<T> {
+    ValidationResult validate(T context);
     
-    // 获取响应内容
-    byte[] content = result.getResponse().getContentAsByteArray();
+    default ValidationRule<T> and(ValidationRule<T> other) {
+        return context -> {
+            ValidationResult result1 = this.validate(context);
+            if (!result1.isValid()) {
+                return result1;
+            }
+            return other.validate(context);
+        };
+    }
     
-    // 验证流式特性
-    assertTrue(content.length > 0, "响应内容为空");
-    assertTrue(content.length < 500, "响应过度缓冲"); 
+    default ValidationRule<T> or(ValidationRule<T> other) {
+        return context -> {
+            ValidationResult result1 = this.validate(context);
+            if (result1.isValid()) {
+                return result1;
+            }
+            return other.validate(context);
+        };
+    }
+}
+
+// service/validator/ValidationResult.java
+public class ValidationResult {
+    private final boolean valid;
+    private final String errorCode;
+    private final String errorMessage;
+    private final Map<String, Object> context;
     
-    // 验证内存使用
-    long usedMemory = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
-    assertTrue(usedMemory < 10 * 1024 * 1024, "内存使用过高: " + usedMemory / 1024 / 1024 + "MB");
+    public static ValidationResult valid() {
+        return new ValidationResult(true, null, null, Map.of());
+    }
+    
+    public static ValidationResult invalid(String errorCode, String errorMessage) {
+        return new ValidationResult(false, errorCode, errorMessage, Map.of());
+    }
+    
+    public static ValidationResult invalid(String errorCode, 
+                                          String errorMessage,
+                                          Map<String, Object> context) {
+        return new ValidationResult(false, errorCode, errorMessage, context);
+    }
+    
+    // 构造函数、getters省略
+    
+    public void throwIfInvalid() {
+        if (!valid) {
+            throw new BusinessException(errorMessage, errorCode);
+        }
+    }
+}
+
+// service/validator/OrderValidationRules.java
+@Component
+public class OrderValidationRules {
+    
+    private final OrderRepository orderRepository;
+    private final ProductService productService;
+    private final CustomerService customerService;
+    
+    // 定义各个验证规则
+    public ValidationRule<OrderCreateContext> customerStatusRule() {
+        return context -> {
+            Customer customer = context.getCustomer();
+            if (customer.getStatus() != CustomerStatus.ACTIVE) {
+                return ValidationResult.invalid(
+                    "CUSTOMER_INACTIVE",
+                    "客户状态不活跃，无法下单"
+                );
+            }
+            return ValidationResult.valid();
+        };
+    }
+    
+    public ValidationRule<OrderCreateContext> creditScoreRule() {
+        return context -> {
+            Customer customer = context.getCustomer();
+            if (customer.getCreditScore() < 60) {
+                return ValidationResult.invalid(
+                    "CREDIT_SCORE_LOW",
+                    "客户信用分不足"
+                );
+            }
+            return ValidationResult.valid();
+        };
+    }
+    
+    public ValidationRule<OrderCreateContext> stockRule() {
+        return context -> {
+            List<OrderItemRequest> items = context.getRequest().getItems();
+            List<Long> productIds = items.stream()
+                .map(OrderItemRequest::getProductId)
+                .collect(Collectors.toList());
+            
+            Map<Long, Product> productMap = productService.getProductsByIds(productIds);
+            
+            for (OrderItemRequest item : items) {
+                Product product = productMap.get(item.getProductId());
+                if (product == null) {
+                    return ValidationResult.invalid(
+                        "PRODUCT_NOT_FOUND",
+                        String.format("商品 %d 不存在", item.getProductId())
+                    );
+                }
+                
+                if (product.getStock() < item.getQuantity()) {
+                    return ValidationResult.invalid(
+                        "INSUFFICIENT_STOCK",
+                        String.format("商品 %s 库存不足", product.getName()),
+                        Map.of("productId", product.getId(), 
+                               "required", item.getQuantity(),
+                               "available", product.getStock())
+                    );
+                }
+            }
+            return ValidationResult.valid();
+        };
+    }
+    
+    public ValidationRule<OrderCreateContext> dailyLimitRule() {
+        return context -> {
+            Customer customer = context.getCustomer();
+            BigDecimal orderAmount = context.getRequest().getTotalAmount();
+            
+            BigDecimal todayTotal = orderRepository
+                .sumAmountByCustomerAndDate(customer.getId(), LocalDate.now());
+            BigDecimal dailyLimit = customer.getDailyOrderLimit();
+            
+            if (dailyLimit != null) {
+                BigDecimal projectedTotal = todayTotal.add(orderAmount);
+                if (projectedTotal.compareTo(dailyLimit) > 0) {
+                    return ValidationResult.invalid(
+                        "DAILY_LIMIT_EXCEEDED",
+                        "超过每日订单限额",
+                        Map.of("dailyLimit", dailyLimit,
+                               "todayTotal", todayTotal,
+                               "orderAmount", orderAmount)
+                    );
+                }
+            }
+            return ValidationResult.valid();
+        };
+    }
+    
+    // 组合验证规则
+    public ValidationRule<OrderCreateContext> validateOrderCreation() {
+        return customerStatusRule()
+            .and(creditScoreRule())
+            .and(stockRule())
+            .and(dailyLimitRule());
+    }
+}
+
+// 使用示例
+@Service
+@Transactional
+@Slf4j
+public class OrderService {
+    
+    private final OrderValidationRules validationRules;
+    private final OrderRepository orderRepository;
+    
+    public OrderResponse createOrder(OrderCreateRequest request) {
+        // 准备验证上下文
+        Customer customer = customerService.getCustomer(request.getCustomerId());
+        OrderCreateContext context = new OrderCreateContext(request, customer);
+        
+        // 执行验证
+        ValidationResult result = validationRules.validateOrderCreation().validate(context);
+        result.throwIfInvalid();
+        
+        // 验证通过，执行业务逻辑
+        return createOrderInternal(request, customer);
+    }
 }
 ```
 
-### 生产环境建议
+3. 注解式验证（扩展JSR-380）
 
-1. **使用专用端点前缀**
-   ```java
-   // 所有流式端点使用特定前缀
-   @GetMapping("/streaming/export")
-   public void exportStream(...) { ... }
-   ```
+```java
+// service/validator/annotation/BusinessValid.java
+@Target({ElementType.METHOD, ElementType.PARAMETER})
+@Retention(RetentionPolicy.RUNTIME)
+public @interface BusinessValid {
+    Class<? extends BusinessValidator>[] value() default {};
+}
 
-2. **配置全局过滤器排除**
-   ```java
-   @Configuration
-   public class WebConfig implements WebMvcConfigurer {
-       @Override
-       public void addInterceptors(InterceptorRegistry registry) {
-           registry.addInterceptor(new LoggingInterceptor())
-                   .excludePathPatterns("/streaming/**");
-       }
-   }
-   ```
+// service/validator/annotation/ValidStock.java
+@Target({ElementType.PARAMETER, ElementType.FIELD})
+@Retention(RetentionPolicy.RUNTIME)
+@Constraint(validatedBy = StockValidator.class)
+public @interface ValidStock {
+    String message() default "库存不足";
+    Class<?>[] groups() default {};
+    Class<? extends Payload>[] payload() default {};
+    
+    // 自定义属性
+    String productField() default "productId";
+    String quantityField() default "quantity";
+}
 
-3. **监控流式传输**
-   ```java
-   public class MonitoringFilter implements Filter {
-       public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain) {
-           long start = System.currentTimeMillis();
-           chain.doFilter(req, res);
-           long duration = System.currentTimeMillis() - start;
-           
-           // 记录流式请求的持续时间
-           if (((HttpServletRequest)req).getRequestURI().contains("/streaming")) {
-               metrics.recordStreamingDuration(duration);
-           }
-       }
-   }
-   ```
+// service/validator/annotation/validator/StockValidator.java
+@Component
+public class StockValidator implements ConstraintValidator<ValidStock, Object> {
+    
+    @Autowired
+    private ProductService productService;
+    
+    private String productField;
+    private String quantityField;
+    
+    @Override
+    public void initialize(ValidStock constraintAnnotation) {
+        this.productField = constraintAnnotation.productField();
+        this.quantityField = constraintAnnotation.quantityField();
+    }
+    
+    @Override
+    public boolean isValid(Object value, ConstraintValidatorContext context) {
+        if (value == null) {
+            return true;
+        }
+        
+        try {
+            // 使用反射获取字段值
+            BeanWrapper wrapper = PropertyAccessorFactory.forBeanPropertyAccess(value);
+            Long productId = (Long) wrapper.getPropertyValue(productField);
+            Integer quantity = (Integer) wrapper.getPropertyValue(quantityField);
+            
+            if (productId == null || quantity == null) {
+                return true; // 让其他验证器处理空值
+            }
+            
+            Product product = productService.getProductById(productId);
+            return product != null && product.getStock() >= quantity;
+            
+        } catch (Exception e) {
+            log.error("Stock validation error", e);
+            return false;
+        }
+    }
+}
 
-4. **Nginx/Apache配置**
-   ```nginx
-   location ~ ^/streaming {
-       # 禁用代理缓冲
-       proxy_buffering off;
-       
-       # 保持连接活跃
-       proxy_http_version 1.1;
-       proxy_set_header Connection "";
-       
-       # 增加超时时间
-       proxy_read_timeout 600s;
-   }
-   ```
+// service/validator/annotation/ValidCustomerStatus.java
+@Target({ElementType.PARAMETER})
+@Retention(RetentionPolicy.RUNTIME)
+@Constraint(validatedBy = CustomerStatusValidator.class)
+public @interface ValidCustomerStatus {
+    String message() default "客户状态无效";
+    Class<?>[] groups() default {};
+    Class<? extends Payload>[] payload() default {};
+    
+    CustomerStatus[] allowed() default {CustomerStatus.ACTIVE};
+}
 
-通过遵循这些实践，您可以确保过滤器不会干扰流式传输，同时保持应用程序的安全性和功能性。始终在类似生产的环境中进行测试，以验证真实数据量下的性能表现。
+// 在DTO中使用
+public class OrderCreateRequest {
+    
+    @NotNull
+    @ValidCustomerStatus
+    private Long customerId;
+    
+    @NotNull
+    private BigDecimal totalAmount;
+    
+    @Valid
+    @NotEmpty
+    private List<@ValidStock OrderItemRequest> items;
+    
+    // getters/setters
+}
+
+// service/validator/annotation/OrderBusinessValidator.java
+@Component
+public class OrderBusinessValidator implements BusinessValidator<OrderCreateRequest> {
+    
+    @Override
+    public void validate(OrderCreateRequest request) {
+        // 复杂的业务验证逻辑
+        validateOrderAmount(request);
+        validatePaymentTerms(request);
+        validateShippingAddress(request);
+    }
+    
+    private void validateOrderAmount(OrderCreateRequest request) {
+        BigDecimal calculatedAmount = calculateOrderAmount(request.getItems());
+        if (request.getTotalAmount().compareTo(calculatedAmount) != 0) {
+            throw new BusinessException("订单金额计算错误", ErrorCode.ORDER_AMOUNT_MISMATCH);
+        }
+    }
+    
+    private BigDecimal calculateOrderAmount(List<OrderItemRequest> items) {
+        return items.stream()
+            .map(item -> item.getUnitPrice().multiply(BigDecimal.valueOf(item.getQuantity())))
+            .reduce(BigDecimal.ZERO, BigDecimal::add);
+    }
+}
+
+// AOP切面处理业务验证
+@Aspect
+@Component
+@Slf4j
+public class BusinessValidationAspect {
+    
+    private final ApplicationContext applicationContext;
+    
+    @Around("@annotation(businessValid)")
+    public Object validate(ProceedingJoinPoint joinPoint, BusinessValid businessValid) 
+            throws Throwable {
+        
+        // 获取参数
+        Object[] args = joinPoint.getArgs();
+        
+        // 执行所有验证器
+        for (Class<? extends BusinessValidator> validatorClass : businessValid.value()) {
+            BusinessValidator validator = applicationContext.getBean(validatorClass);
+            for (Object arg : args) {
+                if (validator.supports(arg)) {
+                    validator.validate(arg);
+                }
+            }
+        }
+        
+        return joinPoint.proceed();
+    }
+}
+
+// 在Service中使用
+@Service
+@Slf4j
+public class OrderService {
+    
+    @BusinessValid(OrderBusinessValidator.class)
+    public OrderResponse createOrder(@Valid OrderCreateRequest request) {
+        // 这里不需要写验证代码，全部由切面处理
+        return createOrderInternal(request);
+    }
+}
+```
+
+4. 验证链模式（责任链模式）
+
+```java
+// service/validator/chain/ValidationChain.java
+@Component
+public class ValidationChain {
+    
+    private final List<Validator> validators;
+    
+    @Autowired
+    public ValidationChain(List<Validator> validators) {
+        // 按照@Order注解排序
+        this.validators = validators.stream()
+            .sorted(Comparator.comparingInt(v -> {
+                Order order = v.getClass().getAnnotation(Order.class);
+                return order != null ? order.value() : Integer.MAX_VALUE;
+            }))
+            .collect(Collectors.toList());
+    }
+    
+    public ValidationResult validate(Object target) {
+        ValidationContext context = new ValidationContext(target);
+        
+        for (Validator validator : validators) {
+            if (validator.supports(target)) {
+                ValidationResult result = validator.validate(context);
+                if (!result.isValid()) {
+                    return result;
+                }
+            }
+        }
+        
+        return ValidationResult.valid();
+    }
+}
+
+// service/validator/chain/Validator.java
+public interface Validator {
+    boolean supports(Object target);
+    ValidationResult validate(ValidationContext context);
+}
+
+// service/validator/chain/BaseValidator.java
+public abstract class BaseValidator<T> implements Validator {
+    
+    @Override
+    public boolean supports(Object target) {
+        return getSupportedClass().isInstance(target);
+    }
+    
+    @Override
+    @SuppressWarnings("unchecked")
+    public ValidationResult validate(ValidationContext context) {
+        return doValidate((T) context.getTarget(), context);
+    }
+    
+    protected abstract Class<T> getSupportedClass();
+    protected abstract ValidationResult doValidate(T target, ValidationContext context);
+}
+
+// service/validator/chain/OrderCreateValidator.java
+@Component
+@Order(10)
+public class OrderCreateValidator extends BaseValidator<OrderCreateRequest> {
+    
+    @Override
+    protected Class<OrderCreateRequest> getSupportedClass() {
+        return OrderCreateRequest.class;
+    }
+    
+    @Override
+    protected ValidationResult doValidate(OrderCreateRequest request, 
+                                        ValidationContext context) {
+        // 验证订单项
+        if (request.getItems() == null || request.getItems().isEmpty()) {
+            return ValidationResult.invalid("ORDER_ITEMS_EMPTY", "订单商品不能为空");
+        }
+        
+        // 验证金额
+        if (request.getTotalAmount() == null || 
+            request.getTotalAmount().compareTo(BigDecimal.ZERO) <= 0) {
+            return ValidationResult.invalid("ORDER_AMOUNT_INVALID", "订单金额无效");
+        }
+        
+        // 可以添加更多验证逻辑
+        return ValidationResult.valid();
+    }
+}
+
+// service/validator/chain/CustomerValidator.java
+@Component
+@Order(20)
+public class CustomerValidator extends BaseValidator<OrderCreateRequest> {
+    
+    @Autowired
+    private CustomerRepository customerRepository;
+    
+    @Override
+    protected Class<OrderCreateRequest> getSupportedClass() {
+        return OrderCreateRequest.class;
+    }
+    
+    @Override
+    protected ValidationResult doValidate(OrderCreateRequest request, 
+                                        ValidationContext context) {
+        // 从缓存或上下文中获取客户信息
+        Customer customer = (Customer) context.getAttribute("customer");
+        if (customer == null) {
+            customer = customerRepository.findById(request.getCustomerId())
+                .orElseThrow(() -> new BusinessException("客户不存在", ErrorCode.CUSTOMER_NOT_FOUND));
+            context.setAttribute("customer", customer);
+        }
+        
+        // 验证客户状态
+        if (customer.getStatus() != CustomerStatus.ACTIVE) {
+            return ValidationResult.invalid("CUSTOMER_INACTIVE", "客户状态不活跃");
+        }
+        
+        return ValidationResult.valid();
+    }
+}
+
+// 使用验证链
+@Service
+public class OrderService {
+    
+    private final ValidationChain validationChain;
+    
+    public OrderResponse createOrder(OrderCreateRequest request) {
+        // 执行验证链
+        ValidationResult result = validationChain.validate(request);
+        result.throwIfInvalid();
+        
+        // 执行业务逻辑
+        return createOrderInternal(request);
+    }
+}
+```
+
+5. 验证组模式（分组验证）
+
+```java
+// service/validator/group/ValidationGroup.java
+public interface ValidationGroup {
+    
+    // 创建时的验证组
+    interface Create {}
+    
+    // 更新时的验证组
+    interface Update {}
+    
+    // 删除时的验证组
+    interface Delete {}
+    
+    // 特定业务的验证组
+    interface PaymentValidation {}
+    interface ShippingValidation {}
+}
+
+// 在DTO中使用分组
+public class OrderRequest {
+    
+    @NotNull(groups = {Create.class, Update.class})
+    private Long id;
+    
+    @NotNull(groups = Create.class)
+    @Size(min = 1, groups = Create.class)
+    private List<OrderItemRequest> items;
+    
+    @NotNull(groups = {Create.class, PaymentValidation.class})
+    private PaymentMethod paymentMethod;
+    
+    @NotNull(groups = {Create.class, ShippingValidation.class})
+    private Address shippingAddress;
+}
+
+// 分组验证服务
+@Service
+public class GroupValidationService {
+    
+    private final Validator validator;
+    
+    public GroupValidationService(Validator validator) {
+        this.validator = validator;
+    }
+    
+    public void validateForCreate(OrderRequest request) {
+        validate(request, Create.class);
+    }
+    
+    public void validateForUpdate(OrderRequest request) {
+        validate(request, Update.class);
+    }
+    
+    public void validateForPayment(OrderRequest request) {
+        validate(request, Create.class, PaymentValidation.class);
+    }
+    
+    public void validateForShipping(OrderRequest request) {
+        validate(request, Create.class, ShippingValidation.class);
+    }
+    
+    private void validate(Object target, Class<?>... groups) {
+        Set<ConstraintViolation<Object>> violations = 
+            validator.validate(target, groups);
+        
+        if (!violations.isEmpty()) {
+            String message = violations.stream()
+                .map(ConstraintViolation::getMessage)
+                .collect(Collectors.joining(", "));
+            throw new BusinessException(message, ErrorCode.VALIDATION_ERROR);
+        }
+    }
+}
+```
+
+三、最佳实践建议
+
+1. 验证分层
+
+```java
+public class OrderService {
+    
+    // 第一层：基础数据验证（Controller层已完成）
+    @Validated
+    public OrderResponse createOrder(@Valid OrderCreateRequest request) {
+        // 第二层：业务规则验证
+        validateBusinessRules(request);
+        
+        // 第三层：状态机验证
+        validateStateTransition(request);
+        
+        // 第四层：依赖数据验证
+        validateDependencies(request);
+        
+        return executeBusinessLogic(request);
+    }
+}
+```
+
+2. 验证工具类
+
+```java
+// service/validator/util/ValidationUtils.java
+@Component
+@Slf4j
+public class ValidationUtils {
+    
+    /**
+     * 验证并收集所有错误（不立即抛出异常）
+     */
+    public static <T> ValidationResult validateAll(
+            List<ValidationRule<T>> rules, T context) {
+        
+        List<String> errors = new ArrayList<>();
+        Map<String, Object> errorDetails = new HashMap<>();
+        
+        for (ValidationRule<T> rule : rules) {
+            ValidationResult result = rule.validate(context);
+            if (!result.isValid()) {
+                errors.add(result.getErrorMessage());
+                errorDetails.put(result.getErrorCode(), result.getContext());
+            }
+        }
+        
+        if (!errors.isEmpty()) {
+            return ValidationResult.invalid(
+                "MULTIPLE_VALIDATION_ERRORS",
+                String.join("; ", errors),
+                errorDetails
+            );
+        }
+        
+        return ValidationResult.valid();
+    }
+    
+    /**
+     * 条件验证
+     */
+    public static ValidationResult conditionalValidate(
+            boolean condition, 
+            Supplier<ValidationResult> validator) {
+        
+        return condition ? validator.get() : ValidationResult.valid();
+    }
+    
+    /**
+     * 异步验证（适用于需要调用外部服务的验证）
+     */
+    public static CompletableFuture<ValidationResult> asyncValidate(
+            Supplier<ValidationResult> validator,
+            Executor executor) {
+        
+        return CompletableFuture.supplyAsync(validator, executor);
+    }
+}
+```
+
+3. 验证配置化
+
+```yaml
+# validation-rules.yml
+validation:
+  order:
+    daily-limit:
+      enabled: true
+      limit: 10000.00
+      message: "每日订单限额为 {limit}"
+    
+    credit-check:
+      enabled: true
+      min-score: 60
+      message: "信用分不足 {score}，最低要求 {minScore}"
+    
+    stock-check:
+      enabled: true
+      strategy: optimistic  # optimistic/pessimistic
+```
+
+四、总结
+
+Service层验证的关键点：
+
+1. 分离关注点：验证逻辑与业务逻辑分离
+2. 可测试性：验证器应该容易进行单元测试
+3. 可重用性：验证规则可以在多个服务中重用
+4. 可配置性：验证规则可以外部配置
+5. 可扩展性：容易添加新的验证规则
+6. 性能考虑：避免不必要的数据库查询，使用缓存
+7. 错误信息友好：提供清晰、可操作的错误信息
+8. 国际化支持：错误消息支持多语言
+
+选择哪种模式取决于项目的复杂度和团队偏好。对于中小型项目，简单的验证器类就足够了；对于大型复杂系统，建议使用验证链或DDD模式。
