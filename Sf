@@ -1,231 +1,752 @@
-在Spring Boot中整合Prometheus并自定义指标记录用户查询的JSON和查询时间，可以通过以下步骤实现。这里使用Micrometer作为指标收集库，它是Spring Boot Actuator的默认指标工具。
+我将为您详细设计一个基于Java 17和Spring Boot 3.x的Web工程，考虑到当前Spring Boot最新版本是3.2.x，我将以此为基础进行设计。
 
----
+一、整体架构设计要点
 
-### 1. 添加依赖
-在`pom.xml`中添加依赖：
+1. 分层架构设计
+
+```java
+// 项目结构示例
+src/main/java/com/example/demo/
+├── config/              // 配置类
+├── controller/          // 控制器层
+│   ├── api/v1/         // API版本管理
+│   └── api/v2/
+├── service/            // 业务层
+│   ├── impl/          // 实现类
+│   └── validator/     // 业务验证
+├── repository/         // 数据访问层
+│   ├── entity/        // JPA实体
+│   └── dao/           // 自定义DAO
+├── dto/               // 数据传输对象
+│   ├── request/       // 请求DTO
+│   └── response/      // 响应DTO
+├── model/             // 领域模型
+├── exception/         // 异常处理
+├── aspect/            // AOP切面
+├── interceptor/       // 拦截器
+├── filter/            // 过滤器
+├── util/              // 工具类
+├── security/          // 安全配置
+└── DemoApplication.java
+```
+
+2. 核心依赖配置（pom.xml）
+
 ```xml
-<dependencies>
-    <!-- Spring Boot Actuator + Prometheus -->
-    <dependency>
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+    <modelVersion>4.0.0</modelVersion>
+    
+    <parent>
         <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-starter-actuator</artifactId>
-    </dependency>
-    <dependency>
-        <groupId>io.micrometer</groupId>
-        <artifactId>micrometer-registry-prometheus</artifactId>
-    </dependency>
-</dependencies>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.2.0</version>
+    </parent>
+    
+    <groupId>com.example</groupId>
+    <artifactId>demo-web</artifactId>
+    <version>1.0.0</version>
+    
+    <properties>
+        <java.version>17</java.version>
+        <mapstruct.version>1.5.5.Final</mapstruct.version>
+        <jjwt.version>0.12.3</jjwt.version>
+    </properties>
+    
+    <dependencies>
+        <!-- Web Starter -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        
+        <!-- Validation -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+        
+        <!-- Security -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security</artifactId>
+        </dependency>
+        
+        <!-- Data JPA -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+        
+        <!-- Database -->
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        
+        <!-- Redis -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+        
+        <!-- Cache -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-cache</artifactId>
+        </dependency>
+        
+        <!-- MapStruct -->
+        <dependency>
+            <groupId>org.mapstruct</groupId>
+            <artifactId>mapstruct</artifactId>
+            <version>${mapstruct.version}</version>
+        </dependency>
+        
+        <!-- JWT -->
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-api</artifactId>
+            <version>${jjwt.version}</version>
+        </dependency>
+        
+        <!-- Documentation -->
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+            <version>2.3.0</version>
+        </dependency>
+        
+        <!-- Monitoring -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        
+        <!-- Test -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+    
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.mapstruct</groupId>
+                            <artifactId>mapstruct-processor</artifactId>
+                            <version>${mapstruct.version}</version>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
 ```
 
----
+二、详细设计实现
 
-### 2. 配置Prometheus端点
-在`application.properties`中启用Prometheus端点：
-```properties
-# 暴露Prometheus指标端点
-management.endpoints.web.exposure.include=prometheus
-# 启用指标自动配置
-management.metrics.enable.all=true
-```
+1. 统一响应结构设计
 
----
-
-### 3. 自定义指标记录查询信息
-#### 方案一：使用AOP拦截查询请求（推荐）
-**步骤：**
-1. 创建自定义注解`@TrackQuery`
-2. 实现AOP切面记录指标
-3. 在Controller方法上添加注解
-
-**代码实现：**
-
-##### (1) 创建注解
 ```java
-import java.lang.annotation.ElementType;
-import java.lang.annotation.Retention;
-import java.lang.annotation.RetentionPolicy;
-import java.lang.annotation.Target;
+// dto/response/ApiResponse.java
+public record ApiResponse<T>(
+    int code,
+    String message,
+    T data,
+    long timestamp
+) {
+    public static <T> ApiResponse<T> success(T data) {
+        return new ApiResponse<>(200, "success", data, System.currentTimeMillis());
+    }
+    
+    public static <T> ApiResponse<T> error(int code, String message) {
+        return new ApiResponse<>(code, message, null, System.currentTimeMillis());
+    }
+}
 
-@Target(ElementType.METHOD)
-@Retention(RetentionPolicy.RUNTIME)
-public @interface TrackQuery {}
+// dto/response/PageResponse.java
+public record PageResponse<T>(
+    List<T> content,
+    int page,
+    int size,
+    long totalElements,
+    int totalPages
+) {
+    public static <T> PageResponse<T> of(Page<T> page) {
+        return new PageResponse<>(
+            page.getContent(),
+            page.getNumber(),
+            page.getSize(),
+            page.getTotalElements(),
+            page.getTotalPages()
+        );
+    }
+}
 ```
 
-##### (2) 实现AOP切面
+2. 全局异常处理
+
 ```java
-import io.micrometer.core.instrument.MeterRegistry;
-import io.micrometer.core.instrument.Timer;
-import org.aspectj.lang.ProceedingJoinPoint;
-import org.aspectj.lang.annotation.Around;
-import org.aspectj.lang.annotation.Aspect;
-import org.springframework.stereotype.Component;
-import org.springframework.util.StopWatch;
+// exception/GlobalExceptionHandler.java
+@RestControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+    
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<ApiResponse<Void>> handleValidationException(
+            MethodArgumentNotValidException ex) {
+        String message = ex.getBindingResult()
+            .getFieldErrors()
+            .stream()
+            .map(FieldError::getDefaultMessage)
+            .collect(Collectors.joining(", "));
+        
+        return ResponseEntity.badRequest()
+            .body(ApiResponse.error(400, message));
+    }
+    
+    @ExceptionHandler(BusinessException.class)
+    public ResponseEntity<ApiResponse<Void>> handleBusinessException(
+            BusinessException ex) {
+        log.error("Business exception: ", ex);
+        return ResponseEntity.status(ex.getStatus())
+            .body(ApiResponse.error(ex.getCode(), ex.getMessage()));
+    }
+    
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ApiResponse<Void>> handleException(Exception ex) {
+        log.error("Unexpected error: ", ex);
+        return ResponseEntity.internalServerError()
+            .body(ApiResponse.error(500, "Internal server error"));
+    }
+}
 
-import java.util.concurrent.TimeUnit;
+// exception/BusinessException.java
+public class BusinessException extends RuntimeException {
+    private final int code;
+    private final HttpStatus status;
+    
+    public BusinessException(String message, int code, HttpStatus status) {
+        super(message);
+        this.code = code;
+        this.status = status;
+    }
+    
+    // Getters
+}
+```
 
-@Aspect
+3. 实体与DTO设计
+
+```java
+// entity/BaseEntity.java
+@MappedSuperclass
+@EntityListeners(AuditingEntityListener.class)
+public abstract class BaseEntity {
+    
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @CreatedDate
+    @Column(updatable = false)
+    private LocalDateTime createTime;
+    
+    @LastModifiedDate
+    private LocalDateTime updateTime;
+    
+    @Version
+    private Integer version;
+    
+    @Column(name = "is_deleted")
+    private Boolean deleted = false;
+    
+    // Getters and Setters
+}
+
+// entity/User.java
+@Entity
+@Table(name = "users")
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class User extends BaseEntity {
+    
+    @Column(unique = true, nullable = false)
+    private String username;
+    
+    @Column(nullable = false)
+    private String password;
+    
+    @Column(unique = true)
+    private String email;
+    
+    private String phone;
+    
+    @Enumerated(EnumType.STRING)
+    private UserStatus status;
+    
+    @ManyToMany(fetch = FetchType.EAGER)
+    @JoinTable(
+        name = "user_roles",
+        joinColumns = @JoinColumn(name = "user_id"),
+        inverseJoinColumns = @JoinColumn(name = "role_id")
+    )
+    private Set<Role> roles = new HashSet<>();
+}
+
+// dto/request/UserCreateRequest.java
+public record UserCreateRequest(
+    @NotBlank(message = "Username cannot be blank")
+    @Size(min = 3, max = 50)
+    String username,
+    
+    @NotBlank(message = "Password cannot be blank")
+    @Size(min = 6, max = 100)
+    String password,
+    
+    @Email(message = "Invalid email format")
+    String email,
+    
+    @Pattern(regexp = "^[0-9]{10,11}$", message = "Invalid phone number")
+    String phone
+) {}
+
+// dto/response/UserResponse.java
+public record UserResponse(
+    Long id,
+    String username,
+    String email,
+    String phone,
+    LocalDateTime createTime,
+    List<String> roles
+) {}
+
+// mapper/UserMapper.java
+@Mapper(componentModel = "spring")
+public interface UserMapper {
+    
+    UserResponse toResponse(User user);
+    
+    User toEntity(UserCreateRequest request);
+    
+    @BeanMapping(nullValuePropertyMappingStrategy = NullValuePropertyMappingStrategy.IGNORE)
+    void updateEntity(UserUpdateRequest request, @MappingTarget User user);
+}
+```
+
+4. 安全配置设计
+
+```java
+// security/JwtAuthenticationFilter.java
 @Component
-public class QueryMetricsAspect {
-
-    private final MeterRegistry meterRegistry;
-
-    public QueryMetricsAspect(MeterRegistry meterRegistry) {
-        this.meterRegistry = meterRegistry;
-    }
-
-    @Around("@annotation(TrackQuery)")
-    public Object trackQuery(ProceedingJoinPoint joinPoint) throws Throwable {
-        // 获取查询JSON参数（假设第一个参数是JSON字符串）
-        String queryJson = (String) joinPoint.getArgs()[0];
-        
-        StopWatch stopWatch = new StopWatch();
-        stopWatch.start();
-        
-        try {
-            return joinPoint.proceed();
-        } finally {
-            stopWatch.stop();
-            long duration = stopWatch.getTotalTimeMillis();
-            
-            // 记录查询时间
-            Timer.builder("user.query.timer")
-                .tags("query", queryJson)  // 注意：高基数标签需谨慎使用
-                .register(meterRegistry)
-                .record(duration, TimeUnit.MILLISECONDS);
-            
-            // 记录查询次数
-            meterRegistry.counter("user.query.counter", "query", queryJson).increment();
-        }
-    }
-}
-```
-
-##### (3) 在Controller中使用
-```java
-@RestController
-public class QueryController {
+@RequiredArgsConstructor
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
     
-    @PostMapping("/query")
-    @TrackQuery // 添加自定义注解
-    public ResponseEntity<?> executeQuery(@RequestBody String queryJson) {
-        // 处理查询逻辑
-        return ResponseEntity.ok().build();
+    private final JwtService jwtService;
+    private final UserDetailsService userDetailsService;
+    
+    @Override
+    protected void doFilterInternal(
+            @NonNull HttpServletRequest request,
+            @NonNull HttpServletResponse response,
+            @NonNull FilterChain filterChain) throws ServletException, IOException {
+        
+        final String authHeader = request.getHeader("Authorization");
+        final String jwt;
+        final String username;
+        
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            filterChain.doFilter(request, response);
+            return;
+        }
+        
+        jwt = authHeader.substring(7);
+        username = jwtService.extractUsername(jwt);
+        
+        if (username != null && SecurityContextHolder.getContext().getAuthentication() == null) {
+            UserDetails userDetails = this.userDetailsService.loadUserByUsername(username);
+            
+            if (jwtService.isTokenValid(jwt, userDetails)) {
+                UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
+                    userDetails,
+                    null,
+                    userDetails.getAuthorities()
+                );
+                authToken.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+                SecurityContextHolder.getContext().setAuthentication(authToken);
+            }
+        }
+        filterChain.doFilter(request, response);
+    }
+}
+
+// security/SecurityConfiguration.java
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity
+@RequiredArgsConstructor
+public class SecurityConfiguration {
+    
+    private final JwtAuthenticationFilter jwtAuthFilter;
+    
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(AbstractHttpConfigurer::disable)
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/api/v1/auth/**", "/swagger-ui/**", "/v3/api-docs/**").permitAll()
+                .requestMatchers("/api/v1/admin/**").hasRole("ADMIN")
+                .anyRequest().authenticated()
+            )
+            .sessionManagement(session -> session
+                .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+            )
+            .authenticationProvider(authenticationProvider())
+            .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class)
+            .exceptionHandling(exception -> exception
+                .authenticationEntryPoint(new HttpStatusEntryPoint(HttpStatus.UNAUTHORIZED))
+            );
+        
+        return http.build();
+    }
+    
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+    
+    @Bean
+    public AuthenticationProvider authenticationProvider() {
+        DaoAuthenticationProvider authProvider = new DaoAuthenticationProvider();
+        authProvider.setUserDetailsService(userDetailsService());
+        authProvider.setPasswordEncoder(passwordEncoder());
+        return authProvider;
     }
 }
 ```
 
----
-
-#### 方案二：手动注册指标（直接使用MeterRegistry）
-在Service中直接注入`MeterRegistry`：
+5. 服务层设计
 
 ```java
-import io.micrometer.core.instrument.MeterRegistry;
-import org.springframework.stereotype.Service;
+// service/UserService.java
+public interface UserService {
+    UserResponse createUser(UserCreateRequest request);
+    UserResponse getUserById(Long id);
+    PageResponse<UserResponse> getUsers(Pageable pageable);
+    UserResponse updateUser(Long id, UserUpdateRequest request);
+    void deleteUser(Long id);
+}
 
+// service/impl/UserServiceImpl.java
 @Service
-public class QueryService {
+@RequiredArgsConstructor
+@Slf4j
+@Transactional
+public class UserServiceImpl implements UserService {
     
-    private final MeterRegistry meterRegistry;
+    private final UserRepository userRepository;
+    private final UserMapper userMapper;
+    private final PasswordEncoder passwordEncoder;
+    private final CacheManager cacheManager;
     
-    public QueryService(MeterRegistry meterRegistry) {
-        this.meterRegistry = meterRegistry;
+    @Override
+    @CacheEvict(value = "users", allEntries = true)
+    public UserResponse createUser(UserCreateRequest request) {
+        // 检查用户名是否存在
+        if (userRepository.existsByUsername(request.username())) {
+            throw new BusinessException("Username already exists", 400, HttpStatus.BAD_REQUEST);
+        }
+        
+        // 创建用户
+        User user = userMapper.toEntity(request);
+        user.setPassword(passwordEncoder.encode(request.password()));
+        user.setStatus(UserStatus.ACTIVE);
+        
+        User savedUser = userRepository.save(user);
+        log.info("User created: {}", savedUser.getUsername());
+        
+        return userMapper.toResponse(savedUser);
     }
     
-    public void processQuery(String queryJson) {
-        long startTime = System.currentTimeMillis();
+    @Override
+    @Cacheable(value = "users", key = "#id")
+    public UserResponse getUserById(Long id) {
+        User user = userRepository.findByIdAndDeletedFalse(id)
+            .orElseThrow(() -> new ResourceNotFoundException("User not found"));
         
-        try {
-            // 执行查询逻辑...
-        } finally {
-            long duration = System.currentTimeMillis() - startTime;
-            
-            // 记录指标
-            Timer.builder("user.query.timer")
-                .tags("query", queryJson)
-                .register(meterRegistry)
-                .record(duration, TimeUnit.MILLISECONDS);
-        }
+        return userMapper.toResponse(user);
+    }
+    
+    @Override
+    @Cacheable(value = "users", key = "#pageable.pageNumber + '-' + #pageable.pageSize")
+    public PageResponse<UserResponse> getUsers(Pageable pageable) {
+        Page<User> users = userRepository.findByDeletedFalse(pageable);
+        return PageResponse.of(users.map(userMapper::toResponse));
     }
 }
 ```
 
----
+6. 控制层设计
 
-### 4. 处理高基数标签问题
-**注意：** 直接将原始JSON作为标签会导致Prometheus高基数问题（每个唯一JSON创建一个新时间序列）。解决方案：
-
-#### 方案A：使用JSON摘要（推荐）
 ```java
-// 在AOP切面中替换为：
-String queryHash = DigestUtils.sha256Hex(queryJson); // Apache Commons Codec
-
-Timer.builder("user.query.timer")
-    .tags("query_hash", queryHash) // 使用哈希代替原始JSON
-    .register(meterRegistry)
-    .record(duration, TimeUnit.MILLISECONDS);
-
-// 同时记录原始JSON到日志
-log.info("Query executed: hash={}, json={}", queryHash, queryJson);
+// controller/api/v1/UserController.java
+@RestController
+@RequestMapping("/api/v1/users")
+@RequiredArgsConstructor
+@Validated
+@Tag(name = "用户管理", description = "用户相关接口")
+public class UserController {
+    
+    private final UserService userService;
+    
+    @PostMapping
+    @Operation(summary = "创建用户")
+    @ResponseStatus(HttpStatus.CREATED)
+    public ApiResponse<UserResponse> createUser(
+            @Valid @RequestBody UserCreateRequest request) {
+        UserResponse response = userService.createUser(request);
+        return ApiResponse.success(response);
+    }
+    
+    @GetMapping("/{id}")
+    @Operation(summary = "获取用户详情")
+    public ApiResponse<UserResponse> getUser(@PathVariable Long id) {
+        UserResponse response = userService.getUserById(id);
+        return ApiResponse.success(response);
+    }
+    
+    @GetMapping
+    @Operation(summary = "分页查询用户列表")
+    public ApiResponse<PageResponse<UserResponse>> getUsers(
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "10") int size,
+            @RequestParam(defaultValue = "createTime,desc") String[] sort) {
+        
+        Sort sorting = Sort.by(sort[0]);
+        if (sort.length > 1 && "desc".equalsIgnoreCase(sort[1])) {
+            sorting = sorting.descending();
+        } else {
+            sorting = sorting.ascending();
+        }
+        
+        Pageable pageable = PageRequest.of(page, size, sorting);
+        PageResponse<UserResponse> response = userService.getUsers(pageable);
+        return ApiResponse.success(response);
+    }
+}
 ```
 
-#### 方案B：提取关键字段
-```java
-// 解析JSON提取关键字段
-JsonNode node = new ObjectMapper().readTree(queryJson);
-String queryType = node.get("type").asText();
+7. 配置类设计
 
-Timer.builder("user.query.timer")
-    .tags("query_type", queryType) // 使用有限值域的标签
-    .register(meterRegistry)
-    .record(duration, TimeUnit.MILLISECONDS);
+```java
+// config/WebConfig.java
+@Configuration
+@EnableWebMvc
+public class WebConfig implements WebMvcConfigurer {
+    
+    @Override
+    public void addCorsMappings(CorsRegistry registry) {
+        registry.addMapping("/api/**")
+            .allowedOrigins("http://localhost:3000")
+            .allowedMethods("GET", "POST", "PUT", "DELETE", "OPTIONS")
+            .allowedHeaders("*")
+            .allowCredentials(true)
+            .maxAge(3600);
+    }
+    
+    @Override
+    public void addInterceptors(InterceptorRegistry registry) {
+        registry.addInterceptor(new LoggingInterceptor())
+            .addPathPatterns("/api/**")
+            .excludePathPatterns("/api/v1/auth/**");
+    }
+    
+    @Bean
+    public AuditorAware<String> auditorAware() {
+        return () -> Optional.ofNullable(SecurityContextHolder.getContext())
+            .map(SecurityContext::getAuthentication)
+            .map(Authentication::getName)
+            .or(() -> Optional.of("system"));
+    }
+}
+
+// config/RedisConfig.java
+@Configuration
+@EnableCaching
+public class RedisConfig {
+    
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate(
+            RedisConnectionFactory connectionFactory) {
+        RedisTemplate<String, Object> template = new RedisTemplate<>();
+        template.setConnectionFactory(connectionFactory);
+        
+        // 使用Jackson2JsonRedisSerializer序列化
+        Jackson2JsonRedisSerializer<Object> serializer = 
+            new Jackson2JsonRedisSerializer<>(Object.class);
+        
+        ObjectMapper mapper = new ObjectMapper();
+        mapper.setVisibility(PropertyAccessor.ALL, JsonAutoDetect.Visibility.ANY);
+        mapper.activateDefaultTyping(
+            mapper.getPolymorphicTypeValidator(),
+            ObjectMapper.DefaultTyping.NON_FINAL
+        );
+        serializer.setObjectMapper(mapper);
+        
+        template.setKeySerializer(new StringRedisSerializer());
+        template.setValueSerializer(serializer);
+        template.setHashKeySerializer(new StringRedisSerializer());
+        template.setHashValueSerializer(serializer);
+        
+        template.afterPropertiesSet();
+        return template;
+    }
+    
+    @Bean
+    public CacheManager cacheManager(RedisConnectionFactory connectionFactory) {
+        RedisCacheConfiguration config = RedisCacheConfiguration.defaultCacheConfig()
+            .entryTtl(Duration.ofMinutes(30))
+            .serializeKeysWith(RedisSerializationContext.SerializationPair
+                .fromSerializer(new StringRedisSerializer()))
+            .serializeValuesWith(RedisSerializationContext.SerializationPair
+                .fromSerializer(new GenericJackson2JsonRedisSerializer()))
+            .disableCachingNullValues();
+        
+        return RedisCacheManager.builder(connectionFactory)
+            .cacheDefaults(config)
+            .build();
+    }
+}
 ```
 
----
+8. 应用配置文件
 
-### 5. 配置Prometheus拉取数据
-在`prometheus.yml`中添加任务：
 ```yaml
-scrape_configs:
-  - job_name: 'spring-query-service'
-    metrics_path: '/actuator/prometheus'
-    static_configs:
-      - targets: ['localhost:8080'] # 服务地址
+# application.yml
+spring:
+  application:
+    name: demo-web
+  
+  # 数据源配置
+  datasource:
+    url: jdbc:mysql://localhost:3306/demo_db?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai
+    username: root
+    password: 123456
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 30000
+  
+  # JPA配置
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+        dialect: org.hibernate.dialect.MySQL8Dialect
+  
+  # Redis配置
+  redis:
+    host: localhost
+    port: 6379
+    password: 
+    database: 0
+    timeout: 3000ms
+    lettuce:
+      pool:
+        max-active: 20
+        max-idle: 10
+        min-idle: 5
+  
+  # 缓存配置
+  cache:
+    type: redis
+    redis:
+      time-to-live: 1800000
+  
+  # 文件上传
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 20MB
+  
+  # Actuator配置
+  management:
+    endpoints:
+      web:
+        exposure:
+          include: health,info,metrics,prometheus
+    endpoint:
+      health:
+        show-details: always
+
+# 日志配置
+logging:
+  level:
+    com.example.demo: DEBUG
+    org.springframework.security: INFO
+    org.springframework.web: INFO
+  file:
+    name: logs/application.log
+  logback:
+    rollingpolicy:
+      max-file-size: 10MB
+      max-history: 30
+
+# 应用配置
+app:
+  jwt:
+    secret-key: your-secret-key-change-in-production
+    expiration: 86400000 # 24小时
+    refresh-expiration: 604800000 # 7天
+  cors:
+    allowed-origins: http://localhost:3000
+  file:
+    upload-dir: ./uploads
+  rate-limit:
+    enabled: true
+    capacity: 100
+    duration: 1h
 ```
 
----
+三、关键设计考虑点总结
 
-### 6. 验证指标
-启动应用后访问：  
-`http://localhost:8080/actuator/prometheus`
+1. 分层清晰：严格遵循Controller-Service-Repository分层
+2. RESTful API设计：使用版本控制，统一响应格式
+3. 安全性：JWT认证，RBAC权限控制，密码加密
+4. 数据持久化：使用JPA，审计字段，软删除
+5. 缓存策略：Redis二级缓存，配置合理的TTL
+6. 异常处理：全局异常处理，业务异常分类
+7. 参数验证：使用Bean Validation
+8. API文档：集成OpenAPI/Swagger
+9. 性能监控：集成Actuator和Prometheus
+10. 代码规范：使用Record，MapStruct映射，Lombok
+11. 国际化和本地化：预留i18n支持
+12. 事务管理：声明式事务，合理的事务边界
+13. 异步处理：可扩展为异步任务处理
+14. 限流降级：预留Rate Limiter集成点
+15. 日志管理：结构化日志，合理的日志级别
+16. 配置管理：多环境配置，外部化配置
+17. 测试策略：单元测试、集成测试分离
+18. 部署友好：健康检查，优雅关闭
 
-应能看到类似指标：
-```
-# HELP user_query_timer_seconds  
-# TYPE user_query_timer_seconds summary
-user_query_timer_seconds_count{query_hash="a1b2c3...",} 5.0
-user_query_timer_seconds_sum{query_hash="a1b2c3...",} 0.45
-```
-
----
-
-### 完整技术栈说明
-| 组件 | 作用 |
-|-------|------|
-| Spring Boot Actuator | 提供监控端点 |
-| Micrometer | 指标采集抽象库 |
-| Prometheus Registry | 将指标转为Prometheus格式 |
-| AOP (AspectJ) | 实现无侵入式指标收集 |
-| Prometheus Server | 存储和查询指标 |
-
----
-
-### 关键注意事项
-1. **高基数问题**：避免使用无限值域的标签（如原始JSON）
-2. **性能影响**：指标收集应轻量，避免阻塞业务线程
-3. **数据安全**：避免记录敏感信息（可添加过滤逻辑）
-4. **采样策略**：高频查询可考虑采样记录
-5. **存储分离**：原始JSON建议存日志系统（如ELK）
-
-通过以上实现，您可以安全地记录用户查询的详细信息和性能指标，同时保持系统的可观测性和稳定性。
+这个设计提供了一个现代Spring Boot Web应用的完整框架，可根据具体业务需求进行调整和扩展。
