@@ -1,140 +1,398 @@
-在Spring Boot中整合DuckDB并自定义DataSource后，可以通过以下步骤实现项目启动时自动执行schema.sql创建表：
+在Spring Boot中根据请求路径的Path Variable动态调用不同的Service有多种优雅的实现方式。以下是几种常见的方法：
 
-方案一：使用Spring Boot内置初始化机制（推荐）
+方法一：使用策略模式 + Spring Bean注册
 
-1. 放置SQL文件
+1. 定义服务接口
 
-将schema.sql文件放在src/main/resources目录下
-
-2. 配置application.properties
-
-# 启用数据库初始化
-spring.datasource.initialization-mode=always
-# 指定初始化脚本（默认会加载schema.sql）
-spring.datasource.schema=classpath:schema.sql
-
-
-3. 配置自定义DataSource
-
-确保你的自定义DataSource配置支持初始化：
-
-@Bean
-public DataSource dataSource() {
-    return DataSourceBuilder.create()
-        .type(DuckDBDataSource.class) // 你的DuckDB数据源类
-        .url("jdbc:duckdb:mydb.db")
-        .build();
+```java
+// Service接口定义
+public interface DataService {
+    String processData(String data);
+    String getServiceType();
 }
 
+// 枚举定义服务类型
+public enum ServiceType {
+    USER("user"),
+    ORDER("order"),
+    PRODUCT("product");
+    
+    private final String type;
+    
+    ServiceType(String type) {
+        this.type = type;
+    }
+    
+    public String getType() {
+        return type;
+    }
+    
+    public static ServiceType fromString(String type) {
+        for (ServiceType st : ServiceType.values()) {
+            if (st.getType().equalsIgnoreCase(type)) {
+                return st;
+            }
+        }
+        throw new IllegalArgumentException("Unknown service type: " + type);
+    }
+}
+```
 
-方案二：编程式初始化（更灵活）
+2. 实现具体的服务
 
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.core.io.ClassPathResource;
-import org.springframework.jdbc.datasource.init.DataSourceInitializer;
-import org.springframework.jdbc.datasource.init.ResourceDatabasePopulator;
-import javax.sql.DataSource;
-
-@Configuration
-public class DatabaseConfig {
-
-    @Autowired
-    private DataSource dataSource;
-
-    @Bean
-    public DataSourceInitializer dataSourceInitializer() {
-        ResourceDatabasePopulator populator = new ResourceDatabasePopulator();
-        populator.addScript(new ClassPathResource("schema.sql"));
-        populator.setSeparator(";"); // DuckDB需要明确分隔符
-
-        DataSourceInitializer initializer = new DataSourceInitializer();
-        initializer.setDataSource(dataSource);
-        initializer.setDatabasePopulator(populator);
-        initializer.setEnabled(true); // 确保启用
-        return initializer;
+```java
+// 用户服务
+@Service
+public class UserService implements DataService {
+    
+    @Override
+    public String processData(String data) {
+        return "Processing user data: " + data;
+    }
+    
+    @Override
+    public String getServiceType() {
+        return ServiceType.USER.getType();
     }
 }
 
-
-方案三：使用JPA自动建表（需Hibernate支持）
-
-# application.properties
-spring.jpa.hibernate.ddl-auto=create
-spring.jpa.show-sql=true
-
-
-@Entity
-public class User {
-    @Id
-    @GeneratedValue
-    private Long id;
-    private String name;
-    // getters/setters
+// 订单服务
+@Service
+public class OrderService implements DataService {
+    
+    @Override
+    public String processData(String data) {
+        return "Processing order data: " + data;
+    }
+    
+    @Override
+    public String getServiceType() {
+        return ServiceType.ORDER.getType();
+    }
 }
 
+// 产品服务
+@Service
+public class ProductService implements DataService {
+    
+    @Override
+    public String processData(String data) {
+        return "Processing product data: " + data;
+    }
+    
+    @Override
+    public String getServiceType() {
+        return ServiceType.PRODUCT.getType();
+    }
+}
+```
 
-DuckDB注意事项
+3. 创建服务工厂
 
-1. SQL语法兼容性
+```java
+@Component
+public class ServiceFactory {
+    
+    private final Map<String, DataService> serviceMap = new ConcurrentHashMap<>();
+    
+    // 通过构造函数注入所有DataService实现
+    @Autowired
+    public ServiceFactory(List<DataService> services) {
+        for (DataService service : services) {
+            serviceMap.put(service.getServiceType().toLowerCase(), service);
+        }
+    }
+    
+    public DataService getService(String serviceType) {
+        DataService service = serviceMap.get(serviceType.toLowerCase());
+        if (service == null) {
+            throw new IllegalArgumentException("Unknown service type: " + serviceType);
+        }
+        return service;
+    }
+}
+```
 
-确保schema.sql使用DuckDB兼容语法：
+4. 控制器实现
 
-CREATE TABLE users (
-  id BIGINT PRIMARY KEY,
-  name VARCHAR(255)
-);
-
-
-2. 多语句执行
-
-在单个schema.sql中包含多个语句时，确保用分号分隔：
-
-CREATE TABLE table1 (...);
-CREATE TABLE table2 (...);
-
-
-3. 文件路径处理
-
-如果使用相对路径，DuckDB会在当前工作目录创建数据库文件：
-
-spring.datasource.url=jdbc:duckdb:file:./mydb.db
-
-
-验证是否生效
-
-1. 查看启动日志中的SQL执行记录
-
-2. 添加测试端点检查表是否存在：
-
+```java
 @RestController
-public class HealthController {
+@RequestMapping("/api/v1")
+public class DynamicController {
+    
+    private final ServiceFactory serviceFactory;
     
     @Autowired
-    private JdbcTemplate jdbcTemplate;
+    public DynamicController(ServiceFactory serviceFactory) {
+        this.serviceFactory = serviceFactory;
+    }
+    
+    @GetMapping("/process/{serviceType}")
+    public ResponseEntity<?> processData(
+            @PathVariable String serviceType,
+            @RequestParam String data) {
+        
+        try {
+            DataService service = serviceFactory.getService(serviceType);
+            String result = service.processData(data);
+            return ResponseEntity.ok(result);
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(e.getMessage());
+        }
+    }
+    
+    // 带验证的版本
+    @GetMapping("/process/validated/{serviceType}")
+    public ResponseEntity<?> processDataValidated(
+            @PathVariable @Pattern(regexp = "user|order|product") String serviceType,
+            @RequestParam String data) {
+        
+        DataService service = serviceFactory.getService(serviceType);
+        String result = service.processData(data);
+        return ResponseEntity.ok(result);
+    }
+}
+```
 
-    @GetMapping("/tables")
-    public List<String> listTables() {
-        return jdbcTemplate.queryForList(
-            "SELECT table_name FROM information_schema.tables", 
-            String.class
-        );
+方法二：使用Map直接注入（更简洁）
+
+```java
+@Component
+public class ServiceRegistry {
+    
+    @Autowired
+    private Map<String, DataService> serviceMap;
+    
+    public DataService getService(String serviceType) {
+        // 根据bean名称获取，假设bean名称为userService、orderService等
+        String beanName = serviceType + "Service";
+        DataService service = serviceMap.get(beanName);
+        
+        if (service == null) {
+            throw new ServiceNotFoundException("Service not found for type: " + serviceType);
+        }
+        return service;
     }
 }
 
+// 自定义异常
+public class ServiceNotFoundException extends RuntimeException {
+    public ServiceNotFoundException(String message) {
+        super(message);
+    }
+}
+```
 
-完整示例结构
+方法三：使用Spring的ApplicationContext
 
-src/main/resources/
-├── application.properties
-└── schema.sql
+```java
+@Component
+public class ServiceLocator {
+    
+    private final ApplicationContext applicationContext;
+    
+    public ServiceLocator(ApplicationContext applicationContext) {
+        this.applicationContext = applicationContext;
+    }
+    
+    public DataService getService(String serviceType) {
+        String beanName = serviceType + "Service";
+        return applicationContext.getBean(beanName, DataService.class);
+    }
+    
+    // 或者使用Qualifier
+    public DataService getServiceByQualifier(String serviceType) {
+        Map<String, DataService> beans = applicationContext.getBeansOfType(DataService.class);
+        
+        return beans.values().stream()
+            .filter(service -> service.getServiceType().equals(serviceType))
+            .findFirst()
+            .orElseThrow(() -> new IllegalArgumentException("Service not found"));
+    }
+}
+```
 
-src/main/java/
-└── com/example/
-    ├── config/
-    │   └── DataSourceConfig.java
-    └── Application.java
+方法四：使用注解和AOP（最优雅）
 
+1. 创建自定义注解
 
-选择最适合你项目需求的方式，通常方案一最简单直接，方案二提供更多控制权。对于DuckDB这种嵌入式数据库，初始化建表是确保应用正常启动的关键步骤。
+```java
+@Target(ElementType.TYPE)
+@Retention(RetentionPolicy.RUNTIME)
+@Component
+public @interface ServiceHandler {
+    String value();
+}
+```
+
+2. 修改服务实现
+
+```java
+@ServiceHandler("user")
+@Service
+public class UserService implements DataService {
+    // 实现代码...
+}
+
+@ServiceHandler("order")
+@Service
+public class OrderService implements DataService {
+    // 实现代码...
+}
+```
+
+3. 创建注解处理器
+
+```java
+@Component
+public class AnnotatedServiceFactory {
+    
+    private final Map<String, DataService> annotatedServices = new ConcurrentHashMap<>();
+    
+    @Autowired
+    public AnnotatedServiceFactory(ApplicationContext applicationContext) {
+        // 获取所有带有@ServiceHandler注解的bean
+        Map<String, Object> beans = applicationContext.getBeansWithAnnotation(ServiceHandler.class);
+        
+        beans.forEach((beanName, bean) -> {
+            if (bean instanceof DataService) {
+                ServiceHandler annotation = bean.getClass().getAnnotation(ServiceHandler.class);
+                annotatedServices.put(annotation.value(), (DataService) bean);
+            }
+        });
+    }
+    
+    public DataService getService(String serviceType) {
+        DataService service = annotatedServices.get(serviceType);
+        if (service == null) {
+            throw new IllegalArgumentException("No handler found for service type: " + serviceType);
+        }
+        return service;
+    }
+}
+```
+
+方法五：使用Spring的InitializingBean
+
+```java
+@Component
+public class ServiceStrategy implements InitializingBean {
+    
+    @Autowired
+    private List<DataService> services;
+    
+    private final Map<String, DataService> serviceMap = new HashMap<>();
+    
+    @Override
+    public void afterPropertiesSet() {
+        for (DataService service : services) {
+            serviceMap.put(service.getServiceType(), service);
+        }
+    }
+    
+    public DataService getStrategy(String type) {
+        return serviceMap.get(type);
+    }
+}
+```
+
+完整的使用示例
+
+```java
+@RestController
+@RequestMapping("/api")
+public class BusinessController {
+    
+    private final ServiceFactory serviceFactory;
+    
+    @Autowired
+    public BusinessController(ServiceFactory serviceFactory) {
+        this.serviceFactory = serviceFactory;
+    }
+    
+    @PostMapping("/{serviceType}/create")
+    public ResponseEntity<ApiResponse> create(
+            @PathVariable String serviceType,
+            @RequestBody Map<String, Object> data) {
+        
+        try {
+            DataService service = serviceFactory.getService(serviceType);
+            String result = service.processData(data.toString());
+            
+            return ResponseEntity.ok(
+                ApiResponse.success("Success", result)
+            );
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(
+                ApiResponse.error("Invalid service type: " + serviceType)
+            );
+        }
+    }
+    
+    // 支持多个路径变量的情况
+    @GetMapping("/{serviceType}/{action}")
+    public ResponseEntity<?> handleAction(
+            @PathVariable String serviceType,
+            @PathVariable String action,
+            @RequestParam(required = false) Map<String, String> params) {
+        
+        // 可以根据action进一步分发
+        DataService service = serviceFactory.getService(serviceType);
+        
+        switch (action) {
+            case "get":
+                return ResponseEntity.ok(service.processData("Get operation"));
+            case "update":
+                return ResponseEntity.ok(service.processData("Update operation"));
+            default:
+                return ResponseEntity.badRequest().body("Unknown action");
+        }
+    }
+}
+
+// 统一响应格式
+@Data
+@AllArgsConstructor
+class ApiResponse {
+    private boolean success;
+    private String message;
+    private Object data;
+    
+    public static ApiResponse success(String message, Object data) {
+        return new ApiResponse(true, message, data);
+    }
+    
+    public static ApiResponse error(String message) {
+        return new ApiResponse(false, message, null);
+    }
+}
+```
+
+配置建议
+
+```yaml
+# application.yml
+spring:
+  mvc:
+    pathmatch:
+      matching-strategy: ant_path_matcher
+
+# 可以配置服务映射
+services:
+  mapping:
+    user: userService
+    order: orderService
+    product: productService
+```
+
+推荐方案
+
+对于生产环境，我推荐使用方法一（策略模式 + Spring Bean注册），因为：
+
+1. 类型安全：所有服务都实现同一接口
+2. 易于扩展：新增服务只需实现接口并添加@Service注解
+3. 代码清晰：工厂模式职责明确
+4. 便于测试：可以轻松进行单元测试和Mock
+5. 符合开闭原则：对扩展开放，对修改关闭
+
+这种方法结合了Spring的依赖注入特性和设计模式的优势，是最为优雅和可维护的解决方案。
