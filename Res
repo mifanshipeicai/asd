@@ -1,514 +1,341 @@
-我来为您详细介绍如何在Spring Boot中整合DuckDB，实现数据持久化到S3对象存储的功能。
+对于根据路径变量动态调用不同Service的场景，可以考虑使用 策略模式 结合 工厂模式。以下是详细实现：
 
-1. 项目依赖配置
+方案一：策略模式 + 工厂模式
 
-首先在pom.xml中添加必要的依赖：
-
-```xml
-<dependencies>
-    <!-- Spring Boot Starter -->
-    <dependency>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-starter-web</artifactId>
-    </dependency>
-    
-    <!-- DuckDB JDBC Driver -->
-    <dependency>
-        <groupId>org.duckdb</groupId>
-        <artifactId>duckdb_jdbc</artifactId>
-        <version>0.9.2</version>
-    </dependency>
-    
-    <!-- AWS S3 SDK -->
-    <dependency>
-        <groupId>software.amazon.awssdk</groupId>
-        <artifactId>s3</artifactId>
-        <version>2.20.0</version>
-    </dependency>
-    
-    <!-- 配置处理器 -->
-    <dependency>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-configuration-processor</artifactId>
-        <optional>true</optional>
-    </dependency>
-</dependencies>
-```
-
-2. 配置文件
-
-在application.yml中配置相关参数：
-
-```yaml
-app:
-  duckdb:
-    # 本地DuckDB文件路径（用于缓存和临时存储）
-    local-db-path: ./data/local_duckdb.db
-    # S3配置
-    s3:
-      region: us-east-1
-      bucket: your-bucket-name
-      access-key: ${AWS_ACCESS_KEY_ID:}
-      secret-key: ${AWS_SECRET_ACCESS_KEY:}
-      endpoint: ${AWS_ENDPOINT:}  # 可选，用于兼容S3的存储服务
-      
-spring:
-  datasource:
-    url: jdbc:duckdb:./data/local_duckdb.db
-    driver-class-name: org.duckdb.DuckDBDriver
-```
-
-3. 配置类
+1. 定义策略接口
 
 ```java
-@Configuration
-@ConfigurationProperties(prefix = "app.duckdb")
-@Data
-public class DuckDBConfig {
-    private String localDbPath;
-    private S3Config s3;
+// 1. 定义策略接口
+public interface IProcessStrategy {
+    /**
+     * 处理请求
+     */
+    String process(String request);
     
-    @Data
-    public static class S3Config {
-        private String region;
-        private String bucket;
-        private String accessKey;
-        private String secretKey;
-        private String endpoint;
-    }
+    /**
+     * 支持的策略类型
+     */
+    String getType();
 }
 
-@Configuration
-@Slf4j
-public class DuckDBConfiguration {
+// 2. 创建策略上下文（非必需，用于统一管理）
+@Component
+public class StrategyContext {
     
     @Autowired
-    private DuckDBConfig duckDBConfig;
+    private final Map<String, IProcessStrategy> strategyMap = new ConcurrentHashMap<>();
     
-    @Bean
-    @Primary
-    public DataSource duckDBDataSource() {
-        try {
-            // 初始化本地DuckDB连接
-            Connection connection = DriverManager.getConnection("jdbc:duckdb:" + duckDBConfig.getLocalDbPath());
-            
-            // 配置S3扩展
-            configureS3Extension(connection);
-            
-            return new SingleConnectionDataSource(connection, true);
-        } catch (SQLException e) {
-            throw new RuntimeException("Failed to initialize DuckDB data source", e);
+    // Spring会自动注入所有IProcessStrategy实现
+    @Autowired
+    public StrategyContext(List<IProcessStrategy> strategies) {
+        for (IProcessStrategy strategy : strategies) {
+            strategyMap.put(strategy.getType(), strategy);
         }
     }
     
-    private void configureS3Extension(Connection connection) throws SQLException {
-        // 安装并加载S3扩展
-        try (Statement stmt = connection.createStatement()) {
-            stmt.execute("INSTALL httpfs");
-            stmt.execute("LOAD httpfs");
-            
-            // 配置S3凭证
-            if (StringUtils.hasText(duckDBConfig.getS3().getAccessKey())) {
-                stmt.execute("SET s3_region='" + duckDBConfig.getS3().getRegion() + "'");
-                stmt.execute("SET s3_access_key_id='" + duckDBConfig.getS3().getAccessKey() + "'");
-                stmt.execute("SET s3_secret_access_key='" + duckDBConfig.getS3().getSecretKey() + "'");
-                
-                // 如果使用兼容S3的存储服务（如MinIO）
-                if (StringUtils.hasText(duckDBConfig.getS3().getEndpoint())) {
-                    stmt.execute("SET s3_endpoint='" + duckDBConfig.getS3().getEndpoint() + "'");
-                    stmt.execute("SET s3_url_style='path'");
-                }
-            }
-            
-            log.info("DuckDB S3 extension configured successfully");
+    public IProcessStrategy getStrategy(String type) {
+        IProcessStrategy strategy = strategyMap.get(type);
+        if (strategy == null) {
+            throw new IllegalArgumentException("Unknown strategy type: " + type);
         }
+        return strategy;
     }
 }
 ```
 
-4. 数据模型和服务类
+2. 实现具体策略
 
 ```java
-@Data
-@AllArgsConstructor
-@NoArgsConstructor
-public class ApiData {
-    private Long id;
-    private String name;
-    private Double value;
-    private LocalDateTime timestamp;
-    private Map<String, Object> metadata;
+// 3. 具体策略实现
+@Service
+public class UserProcessStrategy implements IProcessStrategy {
+    
+    @Override
+    public String process(String request) {
+        return "Processing user request: " + request;
+    }
+    
+    @Override
+    public String getType() {
+        return "user";
+    }
 }
 
 @Service
-@Slf4j
-public class DuckDBService {
+public class OrderProcessStrategy implements IProcessStrategy {
     
-    @Autowired
-    private DataSource dataSource;
-    
-    @Autowired
-    private DuckDBConfig duckDBConfig;
-    
-    /**
-     * 创建表用于存储API数据
-     */
-    public void createTableIfNotExists(String tableName) throws SQLException {
-        String sql = String.format(
-            "CREATE TABLE IF NOT EXISTS %s (" +
-            "id BIGINT, " +
-            "name VARCHAR, " +
-            "value DOUBLE, " +
-            "timestamp TIMESTAMP, " +
-            "metadata JSON" +
-            ")", tableName
-        );
-        
-        try (Connection conn = dataSource.getConnection();
-             Statement stmt = conn.createStatement()) {
-            stmt.execute(sql);
-            log.info("Table {} created or already exists", tableName);
-        }
+    @Override
+    public String process(String request) {
+        return "Processing order request: " + request;
     }
     
-    /**
-     * 插入API数据到本地DuckDB
-     */
-    public void insertApiData(List<ApiData> dataList, String tableName) throws SQLException {
-        String sql = String.format(
-            "INSERT INTO %s (id, name, value, timestamp, metadata) VALUES (?, ?, ?, ?, ?)",
-            tableName
-        );
-        
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement pstmt = conn.prepareStatement(sql)) {
-            
-            for (ApiData data : dataList) {
-                pstmt.setLong(1, data.getId());
-                pstmt.setString(2, data.getName());
-                pstmt.setDouble(3, data.getValue());
-                pstmt.setTimestamp(4, Timestamp.valueOf(data.getTimestamp()));
-                
-                // 将metadata转换为JSON字符串
-                ObjectMapper mapper = new ObjectMapper();
-                String metadataJson = mapper.writeValueAsString(data.getMetadata());
-                pstmt.setString(5, metadataJson);
-                
-                pstmt.addBatch();
-            }
-            
-            pstmt.executeBatch();
-            log.info("Inserted {} records into table {}", dataList.size(), tableName);
-        } catch (JsonProcessingException e) {
-            throw new SQLException("Failed to serialize metadata to JSON", e);
-        }
+    @Override
+    public String getType() {
+        return "order";
+    }
+}
+
+@Service
+public class ProductProcessStrategy implements IProcessStrategy {
+    
+    @Override
+    public String process(String request) {
+        return "Processing product request: " + request;
     }
     
-    /**
-     * 将本地表数据导出为Parquet格式到S3
-     */
-    public void exportToS3AsParquet(String tableName, String s3Path) throws SQLException {
-        String fullS3Path = String.format("s3://%s/%s", duckDBConfig.getS3().getBucket(), s3Path);
-        
-        String sql = String.format(
-            "COPY %s TO '%s' (FORMAT PARQUET)",
-            tableName, fullS3Path
-        );
-        
-        try (Connection conn = dataSource.getConnection();
-             Statement stmt = conn.createStatement()) {
-            stmt.execute(sql);
-            log.info("Successfully exported table {} to S3: {}", tableName, fullS3Path);
-        }
-    }
-    
-    /**
-     * 从S3读取Parquet文件到DuckDB
-     */
-    public List<ApiData> readFromS3Parquet(String s3Path) throws SQLException {
-        String fullS3Path = String.format("s3://%s/%s", duckDBConfig.getS3().getBucket(), s3Path);
-        
-        String sql = String.format(
-            "SELECT * FROM read_parquet('%s')",
-            fullS3Path
-        );
-        
-        List<ApiData> result = new ArrayList<>();
-        try (Connection conn = dataSource.getConnection();
-             Statement stmt = conn.createStatement();
-             ResultSet rs = stmt.executeQuery(sql)) {
-            
-            while (rs.next()) {
-                ApiData data = new ApiData();
-                data.setId(rs.getLong("id"));
-                data.setName(rs.getString("name"));
-                data.setValue(rs.getDouble("value"));
-                data.setTimestamp(rs.getTimestamp("timestamp").toLocalDateTime());
-                
-                // 解析JSON metadata
-                String metadataJson = rs.getString("metadata");
-                ObjectMapper mapper = new ObjectMapper();
-                Map<String, Object> metadata = mapper.readValue(metadataJson, new TypeReference<Map<String, Object>>() {});
-                data.setMetadata(metadata);
-                
-                result.add(data);
-            }
-        } catch (JsonProcessingException e) {
-            throw new SQLException("Failed to parse metadata JSON", e);
-        }
-        
-        return result;
-    }
-    
-    /**
-     * 直接从S3查询Parquet数据（无需导入到本地表）
-     */
-    public List<ApiData> queryS3ParquetDirectly(String s3Path, String whereClause) throws SQLException {
-        String fullS3Path = String.format("s3://%s/%s", duckDBConfig.getS3().getBucket(), s3Path);
-        
-        String sql = String.format(
-            "SELECT * FROM read_parquet('%s') WHERE %s",
-            fullS3Path, whereClause
-        );
-        
-        List<ApiData> result = new ArrayList<>();
-        try (Connection conn = dataSource.getConnection();
-             Statement stmt = conn.createStatement();
-             ResultSet rs = stmt.executeQuery(sql)) {
-            
-            while (rs.next()) {
-                ApiData data = new ApiData();
-                data.setId(rs.getLong("id"));
-                data.setName(rs.getString("name"));
-                data.setValue(rs.getDouble("value"));
-                data.setTimestamp(rs.getTimestamp("timestamp").toLocalDateTime());
-                
-                String metadataJson = rs.getString("metadata");
-                ObjectMapper mapper = new ObjectMapper();
-                Map<String, Object> metadata = mapper.readValue(metadataJson, new TypeReference<Map<String, Object>>() {});
-                data.setMetadata(metadata);
-                
-                result.add(data);
-            }
-        } catch (JsonProcessingException e) {
-            throw new SQLException("Failed to parse metadata JSON", e);
-        }
-        
-        return result;
+    @Override
+    public String getType() {
+        return "product";
     }
 }
 ```
 
-5. 第三方API集成服务
+3. Controller实现
 
 ```java
-@Service
-@Slf4j
-public class ThirdPartyApiService {
+// 4. Controller层
+@RestController
+@RequestMapping("/api")
+public class ProcessController {
     
-    @Value("${app.third-party.api-url}")
-    private String apiUrl;
-    
-    @Value("${app.third-party.api-key}")
-    private String apiKey;
-    
-    private final RestTemplate restTemplate;
-    
-    public ThirdPartyApiService(RestTemplateBuilder restTemplateBuilder) {
-        this.restTemplate = restTemplateBuilder.build();
-    }
+    @Autowired
+    private StrategyContext strategyContext;
     
     /**
-     * 从第三方API获取数据
+     * 根据类型动态调用不同策略
+     * @param type 路径变量：user/order/product等
+     * @param request 请求参数
      */
-    public List<ApiData> fetchDataFromApi() {
-        try {
-            HttpHeaders headers = new HttpHeaders();
-            headers.set("Authorization", "Bearer " + apiKey);
-            headers.setContentType(MediaType.APPLICATION_JSON);
-            
-            HttpEntity<String> entity = new HttpEntity<>(headers);
-            
-            ResponseEntity<Map> response = restTemplate.exchange(
-                apiUrl, HttpMethod.GET, entity, Map.class);
-            
-            return convertApiResponseToData(response.getBody());
-            
-        } catch (Exception e) {
-            log.error("Failed to fetch data from third-party API", e);
-            throw new RuntimeException("API data fetch failed", e);
-        }
-    }
-    
-    private List<ApiData> convertApiResponseToData(Map<String, Object> apiResponse) {
-        List<ApiData> dataList = new ArrayList<>();
+    @PostMapping("/process/{type}")
+    public ResponseEntity<?> process(
+            @PathVariable("type") String type,
+            @RequestBody String request) {
         
-        // 根据实际的API响应结构进行转换
-        List<Map<String, Object>> items = (List<Map<String, Object>>) apiResponse.get("data");
+        IProcessStrategy strategy = strategyContext.getStrategy(type);
+        String result = strategy.process(request);
         
-        for (Map<String, Object> item : items) {
-            ApiData data = new ApiData();
-            data.setId(Long.valueOf(item.get("id").toString()));
-            data.setName((String) item.get("name"));
-            data.setValue(Double.valueOf(item.get("value").toString()));
-            data.setTimestamp(LocalDateTime.now());
-            
-            // 将其他字段放入metadata
-            Map<String, Object> metadata = new HashMap<>(item);
-            metadata.remove("id");
-            metadata.remove("name");
-            metadata.remove("value");
-            data.setMetadata(metadata);
-            
-            dataList.add(data);
-        }
-        
-        return dataList;
+        return ResponseEntity.ok(result);
     }
 }
 ```
 
-6. 控制器
+方案二：使用ServiceLocator模式（更简洁）
+
+1. 创建服务定位器
+
+```java
+@Component
+public class ServiceLocator {
+    
+    private final Map<String, IProcessService> serviceMap = new ConcurrentHashMap<>();
+    
+    @Autowired
+    public ServiceLocator(List<IProcessService> services) {
+        // 使用注解或约定获取服务标识
+        for (IProcessService service : services) {
+            if (service instanceof ProcessService) {
+                ProcessService processService = (ProcessService) service;
+                serviceMap.put(processService.getServiceType(), service);
+            }
+        }
+    }
+    
+    public IProcessService getService(String serviceType) {
+        IProcessService service = serviceMap.get(serviceType);
+        if (service == null) {
+            throw new ServiceNotFoundException("Service not found for type: " + serviceType);
+        }
+        return service;
+    }
+}
+```
+
+2. 定义服务接口和实现
+
+```java
+// 服务接口
+public interface IProcessService {
+    String handleRequest(String request);
+}
+
+// 基类（可选，用于规范）
+public abstract class ProcessService implements IProcessService {
+    public abstract String getServiceType();
+}
+
+// 具体实现
+@Service
+public class UserService extends ProcessService {
+    
+    @Override
+    public String handleRequest(String request) {
+        return "User Service: " + request;
+    }
+    
+    @Override
+    public String getServiceType() {
+        return "user";
+    }
+}
+
+@Service
+public class OrderService extends ProcessService {
+    
+    @Override
+    public String handleRequest(String request) {
+        return "Order Service: " + request;
+    }
+    
+    @Override
+    public String getServiceType() {
+        return "order";
+    }
+}
+```
+
+3. 使用枚举管理类型（推荐）
+
+```java
+// 5. 使用枚举定义类型（更规范）
+public enum ProcessType {
+    USER("user", "用户处理"),
+    ORDER("order", "订单处理"),
+    PRODUCT("product", "产品处理");
+    
+    private final String code;
+    private final String desc;
+    
+    ProcessType(String code, String desc) {
+        this.code = code;
+        this.desc = desc;
+    }
+    
+    public String getCode() {
+        return code;
+    }
+    
+    public static ProcessType fromCode(String code) {
+        for (ProcessType type : values()) {
+            if (type.code.equalsIgnoreCase(code)) {
+                return type;
+            }
+        }
+        throw new IllegalArgumentException("Unknown process type: " + code);
+    }
+}
+
+// 策略工厂改进版
+@Component
+public class ProcessStrategyFactory {
+    
+    @Autowired
+    private Map<String, IProcessStrategy> strategyMap;
+    
+    public IProcessStrategy getStrategy(ProcessType type) {
+        return strategyMap.get(type.getCode());
+    }
+}
+```
+
+4. 改进的Controller
 
 ```java
 @RestController
-@RequestMapping("/api/data")
-@Slf4j
-public class DataController {
+@RequestMapping("/api/v2")
+public class ImprovedController {
     
     @Autowired
-    private ThirdPartyApiService apiService;
+    private ProcessStrategyFactory strategyFactory;
     
-    @Autowired
-    private DuckDBService duckDBService;
-    
-    @PostMapping("/fetch-and-store")
-    public ResponseEntity<String> fetchAndStoreData(@RequestParam String tableName) {
+    @PostMapping("/process/{type}")
+    public ResponseEntity<?> process(
+            @PathVariable("type") String typeStr,
+            @RequestBody String request) {
+        
+        // 1. 验证和转换类型
+        ProcessType type;
         try {
-            // 创建表
-            duckDBService.createTableIfNotExists(tableName);
-            
-            // 从API获取数据
-            List<ApiData> apiData = apiService.fetchDataFromApi();
-            
-            // 存储到本地DuckDB
-            duckDBService.insertApiData(apiData, tableName);
-            
-            return ResponseEntity.ok("Successfully fetched and stored " + apiData.size() + " records");
-            
-        } catch (Exception e) {
-            log.error("Failed to fetch and store data", e);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                .body("Error: " + e.getMessage());
+            type = ProcessType.fromCode(typeStr);
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest()
+                    .body("Invalid process type: " + typeStr);
         }
-    }
-    
-    @PostMapping("/export-to-s3")
-    public ResponseEntity<String> exportToS3(
-            @RequestParam String tableName,
-            @RequestParam String s3Path) {
-        try {
-            duckDBService.exportToS3AsParquet(tableName, s3Path);
-            return ResponseEntity.ok("Successfully exported data to S3: " + s3Path);
-        } catch (Exception e) {
-            log.error("Failed to export data to S3", e);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                .body("Error: " + e.getMessage());
-        }
-    }
-    
-    @GetMapping("/from-s3")
-    public ResponseEntity<List<ApiData>> readFromS3(@RequestParam String s3Path) {
-        try {
-            List<ApiData> data = duckDBService.readFromS3Parquet(s3Path);
-            return ResponseEntity.ok(data);
-        } catch (Exception e) {
-            log.error("Failed to read data from S3", e);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
-        }
-    }
-    
-    @GetMapping("/query-s3")
-    public ResponseEntity<List<ApiData>> queryS3Directly(
-            @RequestParam String s3Path,
-            @RequestParam String condition) {
-        try {
-            List<ApiData> data = duckDBService.queryS3ParquetDirectly(s3Path, condition);
-            return ResponseEntity.ok(data);
-        } catch (Exception e) {
-            log.error("Failed to query data from S3", e);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
-        }
+        
+        // 2. 获取策略并执行
+        IProcessStrategy strategy = strategyFactory.getStrategy(type);
+        String result = strategy.process(request);
+        
+        // 3. 返回结果
+        return ResponseEntity.ok(result);
     }
 }
 ```
 
-7. 完整的数据处理流程
+方案三：使用反射的动态调用（最灵活）
 
 ```java
-@Service
-@Slf4j
-public class DataPipelineService {
+@Component
+public class DynamicServiceInvoker {
     
     @Autowired
-    private ThirdPartyApiService apiService;
-    
-    @Autowired
-    private DuckDBService duckDBService;
+    private ApplicationContext applicationContext;
     
     /**
-     * 完整的数据处理管道：从API获取 -> 本地存储 -> 导出到S3
+     * 根据服务名动态调用
      */
-    @Async
-    public void executeDataPipeline(String tableName, String s3Path) {
+    public Object invokeService(String serviceName, String methodName, Object... args) {
+        // 获取Bean名称（可以配置映射关系）
+        String beanName = serviceName + "ServiceImpl";
+        
+        Object service = applicationContext.getBean(beanName);
+        
         try {
-            log.info("Starting data pipeline for table: {}", tableName);
+            // 找到对应方法（可根据参数类型更精确匹配）
+            Method method = Arrays.stream(service.getClass().getMethods())
+                    .filter(m -> m.getName().equals(methodName))
+                    .findFirst()
+                    .orElseThrow(() -> new NoSuchMethodException(methodName));
             
-            // 1. 创建表
-            duckDBService.createTableIfNotExists(tableName);
-            
-            // 2. 从API获取数据
-            List<ApiData> apiData = apiService.fetchDataFromApi();
-            log.info("Fetched {} records from API", apiData.size());
-            
-            // 3. 存储到本地DuckDB
-            duckDBService.insertApiData(apiData, tableName);
-            
-            // 4. 导出到S3作为Parquet
-            duckDBService.exportToS3AsParquet(tableName, s3Path);
-            
-            log.info("Data pipeline completed successfully for table: {}", tableName);
+            return method.invoke(service, args);
             
         } catch (Exception e) {
-            log.error("Data pipeline failed for table: {}", tableName, e);
-            throw new RuntimeException("Data pipeline execution failed", e);
+            throw new RuntimeException("Service invocation failed", e);
         }
     }
 }
 ```
 
-主要特性说明
+配置文件示例
 
-1. 本地DuckDB集成：使用DuckDB作为本地数据处理引擎
-2. S3对象存储：通过httpfs扩展直接读写S3上的Parquet文件
-3. 数据转换：将API数据转换为结构化格式并支持JSON元数据
-4. 灵活查询：支持从S3直接查询Parquet数据，无需下载到本地
-5. 错误处理：完善的异常处理和日志记录
+```yaml
+# application.yml
+strategy:
+  mappings:
+    user: userProcessStrategy
+    order: orderProcessStrategy
+    product: productProcessStrategy
 
-使用示例
-
-```bash
-# 1. 从API获取数据并存储到本地
-curl -X POST "http://localhost:8080/api/data/fetch-and-store?tableName=api_data"
-
-# 2. 导出到S3
-curl -X POST "http://localhost:8080/api/data/export-to-s3?tableName=api_data&s3Path=exports/api_data.parquet"
-
-# 3. 从S3读取数据
-curl "http://localhost:8080/api/data/from-s3?s3Path=exports/api_data.parquet"
-
-# 4. 直接从S3查询
-curl "http://localhost:8080/api/data/query-s3?s3Path=exports/api_data.parquet&condition=value>100"
+# 如果需要配置映射
+@Component
+@ConfigurationProperties(prefix = "strategy")
+public class StrategyProperties {
+    private Map<String, String> mappings = new HashMap<>();
+    // getters and setters
+}
 ```
 
-这个方案提供了完整的从API数据获取到S3持久化的流水线，同时保持了DuckDB的高性能查询能力。
+优势总结
+
+1. 开闭原则：新增策略只需添加新实现类，无需修改现有代码
+2. 可维护性：代码结构清晰，职责分离
+3. 可测试性：每个策略可独立测试
+4. 灵活性：动态切换策略，便于扩展
+
+使用建议
+
+1. 策略类型较少时，使用方案一（策略模式+工厂）
+2. 需要严格类型管理时，使用方案二（枚举+工厂）
+3. 需要高度动态性时，考虑方案三（反射）
+4. 建议配合自定义注解，使配置更优雅
+
+选择哪种方案取决于你的具体需求和复杂度，通常方案二（枚举+工厂）在大多数Spring Boot项目中是最佳实践。
