@@ -1,252 +1,218 @@
-在Spring Boot全局异常处理器中获取请求头中的request id，有以下几种实现方式：
+针对您查询慢的问题，我提供几个优化方案：
 
-1. 通过 HttpServletRequest 获取（推荐）
+1. 缓存层优化
 
-@RestControllerAdvice
-public class GlobalExceptionHandler {
-    
-    @ExceptionHandler(Exception.class)
-    public ResponseEntity<ErrorResponse> handleException(
-            Exception ex, 
-            HttpServletRequest request) {
-        
-        // 从请求头中获取 request id
-        String requestId = request.getHeader("X-Request-ID");
-        // 或者使用其他常见的 header 名称
-        // String requestId = request.getHeader("X-Request-Id");
-        // String requestId = request.getHeader("requestId");
-        
-        // 如果没有传递，可以生成一个默认的
-        if (StringUtils.isEmpty(requestId)) {
-            requestId = UUID.randomUUID().toString();
-        }
-        
-        // 记录日志，包含 request id
-        log.error("Request ID: {}, Error: {}", requestId, ex.getMessage(), ex);
-        
-        // 返回响应
-        ErrorResponse error = ErrorResponse.builder()
-                .requestId(requestId)
-                .timestamp(LocalDateTime.now())
-                .message(ex.getMessage())
-                .path(request.getRequestURI())
-                .build();
-        
-        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                .body(error);
-    }
-}
-
-
-2. 通过 @RequestHeader 注解获取
-
-@RestControllerAdvice
-public class GlobalExceptionHandler {
-    
-    @ExceptionHandler(Exception.class)
-    public ResponseEntity<ErrorResponse> handleException(
-            Exception ex,
-            @RequestHeader(value = "X-Request-ID", required = false) String requestId,
-            HttpServletRequest request) {
-        
-        if (StringUtils.isEmpty(requestId)) {
-            requestId = generateRequestId();
-        }
-        
-        // 处理异常...
-        return buildErrorResponse(ex, requestId, request);
-    }
-}
-
-
-3. 通过 RequestContextHolder 获取（线程安全）
-
-@RestControllerAdvice
-public class GlobalExceptionHandler {
-    
-    @ExceptionHandler(Exception.class)
-    public ResponseEntity<ErrorResponse> handleException(Exception ex) {
-        
-        // 从当前请求上下文中获取
-        ServletRequestAttributes attributes = 
-            (ServletRequestAttributes) RequestContextHolder.getRequestAttributes();
-        
-        if (attributes != null) {
-            HttpServletRequest request = attributes.getRequest();
-            String requestId = request.getHeader("X-Request-ID");
-            
-            // 处理异常...
-        }
-        
-        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
-    }
-}
-
-
-4. 完整示例：带有日志追踪的全局异常处理
-
-@Slf4j
-@RestControllerAdvice
-public class GlobalExceptionHandler {
-    
-    // 处理所有异常
-    @ExceptionHandler(Exception.class)
-    public ResponseEntity<ApiError> handleAllExceptions(
-            Exception ex, 
-            WebRequest request) {
-        
-        // 获取 request id
-        String requestId = ((ServletRequestAttributes) 
-                RequestContextHolder.currentRequestAttributes())
-                .getRequest()
-                .getHeader("X-Request-ID");
-        
-        // 如果没有，从 MDC 中获取（如果使用了日志框架）
-        if (StringUtils.isEmpty(requestId)) {
-            requestId = MDC.get("requestId");
-        }
-        
-        // 如果还是没有，生成一个
-        if (StringUtils.isEmpty(requestId)) {
-            requestId = UUID.randomUUID().toString().substring(0, 8);
-        }
-        
-        // 记录带 request id 的日志
-        log.error("[RequestId: {}] 系统异常: {}", requestId, ex.getMessage(), ex);
-        
-        // 构建错误响应
-        ApiError apiError = ApiError.builder()
-                .requestId(requestId)
-                .timestamp(Instant.now())
-                .status(HttpStatus.INTERNAL_SERVER_ERROR.value())
-                .error("Internal Server Error")
-                .message("系统繁忙，请稍后重试")
-                .path(((ServletWebRequest) request).getRequest().getRequestURI())
-                .build();
-        
-        return new ResponseEntity<>(apiError, HttpStatus.INTERNAL_SERVER_ERROR);
-    }
-    
-    // 处理业务异常
-    @ExceptionHandler(BusinessException.class)
-    public ResponseEntity<ApiError> handleBusinessException(
-            BusinessException ex, 
-            HttpServletRequest request) {
-        
-        String requestId = request.getHeader("X-Request-ID");
-        
-        log.warn("[RequestId: {}] 业务异常: {}", requestId, ex.getMessage());
-        
-        ApiError apiError = ApiError.builder()
-                .requestId(requestId)
-                .timestamp(Instant.now())
-                .status(ex.getCode())
-                .error("Business Error")
-                .message(ex.getMessage())
-                .path(request.getRequestURI())
-                .build();
-        
-        return new ResponseEntity<>(apiError, HttpStatus.BAD_REQUEST);
-    }
-}
-
-// 错误响应 DTO
-@Data
-@Builder
-@AllArgsConstructor
-@NoArgsConstructor
-class ApiError {
-    private String requestId;
-    private Instant timestamp;
-    private int status;
-    private String error;
-    private String message;
-    private String path;
-}
-
-
-5. 使用 Filter 或 Interceptor 预先处理 request id
-
+```java
+// 使用Caffeine或Redis缓存查询结果
 @Component
-public class RequestIdFilter extends OncePerRequestFilter {
+public class DataQueryService {
+    @Autowired
+    private CacheManager cacheManager;
     
-    @Override
-    protected void doFilterInternal(
-            HttpServletRequest request, 
-            HttpServletResponse response, 
-            FilterChain filterChain) throws ServletException, IOException {
+    // 缓存最近访问的历史数据
+    public List<DataRecord> queryWithCache(Date date, String query) {
+        String cacheKey = buildCacheKey(date, query);
         
-        // 获取或生成 request id
-        String requestId = request.getHeader("X-Request-ID");
-        if (StringUtils.isEmpty(requestId)) {
-            requestId = UUID.randomUUID().toString();
-        }
+        // 先查缓存
+        List<DataRecord> cached = cacheManager.get(cacheKey);
+        if (cached != null) return cached;
         
-        // 设置到请求属性中，方便后续获取
-        request.setAttribute("requestId", requestId);
+        // 缓存未命中则查询
+        List<DataRecord> result = queryFromDuckDB(date, query);
         
-        // 设置到响应头
-        response.setHeader("X-Request-ID", requestId);
-        
-        // 设置到 MDC，用于日志追踪
-        MDC.put("requestId", requestId);
-        
-        try {
-            filterChain.doFilter(request, response);
-        } finally {
-            // 清除 MDC
-            MDC.clear();
-        }
+        // 异步缓存结果
+        CompletableFuture.runAsync(() -> 
+            cacheManager.put(cacheKey, result, 30, TimeUnit.MINUTES));
+            
+        return result;
     }
 }
+```
 
+2. 索引策略优化
 
-// 异常处理器中从请求属性获取
-@ExceptionHandler(Exception.class)
-public ResponseEntity<ApiError> handleException(
-        Exception ex, 
-        HttpServletRequest request) {
+```sql
+-- 为DuckDB创建本地元数据索引
+CREATE TABLE s3_metadata_index AS
+SELECT 
+    date,
+    file_path,
+    row_count,
+    min_value,
+    max_value,
+    created_time
+FROM 's3://bucket/data/*/metadata.parquet';
+```
+
+3. 查询路径优化
+
+```java
+@Component
+public class OptimizedQueryService {
     
-    String requestId = (String) request.getAttribute("requestId");
-    // ...
+    // 方案A：并行查询（如果查询多个日期）
+    public List<DataRecord> parallelQuery(List<LocalDate> dates, String condition) {
+        return dates.parallelStream()
+            .map(date -> querySingleDate(date, condition))
+            .flatMap(List::stream)
+            .collect(Collectors.toList());
+    }
+    
+    // 方案B：按需加载，只查必要日期
+    public List<DataRecord> optimizedQuery(LocalDate start, LocalDate end, 
+                                           String condition) {
+        List<LocalDate> datesToQuery = new ArrayList<>();
+        
+        // 先检查本地DuckDB
+        for (LocalDate date = start; !date.isAfter(end); date = date.plusDays(1)) {
+            if (!hasDataInLocal(date)) {
+                datesToQuery.add(date);
+            }
+        }
+        
+        // 批量处理S3查询
+        if (!datesToQuery.isEmpty()) {
+            return batchQueryFromS3(datesToQuery, condition);
+        }
+        
+        return queryFromLocal(start, end, condition);
+    }
 }
+```
 
+4. 数据预加载策略
 
-6. 使用 Spring Cloud Sleuth（分布式追踪）
+```java
+@Component
+public class DataPreloader {
+    @Scheduled(cron = "0 0 2 * * ?") // 每天凌晨2点执行
+    public void preloadNextDayData() {
+        LocalDate tomorrow = LocalDate.now().plusDays(1);
+        
+        // 提前将明天可能用到的历史数据加载到本地
+        String predictedQuery = predictCommonQueries();
+        preloadFromS3(tomorrow, predictedQuery);
+    }
+    
+    // 智能预测 - 基于历史查询模式
+    private String predictCommonQueries() {
+        // 实现查询模式分析逻辑
+        return "common_filters_here";
+    }
+}
+```
 
-如果使用微服务架构，建议使用 Sleuth 自动生成 traceId：
+5. S3查询优化配置
 
+```java
+@Configuration
+public class DuckDBConfig {
+    
+    @Bean
+    public DuckDBConnection duckDBConnection() throws SQLException {
+        Connection conn = DriverManager.getConnection("jdbc:duckdb:");
+        
+        // 优化S3访问配置
+        try (Statement stmt = conn.createStatement()) {
+            // 启用更快的S3访问
+            stmt.execute("SET s3_region='us-east-1'");
+            stmt.execute("SET s3_access_key_id='your-key'");
+            stmt.execute("SET s3_secret_access_key='your-secret'");
+            stmt.execute("SET s3_use_ssl=true");
+            
+            // 增加并行度
+            stmt.execute("SET threads TO 8");
+            
+            // 优化内存使用
+            stmt.execute("SET memory_limit='4GB'");
+        }
+        
+        return new DuckDBConnection(conn);
+    }
+}
+```
+
+6. 文件格式和分区优化
+
+```sql
+-- 方案A：使用Parquet格式并添加分区
+-- 确保S3数据是按分区存储的
+-- s3://bucket/data/year=2024/month=01/day=01/file.parquet
+
+-- 创建外部表，利用分区过滤
+CREATE EXTERNAL TABLE historical_data 
+USING PARQUET
+LOCATION 's3://bucket/data/'
+OPTIONS (
+    'partitionColumns' 'year,month,day'
+);
+
+-- 查询时利用分区剪枝
+SELECT * FROM historical_data 
+WHERE year = 2024 AND month = 01 AND day = 01;
+```
+
+7. 架构改进建议
+
+方案A：混合存储架构
+
+```
+本地DuckDB (热数据: 最近5天 + 高频历史)
+    ↑
+缓存层 (Redis/Memcached)
+    ↑
+S3 (冷数据归档)
+```
+
+方案B：查询代理模式
+
+```java
+@RestController
+public class QueryController {
+    
+    @GetMapping("/query")
+    public ResponseEntity<QueryResult> query(
+            @RequestParam LocalDate startDate,
+            @RequestParam LocalDate endDate) {
+        
+        // 1. 快速响应 - 先返回本地数据
+        QueryResult immediateResult = queryLocalData(startDate, endDate);
+        
+        // 2. 异步查询S3历史数据
+        CompletableFuture<QueryResult> historyFuture = 
+            queryHistoryAsync(startDate, endDate);
+        
+        // 3. 可以WebSocket推送或轮询获取完整结果
+        return ResponseEntity.accepted()
+            .header("X-Query-Id", queryId)
+            .body(immediateResult);
+    }
+}
+```
+
+8. 监控和诊断
+
+```yaml
 # application.yml
-spring:
-  sleuth:
-    enabled: true
-
-
-@ExceptionHandler(Exception.class)
-public ResponseEntity<ErrorResponse> handleException(Exception ex) {
-    // 自动注入 TraceId
-    String traceId = org.slf4j.MDC.get("traceId");
+duckdb:
+  optimization:
+    query-timeout: 300s
+    max-concurrent-queries: 5
+    cache-enabled: true
+    cache-size: 1000
+    preload-days: 7
     
-    log.error("TraceId: {}, Error: {}", traceId, ex.getMessage(), ex);
-    
-    return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-            .header("X-Trace-Id", traceId)
-            .body(new ErrorResponse(traceId, ex.getMessage()));
-}
+logging:
+  level:
+    org.springframework.jdbc: DEBUG
+    io.trino.jdbc: DEBUG
+```
 
+推荐实施顺序：
 
-最佳实践建议：
+1. 立即实施：添加缓存层（方案1），可立即见效
+2. 短期优化：优化DuckDB配置和并行查询（方案3、5）
+3. 中期改进：重构文件格式和分区（方案6）
+4. 长期架构：考虑引入查询代理或数据湖引擎（如Trino/Presto）
 
-1. 统一命名：团队内统一定义 request id 的 header 名称，如 X-Request-ID
-
-2. 客户端传递：建议前端/客户端在请求时自动生成并传递 request id
-
-3. 服务端兜底：如果客户端未传递，服务端应自动生成
-
-4. 日志关联：将 request id 记录到所有相关日志中，便于问题追踪
-
-5. 响应头返回：在响应头中也返回 request id，方便客户端调试
-
-6. 异步处理：如果是异步处理，需要手动传递 request id 到子线程
-
-这样配置后，无论系统哪个地方发生异常，都能在全局异常处理器中获取到 request id，便于问题排查和日志追踪。
+您当前三四分钟的查询时间主要瓶颈在S3的网络IO和文件扫描，建议先实施缓存和并行查询，预计可将查询时间降至30秒以内。
