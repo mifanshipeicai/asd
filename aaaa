@@ -1,347 +1,262 @@
-# Spring Boot WebFlux 实现轻量级负载均衡（不引入 Spring Cloud）
+MyBatis 可以通过注解方式实现动态条件查询。以下是几种常见的方法：
 
-在不引入 Spring Cloud 的情况下，可以通过自定义负载均衡策略和 WebClient 过滤器实现轻量级负载均衡。以下是完整实现方案：
-
-## 核心实现思路
-
-1. **自定义负载均衡器**：实现轮询、随机等负载均衡策略
-2. **创建 URL 重写过滤器**：在请求前动态修改目标 URL
-3. **配置负载均衡的 WebClient**
-4. **集成到声明式 HTTP 客户端**
-
-## 完整实现代码
-
-### 1. 添加依赖 (pom.xml)
-```xml
-<dependencies>
-    <dependency>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-starter-webflux</artifactId>
-    </dependency>
-</dependencies>
-```
-
-### 2. 配置文件 (application.yml)
-```yaml
-external-service:
-  instances:
-    - http://service1.example.com:8080
-    - http://service2.example.com:8080
-    - http://service3.example.com:8080
-  load-balancer:
-    strategy: round-robin # 可选：random, weighted
-```
-
-### 3. 配置类读取实例列表
+1. 使用 <script> 标签在注解中写动态 SQL
 
 ```java
-@Configuration
-@ConfigurationProperties(prefix = "external-service")
-public class ServiceConfig {
-    private List<String> instances = new ArrayList<>();
-    private LoadBalancerStrategy strategy = LoadBalancerStrategy.ROUND_ROBIN;
+@Mapper
+public interface UserMapper {
     
-    public enum LoadBalancerStrategy {
-        ROUND_ROBIN, RANDOM
-    }
-
-    // Getters and setters
-    public List<String> getInstances() { return instances; }
-    public void setInstances(List<String> instances) { this.instances = instances; }
-    public LoadBalancerStrategy getStrategy() { return strategy; }
-    public void setStrategy(LoadBalancerStrategy strategy) { this.strategy = strategy; }
+    @Select("<script>" +
+            "SELECT * FROM users" +
+            "<where>" +
+            "   <if test='username != null and username != \"\"'>" +
+            "       AND username = #{username}" +
+            "   </if>" +
+            "   <if test='age != null'>" +
+            "       AND age = #{age}" +
+            "   </if>" +
+            "   <if test='email != null and email != \"\"'>" +
+            "       AND email LIKE CONCAT('%', #{email}, '%')" +
+            "   </if>" +
+            "</where>" +
+            "</script>")
+    List<User> findUsers(@Param("username") String username,
+                         @Param("age") Integer age,
+                         @Param("email") String email);
 }
 ```
 
-### 4. 负载均衡器接口与实现
+2. 使用 @SelectProvider 注解
+
+这种方式更灵活，适合复杂查询：
 
 ```java
-public interface LoadBalancer {
-    String chooseInstance();
-    void reportSuccess(String instance);
-    void reportFailure(String instance);
+@Mapper
+public interface UserMapper {
+    
+    @SelectProvider(type = UserSqlProvider.class, method = "findUsers")
+    List<User> findUsers(@Param("username") String username,
+                         @Param("age") Integer age,
+                         @Param("email") String email);
 }
-```
 
-```java
-@Component
-public class RoundRobinLoadBalancer implements LoadBalancer {
-    private final List<String> instances;
-    private final AtomicInteger counter = new AtomicInteger(0);
-
-    public RoundRobinLoadBalancer(ServiceConfig config) {
-        this.instances = Collections.synchronizedList(new ArrayList<>(config.getInstances()));
-    }
-
-    @Override
-    public String chooseInstance() {
-        if (instances.isEmpty()) {
-            throw new IllegalStateException("No available instances");
+public class UserSqlProvider {
+    public String findUsers(Map<String, Object> params) {
+        String username = (String) params.get("username");
+        Integer age = (Integer) params.get("age");
+        String email = (String) params.get("email");
+        
+        StringBuilder sql = new StringBuilder("SELECT * FROM users WHERE 1=1");
+        
+        if (username != null && !username.trim().isEmpty()) {
+            sql.append(" AND username = #{username}");
         }
-        int index = counter.getAndIncrement() % instances.size();
-        if (counter.get() >= Integer.MAX_VALUE - 10000) {
-            counter.set(0);
+        
+        if (age != null) {
+            sql.append(" AND age = #{age}");
         }
-        return instances.get(index);
-    }
-
-    @Override
-    public void reportSuccess(String instance) {
-        // 成功时不做处理，可扩展实现健康检查
-    }
-
-    @Override
-    public void reportFailure(String instance) {
-        // 失败时移除实例（可添加重试逻辑）
-        instances.remove(instance);
-        if (instances.isEmpty()) {
-            throw new IllegalStateException("All instances are down");
+        
+        if (email != null && !email.trim().isEmpty()) {
+            sql.append(" AND email LIKE CONCAT('%', #{email}, '%')");
         }
-    }
-}
-```
-
-```java
-@Component
-@ConditionalOnProperty(
-    name = "external-service.load-balancer.strategy", 
-    havingValue = "random"
-)
-public class RandomLoadBalancer implements LoadBalancer {
-    private final List<String> instances;
-    private final ThreadLocalRandom random = ThreadLocalRandom.current();
-
-    public RandomLoadBalancer(ServiceConfig config) {
-        this.instances = Collections.synchronizedList(new ArrayList<>(config.getInstances()));
-    }
-
-    @Override
-    public String chooseInstance() {
-        if (instances.isEmpty()) {
-            throw new IllegalStateException("No available instances");
-        }
-        return instances.get(random.nextInt(instances.size()));
-    }
-
-    // 其他方法实现类似 RoundRobinLoadBalancer
-}
-```
-
-### 5. URL 重写过滤器
-
-```java
-@Component
-public class LoadBalancerFilter implements ExchangeFilterFunction {
-    
-    private final LoadBalancer loadBalancer;
-    
-    public LoadBalancerFilter(LoadBalancer loadBalancer) {
-        this.loadBalancer = loadBalancer;
-    }
-
-    @Override
-    public Mono<ClientResponse> filter(ClientRequest request, ExchangeFunction next) {
-        // 获取基础URL
-        String baseUrl = loadBalancer.chooseInstance();
-        String instanceUsed = baseUrl;
         
-        // 构建新URL
-        URI newUri = UriComponentsBuilder.fromHttpUrl(baseUrl)
-                .path(request.url().getPath())
-                .query(request.url().getQuery())
-                .build()
-                .toUri();
-        
-        // 创建新请求
-        ClientRequest newRequest = ClientRequest.from(request)
-                .url(newUri)
-                .build();
-        
-        return next.exchange(newRequest)
-                .doOnSuccess(response -> loadBalancer.reportSuccess(instanceUsed))
-                .onErrorResume(ex -> {
-                    loadBalancer.reportFailure(instanceUsed);
-                    return Mono.error(ex);
-                });
+        return sql.toString();
     }
 }
 ```
 
-### 6. 配置负载均衡的 WebClient
+3. 使用 MyBatis 的 SQL 构建器类
 
 ```java
-@Configuration
-public class WebClientConfig {
+@Mapper
+public interface UserMapper {
     
-    @Bean
-    public WebClient loadBalancedWebClient(LoadBalancerFilter loadBalancerFilter) {
-        return WebClient.builder()
-                .filter(loadBalancerFilter)
-                .build();
-    }
+    @SelectProvider(type = UserSqlBuilder.class, method = "buildFindUsersSql")
+    List<User> findUsers(@Param("username") String username,
+                         @Param("age") Integer age,
+                         @Param("email") String email);
 }
-```
 
-### 7. 定义和使用 HttpExchange 接口
-
-```java
-@HttpExchange // 注意这里不指定完整URL
-public interface ExternalServiceClient {
-    
-    @GetExchange("/api/data")
-    Flux<Data> getData();
-    
-    @PostExchange("/api/process")
-    Mono<Result> processData(@RequestBody RequestData data);
-}
-```
-
-```java
-@Configuration
-public class ClientConfig {
-    
-    @Bean
-    public ExternalServiceClient externalServiceClient(WebClient loadBalancedWebClient) {
-        HttpServiceProxyFactory factory = HttpServiceProxyFactory
-                .builder(WebClientAdapter.forClient(loadBalancedWebClient))
-                .build();
-        return factory.createClient(ExternalServiceClient.class);
-    }
-}
-```
-
-### 8. 服务层使用示例
-
-```java
-@Service
-public class DataService {
-    
-    private final ExternalServiceClient client;
-    
-    public DataService(ExternalServiceClient client) {
-        this.client = client;
-    }
-    
-    public Flux<Data> fetchData() {
-        return client.getData()
-                .retryWhen(Retry.backoff(3, Duration.ofMillis(100))
-                .timeout(Duration.ofSeconds(5));
-    }
-    
-    public Mono<Result> processData(RequestData data) {
-        return client.processData(data)
-                .onErrorResume(ex -> Mono.just(Result.fallbackResult()));
-    }
-}
-```
-
-## 高级功能扩展
-
-### 1. 添加权重支持
-
-```java
-@Component
-public class WeightedLoadBalancer implements LoadBalancer {
-    private final List<WeightedInstance> instances;
-    private final ThreadLocalRandom random = ThreadLocalRandom.current();
-    
-    private static class WeightedInstance {
-        String url;
-        int weight;
-        
-        // 构造方法等
-    }
-
-    @Override
-    public String chooseInstance() {
-        int totalWeight = instances.stream().mapToInt(wi -> wi.weight).sum();
-        int randomWeight = random.nextInt(totalWeight);
-        
-        int current = 0;
-        for (WeightedInstance instance : instances) {
-            current += instance.weight;
-            if (randomWeight < current) {
-                return instance.url;
+public class UserSqlBuilder {
+    public static String buildFindUsersSql(Map<String, Object> params) {
+        return new SQL() {{
+            SELECT("*");
+            FROM("users");
+            
+            String username = (String) params.get("username");
+            Integer age = (Integer) params.get("age");
+            String email = (String) params.get("email");
+            
+            if (username != null && !username.trim().isEmpty()) {
+                WHERE("username = #{username}");
             }
+            
+            if (age != null) {
+                WHERE("age = #{age}");
+            }
+            
+            if (email != null && !email.trim().isEmpty()) {
+                WHERE("email LIKE CONCAT('%', #{email}, '%')");
+            }
+        }}.toString();
+    }
+}
+```
+
+4. 使用 Java 8 的 Optional 简化参数判断
+
+```java
+@Mapper
+public interface UserMapper {
+    
+    @Select("<script>" +
+            "SELECT * FROM users" +
+            "<where>" +
+            "   <if test='username != null'>" +
+            "       AND username = #{username}" +
+            "   </if>" +
+            "   <if test='age != null'>" +
+            "       AND age = #{age}" +
+            "   </if>" +
+            "   <if test='email != null'>" +
+            "       AND email LIKE CONCAT('%', #{email}, '%')" +
+            "   </if>" +
+            "   <if test='statusList != null and statusList.size() > 0'>" +
+            "       AND status IN" +
+            "       <foreach collection='statusList' item='status' open='(' separator=',' close=')'>" +
+            "           #{status}" +
+            "       </foreach>" +
+            "   </if>" +
+            "</where>" +
+            "ORDER BY create_time DESC" +
+            "</script>")
+    List<User> findUsersDynamic(@Param("username") String username,
+                                @Param("age") Integer age,
+                                @Param("email") String email,
+                                @Param("statusList") List<Integer> statusList);
+    
+    // 使用 Java 8 Optional 的调用示例
+    default List<User> findUsersWithOptional(String username, Integer age, String email) {
+        return findUsersDynamic(
+            Optional.ofNullable(username).filter(s -> !s.trim().isEmpty()).orElse(null),
+            age,
+            Optional.ofNullable(email).filter(s -> !s.trim().isEmpty()).orElse(null),
+            null
+        );
+    }
+}
+```
+
+5. 使用自定义注解和参数对象
+
+```java
+@Data
+public class UserQuery {
+    private String username;
+    private Integer age;
+    private String email;
+    private Date startCreateTime;
+    private Date endCreateTime;
+}
+
+@Mapper
+public interface UserMapper {
+    
+    @Select("<script>" +
+            "SELECT * FROM users" +
+            "<where>" +
+            "   <if test='query.username != null and query.username != \"\"'>" +
+            "       AND username = #{query.username}" +
+            "   </if>" +
+            "   <if test='query.age != null'>" +
+            "       AND age = #{query.age}" +
+            "   </if>" +
+            "   <if test='query.email != null and query.email != \"\"'>" +
+            "       AND email LIKE CONCAT('%', #{query.email}, '%')" +
+            "   </if>" +
+            "   <if test='query.startCreateTime != null'>" +
+            "       AND create_time &gt;= #{query.startCreateTime}" +
+            "   </if>" +
+            "   <if test='query.endCreateTime != null'>" +
+            "       AND create_time &lt;= #{query.endCreateTime}" +
+            "   </if>" +
+            "</where>" +
+            "ORDER BY id" +
+            "</script>")
+    List<User> findByCondition(@Param("query") UserQuery query);
+}
+```
+
+6. 通用查询注解封装
+
+可以创建一个通用注解来简化动态查询：
+
+```java
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface DynamicSelect {
+    String value();
+    String table();
+    String[] columns() default {"*"};
+    String orderBy() default "";
+}
+```
+
+```java
+@Mapper
+public interface UserMapper {
+    
+    @DynamicSelect(
+        table = "users",
+        columns = {"id", "username", "email", "age", "create_time"},
+        orderBy = "create_time DESC"
+    )
+    @SelectProvider(type = DynamicSqlProvider.class, method = "buildDynamicSql")
+    List<User> findDynamic(Map<String, Object> params);
+}
+
+public class DynamicSqlProvider {
+    public String buildDynamicSql(Map<String, Object> params) {
+        DynamicSelect annotation = (DynamicSelect) params.get("annotation");
+        
+        String[] columns = annotation.columns();
+        String table = annotation.table();
+        String orderBy = annotation.orderBy();
+        
+        StringBuilder sql = new StringBuilder("SELECT ");
+        sql.append(String.join(", ", columns))
+           .append(" FROM ").append(table);
+        
+        // 添加动态条件
+        sql.append(" WHERE 1=1");
+        
+        if (params.containsKey("username") && params.get("username") != null) {
+            sql.append(" AND username = #{username}");
         }
-        return instances.get(0).url;
+        
+        if (params.containsKey("age") && params.get("age") != null) {
+            sql.append(" AND age = #{age}");
+        }
+        
+        if (params.containsKey("email") && params.get("email") != null) {
+            sql.append(" AND email LIKE CONCAT('%', #{email}, '%')");
+        }
+        
+        if (!orderBy.isEmpty()) {
+            sql.append(" ORDER BY ").append(orderBy);
+        }
+        
+        return sql.toString();
     }
 }
 ```
 
-### 2. 实现简单的健康检查
+最佳实践建议
 
-```java
-@Component
-public class HealthCheckScheduler {
-    
-    private final LoadBalancer loadBalancer;
-    private final WebClient webClient;
-    
-    public HealthCheckScheduler(LoadBalancer loadBalancer, WebClient.Builder webClientBuilder) {
-        this.loadBalancer = loadBalancer;
-        this.webClient = webClientBuilder.build();
-    }
-    
-    @Scheduled(fixedRate = 30000) // 每30秒检查一次
-    public void healthCheck() {
-        // 实现健康检查逻辑
-        // 对每个实例发送HEAD请求检查健康状态
-        // 更新负载均衡器中的实例列表
-    }
-}
-```
+1. 简单查询：使用 <script> 标签方式，代码直观
+2. 复杂查询：使用 @SelectProvider 方式，易于维护
+3. 性能考虑：大量动态查询时，考虑使用缓存机制
+4. 安全性：注意 SQL 注入问题，始终使用 #{} 占位符
+5. 可读性：为每个条件添加明确的注释
 
-### 3. 添加断路器支持
-
-```java
-@Bean
-public ExternalServiceClient externalServiceClient(WebClient loadBalancedWebClient) {
-    CircuitBreaker circuitBreaker = CircuitBreaker.ofDefaults("externalService");
-    
-    HttpServiceProxyFactory factory = HttpServiceProxyFactory
-        .builder(WebClientAdapter.forClient(loadBalancedWebClient))
-        .exchangeFilterFunction((request, next) -> 
-            Mono.defer(() -> next.exchange(request))
-                .transformDeferred(CircuitBreakerOperator.of(circuitBreaker))
-        )
-        .build();
-    
-    return factory.createClient(ExternalServiceClient.class);
-}
-```
-
-## 使用注意事项
-
-1. **URL 路径处理**：
-   - 在 `@HttpExchange` 接口中只定义路径部分，不包含主机名
-   - 确保所有实例的 API 路径一致
-
-2. **异常处理**：
-   - 使用 `retryWhen` 添加重试机制
-   - 使用 `onErrorResume` 提供回退方案
-   - 在负载均衡器中实现故障实例移除
-
-3. **性能优化**：
-   - 使用连接池：`HttpClient.create().connectionProvider(...)`
-   - 配置超时时间：
-     ```java
-     .clientConnector(new ReactorClientHttpConnector(
-         HttpClient.create().responseTimeout(Duration.ofSeconds(3))
-     )
-     ```
-
-4. **动态配置更新**：
-   - 监听配置变更事件，更新负载均衡器中的实例列表
-   - 使用 `@RefreshScope` 或自定义配置更新机制
-
-## 总结
-
-通过以上方案，我们在不引入 Spring Cloud 的情况下实现了轻量级负载均衡，具有以下优势：
-
-1. **零额外依赖**：仅使用 Spring Boot WebFlux 原生功能
-2. **高度可定制**：可自由扩展负载均衡策略
-3. **灵活集成**：与 WebClient 和声明式客户端无缝协作
-4. **轻量高效**：避免 Spring Cloud 的复杂性
-
-此方案适用于中小规模项目，对于需要更高级功能（如服务发现、集中配置）的大型系统，仍建议考虑 Spring Cloud 方案。
+这些方法都可以实现根据参数动态构建查询条件，参数为空时自动忽略该条件。
