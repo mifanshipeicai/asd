@@ -1,159 +1,803 @@
-处理JSON时间数据并生成统计报告
+我来帮你构建一个Spring Boot项目，集成了DuckDB、MyBatis，并配置DuckDB连接S3查询数据。
 
-我可以帮你处理JSON数组文件，计算每个ID的时间花费，并生成CSV文件和统计报告。以下是完整的Python解决方案：
+1. 项目结构
 
-import json
-import csv
-from datetime import datetime
+```
+spring-boot-duckdb-s3/
+├── src/
+│   └── main/
+│       ├── java/
+│       │   └── com/
+│       │       └── example/
+│       │           └── duckdbdemo/
+│       │               ├── DuckdbDemoApplication.java
+│       │               ├── config/
+│       │               │   ├── DuckDBConfig.java
+│       │               │   └── MyBatisConfig.java
+│       │               ├── mapper/
+│       │               │   └── S3DataMapper.java
+│       │               ├── model/
+│       │               │   └── S3Data.java
+│       │               └── service/
+│       │                   ├── S3QueryService.java
+│       │                   └── impl/
+│       │                       └── S3QueryServiceImpl.java
+│       └── resources/
+│           ├── application.yml
+│           └── mapper/
+│               └── S3DataMapper.xml
+├── pom.xml
+└── README.md
+```
 
-def process_time_data(json_file_path, csv_file_path):
-    """
-    处理JSON时间数据并生成CSV文件和统计报告
+2. Maven依赖 (pom.xml)
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 
+         http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
     
-    参数:
-    json_file_path: JSON文件路径
-    csv_file_path: 输出CSV文件路径
-    """
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.1.5</version>
+        <relativePath/>
+    </parent>
     
-    # 读取JSON文件
-    try:
-        with open(json_file_path, 'r', encoding='utf-8') as file:
-            data = json.load(file)
-    except FileNotFoundError:
-        print(f"错误：找不到文件 {json_file_path}")
-        return
-    except json.JSONDecodeError:
-        print("错误：JSON文件格式不正确")
-        return
+    <groupId>com.example</groupId>
+    <artifactId>duckdb-demo</artifactId>
+    <version>1.0.0</version>
+    <name>duckdb-demo</name>
     
-    # 检查数据是否为空
-    if not data:
-        print("警告：JSON文件中没有数据")
-        return
+    <properties>
+        <java.version>17</java.version>
+        <mybatis.version>3.0.2</mybatis.version>
+    </properties>
     
-    # 处理每个项目，计算时间花费
-    processed_data = []
-    for item in data:
-        try:
-            # 提取数据并计算时间差（单位：秒）
-            item_id = item['id']
-            start_time = item['starttime']
-            end_time = item['endtime']
-            time_spent = end_time - start_time
+    <dependencies>
+        <!-- Spring Boot Starters -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        
+        <!-- MyBatis -->
+        <dependency>
+            <groupId>org.mybatis.spring.boot</groupId>
+            <artifactId>mybatis-spring-boot-starter</artifactId>
+            <version>${mybatis.version}</version>
+        </dependency>
+        
+        <!-- DuckDB JDBC -->
+        <dependency>
+            <groupId>org.duckdb</groupId>
+            <artifactId>duckdb_jdbc</artifactId>
+            <version>0.9.2</version>
+        </dependency>
+        
+        <!-- AWS SDK for S3 -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>s3</artifactId>
+            <version>2.20.86</version>
+        </dependency>
+        
+        <!-- 配置文件处理器 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-configuration-processor</artifactId>
+            <optional>true</optional>
+        </dependency>
+        
+        <!-- Lombok (可选) -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+        
+        <!-- 测试 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+    
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <excludes>
+                        <exclude>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+```
+
+3. 配置文件 (application.yml)
+
+```yaml
+# application.yml
+
+spring:
+  application:
+    name: duckdb-s3-demo
+
+# DuckDB 配置
+duckdb:
+  # 数据库文件路径（内存模式使用 :memory:）
+  database: :memory:
+  # 或使用文件模式
+  # database: /data/duckdb/duckdb.db
+  
+  # S3 配置
+  s3:
+    region: us-east-1
+    access-key: ${AWS_ACCESS_KEY_ID:your-access-key}
+    secret-key: ${AWS_SECRET_ACCESS_KEY:your-secret-key}
+    endpoint: ${AWS_ENDPOINT:}  # 用于MinIO或其他兼容S3的服务
+    # 可选的IAM角色（如果使用IAM角色而非AK/SK）
+    # iam-role: arn:aws:iam::xxx:role/xxx
+  
+  # HTTPFS扩展配置（用于S3访问）
+  httpfs:
+    enabled: true
+
+# MyBatis 配置
+mybatis:
+  mapper-locations: classpath:mapper/*.xml
+  type-aliases-package: com.example.duckdbdemo.model
+  configuration:
+    map-underscore-to-camel-case: true
+
+# 日志配置
+logging:
+  level:
+    com.example.duckdbdemo: DEBUG
+    org.mybatis: DEBUG
+```
+
+4. DuckDB配置类
+
+```java
+// DuckDBConfig.java
+package com.example.duckdbdemo.config;
+
+import org.duckdb.DuckDBConnection;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.Properties;
+
+@Configuration
+public class DuckDBConfig {
+
+    @Value("${duckdb.database::memory:}")
+    private String databasePath;
+
+    @Value("${duckdb.s3.region:us-east-1}")
+    private String s3Region;
+
+    @Value("${duckdb.s3.access-key:}")
+    private String s3AccessKey;
+
+    @Value("${duckdb.s3.secret-key:}")
+    private String s3SecretKey;
+
+    @Value("${duckdb.s3.endpoint:}")
+    private String s3Endpoint;
+
+    @Value("${duckdb.httpfs.enabled:true}")
+    private boolean httpfsEnabled;
+
+    @Bean
+    public DataSource duckDBDataSource() throws SQLException {
+        // DuckDB JDBC URL
+        String jdbcUrl = "jdbc:duckdb:" + databasePath;
+        
+        // 创建连接
+        Properties properties = new Properties();
+        DuckDBDataSource dataSource = new DuckDBDataSource(jdbcUrl, properties);
+        
+        // 初始化连接，配置S3
+        initializeDuckDBConnection(dataSource);
+        
+        return dataSource;
+    }
+
+    private void initializeDuckDBConnection(DuckDBDataSource dataSource) throws SQLException {
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement()) {
             
-            # 添加到处理后的数据列表
-            processed_data.append({
-                'id': item_id,
-                'starttime': start_time,
-                'endtime': end_time,
-                'time_spent': time_spent
-            })
-        except KeyError as e:
-            print(f"警告：缺少必要的键 {e}，跳过此项")
-        except TypeError:
-            print("警告：时间戳格式不正确，跳过此项")
-    
-    # 写入CSV文件
-    try:
-        with open(csv_file_path, 'w', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['id', 'starttime', 'endtime', 'time_spent']
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            // 安装和加载httpfs扩展（用于S3访问）
+            if (httpfsEnabled) {
+                try {
+                    stmt.execute("INSTALL httpfs");
+                    stmt.execute("LOAD httpfs");
+                    System.out.println("HTTPFS extension loaded successfully");
+                } catch (SQLException e) {
+                    System.err.println("Failed to load HTTPFS extension: " + e.getMessage());
+                }
+            }
             
-            writer.writeheader()
-            for item in processed_data:
-                writer.writerow(item)
-        
-        print(f"CSV文件已生成: {csv_file_path}")
-    except IOError:
-        print(f"错误：无法写入文件 {csv_file_path}")
-        return
-    
-    # 按ID分组计算总时间花费
-    id_time_totals = {}
-    for item in processed_data:
-        item_id = item['id']
-        time_spent = item['time_spent']
-        
-        if item_id in id_time_totals:
-            id_time_totals[item_id] += time_spent
-        else:
-            id_time_totals[item_id] = time_spent
-    
-    # 计算最早和最晚时间花费
-    if processed_data:
-        all_times = [item['time_spent'] for item in processed_data]
-        min_time = min(all_times)
-        max_time = max(all_times)
-        
-        # 输出统计结果
-        print("\n=== 时间花费统计 ===")
-        print("各ID总时间花费:")
-        for item_id, total_time in id_time_totals.items():
-            print(f"  ID {item_id}: {total_time} 秒")
-        
-        print(f"\n最早时间花费: {min_time} 秒")
-        print(f"最晚时间花费: {max_time} 秒")
-        
-        # 可选：将统计结果也保存到文件
-        stats_file = csv_file_path.replace('.csv', '_stats.csv')
-        try:
-            with open(stats_file, 'w', newline='', encoding='utf-8') as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(['ID', '总时间花费(秒)'])
-                for item_id, total_time in id_time_totals.items():
-                    writer.writerow([item_id, total_time])
-                writer.writerow([])
-                writer.writerow(['最早时间花费(秒)', min_time])
-                writer.writerow(['最晚时间花费(秒)', max_time])
+            // 设置S3配置
+            if (!s3AccessKey.isEmpty() && !s3SecretKey.isEmpty()) {
+                // 使用AK/SK认证
+                stmt.execute("SET s3_region='" + s3Region + "'");
+                stmt.execute("SET s3_access_key_id='" + s3AccessKey + "'");
+                stmt.execute("SET s3_secret_access_key='" + s3SecretKey + "'");
+                
+                if (!s3Endpoint.isEmpty()) {
+                    stmt.execute("SET s3_endpoint='" + s3Endpoint + "'");
+                    // 对于MinIO等兼容S3的服务
+                    stmt.execute("SET s3_url_style='path'");
+                }
+                
+                // 可选：设置其他S3参数
+                stmt.execute("SET s3_use_ssl=true");
+                stmt.execute("SET s3_uploader_max_parts_per_file=1000");
+                stmt.execute("SET s3_uploader_max_filesize=5368709120"); // 5GB
+                
+                System.out.println("S3 configuration set successfully");
+            }
             
-            print(f"\n统计报告已保存: {stats_file}")
-        except IOError:
-            print(f"警告：无法保存统计报告文件 {stats_file}")
-    else:
-        print("警告：没有有效数据可统计")
+            // 设置其他DuckDB参数
+            stmt.execute("SET threads TO 4");
+            stmt.execute("SET memory_limit='2GB'");
+            
+        } catch (SQLException e) {
+            throw new SQLException("Failed to initialize DuckDB connection", e);
+        }
+    }
+}
 
-# 使用示例
-if __name__ == "__main__":
-    # 请替换为你的JSON文件路径
-    json_file_path = "data.json"
+// 自定义DuckDB数据源
+class DuckDBDataSource extends org.springframework.jdbc.datasource.SimpleDriverDataSource {
+    public DuckDBDataSource(String url, Properties properties) {
+        setDriverClass(org.duckdb.DuckDBDriver.class);
+        setUrl(url);
+        setConnectionProperties(properties);
+    }
+}
+```
+
+5. MyBatis配置类
+
+```java
+// MyBatisConfig.java
+package com.example.duckdbdemo.config;
+
+import org.apache.ibatis.session.SqlSessionFactory;
+import org.mybatis.spring.SqlSessionFactoryBean;
+import org.mybatis.spring.annotation.MapperScan;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import javax.sql.DataSource;
+
+@Configuration
+@MapperScan("com.example.duckdbdemo.mapper")
+public class MyBatisConfig {
+
+    @Bean
+    public SqlSessionFactory sqlSessionFactory(DataSource dataSource) throws Exception {
+        SqlSessionFactoryBean sessionFactory = new SqlSessionFactoryBean();
+        sessionFactory.setDataSource(dataSource);
+        
+        // 配置驼峰命名转换
+        org.apache.ibatis.session.Configuration configuration = 
+            new org.apache.ibatis.session.Configuration();
+        configuration.setMapUnderscoreToCamelCase(true);
+        sessionFactory.setConfiguration(configuration);
+        
+        return sessionFactory.getObject();
+    }
+}
+```
+
+6. 数据模型
+
+```java
+// S3Data.java
+package com.example.duckdbdemo.model;
+
+import lombok.Data;
+import java.time.LocalDateTime;
+
+@Data
+public class S3Data {
+    private Long id;
+    private String fileName;
+    private String bucketName;
+    private String filePath;
+    private Long fileSize;
+    private LocalDateTime lastModified;
+    private String fileType;
+    private String metadata;
     
-    # 输出CSV文件路径
-    csv_file_path = "time_data.csv"
+    // 如果查询Parquet/CSV文件的内容
+    private String column1;
+    private String column2;
+    private Integer column3;
+    private Double column4;
+}
+```
+
+7. Mapper接口和XML
+
+```java
+// S3DataMapper.java
+package com.example.duckdbdemo.mapper;
+
+import com.example.duckdbdemo.model.S3Data;
+import org.apache.ibatis.annotations.Mapper;
+import org.apache.ibatis.annotations.Param;
+import org.apache.ibatis.annotations.Select;
+
+import java.util.List;
+import java.util.Map;
+
+@Mapper
+public interface S3DataMapper {
     
-    # 处理数据
-    process_time_data(json_file_path, csv_file_path)
+    // 查询S3上的Parquet文件
+    @Select("SELECT * FROM read_parquet('s3://#{bucket}/#{filePath}') LIMIT #{limit}")
+    List<Map<String, Object>> queryParquetFile(
+            @Param("bucket") String bucket,
+            @Param("filePath") String filePath,
+            @Param("limit") int limit);
+    
+    // 查询S3上的CSV文件
+    @Select("SELECT * FROM read_csv_auto('s3://#{bucket}/#{filePath}') LIMIT #{limit}")
+    List<Map<String, Object>> queryCsvFile(
+            @Param("bucket") String bucket,
+            @Param("filePath") String filePath,
+            @Param("limit") int limit);
+    
+    // 列出S3桶中的文件（需要安装aws扩展）
+    @Select("SELECT * FROM glob('s3://#{bucket}/*')")
+    List<String> listS3Files(@Param("bucket") String bucket);
+    
+    // 动态SQL查询
+    List<S3Data> queryS3Data(@Param("bucket") String bucket, 
+                            @Param("filePattern") String filePattern,
+                            @Param("columns") List<String> columns);
+}
+```
 
+```xml
+<!-- S3DataMapper.xml -->
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" 
+    "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.example.duckdbdemo.mapper.S3DataMapper">
+    
+    <select id="queryS3Data" resultType="com.example.duckdbdemo.model.S3Data">
+        SELECT 
+        <choose>
+            <when test="columns != null and columns.size() > 0">
+                <foreach collection="columns" item="col" separator=",">
+                    ${col}
+                </foreach>
+            </when>
+            <otherwise>*</otherwise>
+        </choose>
+        FROM read_parquet('s3://${bucket}/${filePattern}')
+        LIMIT 1000
+    </select>
+    
+    <!-- 查询S3上的多个Parquet文件 -->
+    <select id="queryMultipleParquetFiles" resultType="map">
+        SELECT * 
+        FROM read_parquet([
+            <foreach collection="files" item="file" separator=",">
+                's3://${bucket}/${file}'
+            </foreach>
+        ])
+        WHERE ${condition}
+        LIMIT #{limit}
+    </select>
+    
+    <!-- 创建S3数据的外部表 -->
+    <update id="createS3ExternalTable">
+        CREATE OR REPLACE VIEW s3_data_view AS
+        SELECT * FROM read_parquet('s3://${bucket}/${path}/*.parquet')
+    </update>
+</mapper>
+```
 
-使用说明
+8. Service层
 
-1. 将上述代码保存为Python脚本（如time_analysis.py）
+```java
+// S3QueryService.java
+package com.example.duckdbdemo.service;
 
-2. 修改json_file_path变量为你的JSON文件路径
+import com.example.duckdbdemo.model.S3Data;
 
-3. 运行脚本：python time_analysis.py
+import java.util.List;
+import java.util.Map;
 
-功能说明
+public interface S3QueryService {
+    
+    // 查询S3 Parquet文件
+    List<Map<String, Object>> queryParquetFromS3(String bucket, String filePath, int limit);
+    
+    // 查询S3 CSV文件
+    List<Map<String, Object>> queryCsvFromS3(String bucket, String filePath, int limit);
+    
+    // 列出S3文件
+    List<String> listS3Files(String bucket);
+    
+    // 复杂查询
+    List<S3Data> queryWithConditions(String bucket, String filePattern, List<String> columns);
+    
+    // 创建S3外部表
+    void createExternalTable(String bucket, String path);
+}
+```
 
-这个脚本会：
+```java
+// S3QueryServiceImpl.java
+package com.example.duckdbdemo.service.impl;
 
-1. 读取JSON文件并解析数据
+import com.example.duckdbdemo.mapper.S3DataMapper;
+import com.example.duckdbdemo.model.S3Data;
+import com.example.duckdbdemo.service.S3QueryService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
-2. 计算每个项目的时间花费（结束时间-开始时间）
+import java.sql.*;
+import java.util.List;
+import java.util.Map;
 
-3. 生成包含原始数据和时间花费的CSV文件
+@Service
+public class S3QueryServiceImpl implements S3QueryService {
 
-4. 计算并显示每个ID的总时间花费
+    @Autowired
+    private S3DataMapper s3DataMapper;
+    
+    @Autowired
+    private DataSource dataSource;
 
-5. 找出最早和最晚的时间花费
+    @Override
+    public List<Map<String, Object>> queryParquetFromS3(String bucket, String filePath, int limit) {
+        return s3DataMapper.queryParquetFile(bucket, filePath, limit);
+    }
 
-6. 生成一个额外的统计报告CSV文件
+    @Override
+    public List<Map<String, Object>> queryCsvFromS3(String bucket, String filePath, int limit) {
+        return s3DataMapper.queryCsvFile(bucket, filePath, limit);
+    }
 
-注意事项
+    @Override
+    public List<String> listS3Files(String bucket) {
+        return s3DataMapper.listS3Files(bucket);
+    }
 
-• 确保JSON文件格式正确，每个项目包含id、starttime和endtime字段
+    @Override
+    public List<S3Data> queryWithConditions(String bucket, String filePattern, List<String> columns) {
+        return s3DataMapper.queryS3Data(bucket, filePattern, columns);
+    }
 
-• 时间戳应为数字类型（Unix时间戳）
+    @Override
+    @Transactional
+    public void createExternalTable(String bucket, String path) {
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement()) {
+            
+            // 创建外部表视图
+            String sql = String.format(
+                "CREATE OR REPLACE VIEW s3_external_data AS " +
+                "SELECT * FROM read_parquet('s3://%s/%s/*.parquet')",
+                bucket, path
+            );
+            stmt.execute(sql);
+            
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to create external table", e);
+        }
+    }
 
-• 脚本会处理可能的数据错误并跳过有问题的项目
+    // 使用原生JDBC执行复杂DuckDB查询
+    public List<Map<String, Object>> executeComplexQuery(String sql) {
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            
+            ResultSetMetaData metaData = rs.getMetaData();
+            int columnCount = metaData.getColumnCount();
+            
+            return JdbcUtils.resultSetToList(rs, metaData, columnCount);
+            
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to execute query", e);
+        }
+    }
+    
+    // 使用DuckDB的COPY TO将查询结果写入S3
+    public void exportToS3(String query, String s3Path) {
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement()) {
+            
+            String copySql = String.format(
+                "COPY (%s) TO '%s' (FORMAT PARQUET)",
+                query, s3Path
+            );
+            stmt.execute(copySql);
+            
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to export to S3", e);
+        }
+    }
+}
 
-如果你的JSON结构有所不同，或者需要不同的时间格式处理，请提供更多细节，我可以调整代码以适应你的具体需求。
+// JDBC工具类
+class JdbcUtils {
+    static List<Map<String, Object>> resultSetToList(ResultSet rs, 
+                                                     ResultSetMetaData metaData, 
+                                                     int columnCount) throws SQLException {
+        // 转换ResultSet为List<Map>
+        // 实现略
+        return List.of();
+    }
+}
+```
+
+9. 主应用类
+
+```java
+// DuckdbDemoApplication.java
+package com.example.duckdbdemo;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableScheduling;
+
+@SpringBootApplication
+@EnableScheduling
+public class DuckdbDemoApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(DuckdbDemoApplication.class, args);
+    }
+}
+```
+
+10. Controller示例
+
+```java
+// S3QueryController.java
+package com.example.duckdbdemo.controller;
+
+import com.example.duckdbdemo.service.S3QueryService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/s3")
+public class S3QueryController {
+
+    @Autowired
+    private S3QueryService s3QueryService;
+
+    @GetMapping("/query/parquet")
+    public List<Map<String, Object>> queryParquet(
+            @RequestParam String bucket,
+            @RequestParam String filePath,
+            @RequestParam(defaultValue = "100") int limit) {
+        return s3QueryService.queryParquetFromS3(bucket, filePath, limit);
+    }
+
+    @GetMapping("/list/{bucket}")
+    public List<String> listFiles(@PathVariable String bucket) {
+        return s3QueryService.listS3Files(bucket);
+    }
+
+    @PostMapping("/export")
+    public String exportToS3(@RequestParam String query,
+                            @RequestParam String s3Path) {
+        s3QueryService.exportToS3(query, s3Path);
+        return "Export completed to: " + s3Path;
+    }
+}
+```
+
+11. 高级功能 - 连接池和监控
+
+```java
+// DuckDB连接池配置
+package com.example.duckdbdemo.config;
+
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+
+import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.sql.Statement;
+
+@Configuration
+public class DuckDBPoolConfig {
+
+    @Value("${duckdb.database::memory:}")
+    private String databasePath;
+
+    @Bean
+    @Primary
+    public DataSource duckDBPoolDataSource() throws SQLException {
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl("jdbc:duckdb:" + databasePath);
+        config.setDriverClassName("org.duckdb.DuckDBDriver");
+        config.setMaximumPoolSize(10);
+        config.setMinimumIdle(2);
+        config.setConnectionTimeout(30000);
+        config.setIdleTimeout(600000);
+        config.setMaxLifetime(1800000);
+        config.setAutoCommit(true);
+        
+        // 自定义连接初始化
+        config.setConnectionInitSql(getInitSql());
+        
+        HikariDataSource dataSource = new HikariDataSource(config);
+        
+        // 初始化第一个连接
+        initializeFirstConnection(dataSource);
+        
+        return dataSource;
+    }
+    
+    private String getInitSql() {
+        return """
+            SET s3_region='us-east-1';
+            SET s3_access_key_id='${duckdb.s3.access-key}';
+            SET s3_secret_access_key='${duckdb.s3.secret-key}';
+            SET s3_use_ssl=true;
+            """;
+    }
+    
+    private void initializeFirstConnection(HikariDataSource dataSource) throws SQLException {
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement()) {
+            stmt.execute("INSTALL httpfs");
+            stmt.execute("LOAD httpfs");
+        }
+    }
+}
+```
+
+12. 测试类
+
+```java
+package com.example.duckdbdemo;
+
+import com.example.duckdbdemo.service.S3QueryService;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+
+import java.util.List;
+import java.util.Map;
+
+@SpringBootTest
+class DuckdbDemoApplicationTests {
+
+    @Autowired
+    private S3QueryService s3QueryService;
+
+    @Test
+    void testQueryS3Parquet() {
+        List<Map<String, Object>> result = s3QueryService.queryParquetFromS3(
+            "my-bucket",
+            "data/file.parquet",
+            10
+        );
+        
+        System.out.println("Query result: " + result.size() + " rows");
+        result.forEach(System.out::println);
+    }
+
+    @Test
+    void testCreateExternalTable() {
+        s3QueryService.createExternalTable("my-bucket", "data/parquet");
+        
+        // 查询外部表
+        List<Map<String, Object>> result = s3QueryService.executeComplexQuery(
+            "SELECT COUNT(*) as count FROM s3_external_data"
+        );
+        
+        System.out.println("Total rows: " + result);
+    }
+}
+```
+
+13. Docker部署配置
+
+```dockerfile
+# Dockerfile
+FROM openjdk:17-jdk-slim
+
+WORKDIR /app
+
+# 安装必要的工具
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# 复制应用
+COPY target/duckdb-demo-*.jar app.jar
+
+# 设置环境变量
+ENV JAVA_OPTS="-Xmx2g -Xms1g"
+ENV AWS_ACCESS_KEY_ID=""
+ENV AWS_SECRET_ACCESS_KEY=""
+ENV AWS_REGION="us-east-1"
+
+EXPOSE 8080
+
+ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar app.jar"]
+```
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  duckdb-app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=us-east-1
+      - DUCKDB_DATABASE=/data/duckdb.db
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+```
+
+关键注意事项：
+
+1. S3权限：确保你的AWS凭证有正确的S3访问权限
+2. DuckDB版本：使用0.9.0+版本以获得更好的S3支持
+3. 内存管理：DuckDB是内存数据库，注意设置合适的内存限制
+4. 连接管理：DuckDB连接不是线程安全的，建议使用连接池
+5. 扩展安装：首次运行会自动安装httpfs扩展
+6. 文件格式：支持Parquet、CSV、JSON等格式
+7. 性能优化：
+   · 使用分区Parquet文件
+   · 设置合适的线程数
+   · 启用缓存
+
+这个配置支持：
+
+· ✅ Spring Boot 3.x
+· ✅ DuckDB + S3连接
+· ✅ MyBatis持久化
+· ✅ 连接池管理
+· ✅ REST API
+· ✅ Docker部署
