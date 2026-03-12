@@ -1,246 +1,100 @@
-在 Spring Boot WebFlux 中实现批量插入并处理事务回退的分批操作，可以通过 Reactor 的响应式编程模型实现。以下是完整实现方案：
+以下是一个使用Python实现的并发调用API的脚本。它会读取CSV文件中的URL和请求负载（payload），按指定的并发数分批处理，每批内的请求并发执行。
 
-核心思路
+代码实现
 
-1. 批量模式：使用同一个事务 ID 插入所有数据，任一失败则回滚整个事务
+```python
+import csv
+import json
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-2. 回退单条模式：回滚后逐条插入，每条数据使用独立的事务
+def call_api(url, payload):
+    """
+    发送HTTP POST请求（假设payload是JSON格式）
+    可根据实际情况调整请求方法、头信息等
+    """
+    try:
+        # 如果payload是字符串，尝试解析为字典；否则直接使用
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                # 如果不是合法JSON，按原字符串发送（可能需要调整）
+                pass
+        
+        response = requests.post(url, json=payload, timeout=10)
+        response.raise_for_status()          # 抛出HTTP错误
+        return response.json()                # 返回JSON响应（可按需修改）
+    except Exception as e:
+        return {"error": str(e), "url": url, "payload": payload}
 
-3. 复用 Token：整个流程使用同一个认证 token
+def process_csv(csv_file, concurrency=4):
+    """
+    读取CSV，分批并发调用API
+    :param csv_file: CSV文件路径
+    :param concurrency: 每批并发数
+    """
+    # 读取CSV所有行
+    rows = []
+    with open(csv_file, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            # 假设CSV有两列：url, payload
+            url = row['url'].strip()
+            payload = row['payload'].strip()
+            rows.append((url, payload))
 
-4. 错误处理：记录失败数据，继续处理后续条目
+    total = len(rows)
+    print(f"总共 {total} 个请求，每批并发数 {concurrency}")
 
-实现代码
+    # 按concurrency分批处理
+    for i in range(0, total, concurrency):
+        batch = rows[i:i+concurrency]
+        print(f"处理第 {i//concurrency + 1} 批，共 {len(batch)} 个请求")
 
-import reactor.core.publisher.Flux;
-import reactor.core.publisher.Mono;
-import org.springframework.web.reactive.function.client.WebClient;
+        # 使用线程池并发执行当前批次
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = {executor.submit(call_api, url, payload): (url, payload)
+                       for url, payload in batch}
+            
+            for future in as_completed(futures):
+                url, payload = futures[future]
+                try:
+                    result = future.result()
+                    print(f"完成: {url} -> {result}")
+                except Exception as e:
+                    print(f"请求失败: {url} - {e}")
 
-public class BatchDataInserter {
+if __name__ == "__main__":
+    # 使用示例：并发数设为4
+    process_csv("api_requests.csv", concurrency=4)
+```
 
-    private final WebClient webClient;
-    
-    public BatchDataInserter(WebClient.Builder webClientBuilder) {
-        this.webClient = webClientBuilder.build();
-    }
+关键点说明
 
-    // 主入口方法
-    public Flux<InsertionResult> processBatch(List<Data> dataList) {
-        return getAuthToken()
-            .flatMap(token -> processBatchWithToken(token, dataList))
-            .flatMapIterable(result -> result); // 展开批处理结果
-    }
+1. CSV格式
+   假设CSV文件包含列名url和payload，例如：
+   ```
+   url,payload
+   https://api.example.com/endpoint1,"{""key"":""value1""}"
+   https://api.example.com/endpoint2,"{""key"":""value2""}"
+   ```
+   注意：如果payload中包含双引号，CSV中需用双引号转义（如上所示），或使用其他分隔符。
+2. 请求方式
+   代码默认使用POST，并将payload作为JSON发送（json=payload）。如果API需要其他格式（如表单、纯文本），请调整call_api函数中的requests.post参数。
+3. 并发控制
+   · 使用ThreadPoolExecutor(max_workers=concurrency)确保每批最多同时运行concurrency个线程。
+   · 分批循环for i in range(0, total, concurrency)将总行数按指定并发数切分，最后一批可能少于concurrency。
+4. 错误处理
+   每个请求的异常被捕获并返回错误信息，不会中断整个批次。你可以根据需要修改错误处理逻辑（如重试、记录失败等）。
+5. 性能考虑
+   · 如果请求量极大，建议添加适当的延迟避免触发API限流。
+   · 若需更高并发，可考虑使用asyncio + aiohttp，但线程池对多数场景已足够。
 
-    private Mono<List<InsertionResult>> processBatchWithToken(String token, List<Data> dataList) {
-        // 1. 获取批量事务ID
-        return getTransactionId(token, true)
-            .flatMap(transactionId -> {
-                // 2. 批量插入所有数据
-                Flux<InsertionResult> batchResults = Flux.fromIterable(dataList)
-                    .flatMap(data -> 
-                        insertData(token, transactionId, data)
-                            .map(success -> new InsertionResult(data, success, transactionId))
-                            .onErrorReturn(new InsertionResult(data, false, transactionId))
-                    );
+运行方式
 
-                // 3. 收集结果并判断是否全部成功
-                return batchResults.collectList()
-                    .flatMap(results -> {
-                        boolean allSuccess = results.stream().allMatch(InsertionResult::isSuccess);
-                        
-                        if (allSuccess) {
-                            // 全部成功 - 提交事务
-                            return closeTransaction(token, transactionId)
-                                .thenReturn(results);
-                        } else {
-                            // 部分失败 - 回滚整个事务
-                            return rollbackTransaction(token, transactionId)
-                                .then(processIndividualItems(token, dataList)) // 进入单条重试
-                                .flatMap(individualResults -> 
-                                    // 合并两次尝试的结果
-                                    Flux.fromIterable(results)
-                                        .filter(InsertionResult::isSuccess)
-                                        .concatWith(Flux.fromIterable(individualResults))
-                                        .collectList()
-                                );
-                        }
-                    });
-            });
-    }
+· 安装依赖：pip install requests
+· 将CSV文件放在脚本同级目录（或指定路径），修改process_csv调用参数。
+· 执行脚本即可看到每批请求的实时输出。
 
-    // 单条插入模式（每条数据独立事务）
-    private Mono<List<InsertionResult>> processIndividualItems(String token, List<Data> dataList) {
-        return Flux.fromIterable(dataList)
-            .flatMap(data -> 
-                getTransactionId(token, false)  // 为每条数据获取新事务ID
-                    .flatMap(transactionId -> 
-                        insertData(token, transactionId, data)
-                            .flatMap(success -> {
-                                if (success) {
-                                    return closeTransaction(token, transactionId)
-                                        .thenReturn(new InsertionResult(data, true, transactionId));
-                                } else {
-                                    return rollbackTransaction(token, transactionId)
-                                        .thenReturn(new InsertionResult(data, false, transactionId));
-                                }
-                            })
-                            .onErrorResume(ex -> 
-                                rollbackTransaction(token, transactionId)
-                                    .thenReturn(new InsertionResult(data, false, transactionId))
-                            )
-                    )
-            )
-            .collectList();
-    }
-
-    // --- 第三方API调用方法（根据实际API调整） ---
-    private Mono<String> getAuthToken() {
-        return webClient.post()
-            .uri("/auth")
-            .retrieve()
-            .bodyToMono(TokenResponse.class)
-            .map(TokenResponse::token);
-    }
-
-    private Mono<String> getTransactionId(String token, boolean isBatch) {
-        return webClient.post()
-            .uri("/transactions")
-            .header("Authorization", "Bearer " + token)
-            .header("X-Batch-Mode", String.valueOf(isBatch))
-            .retrieve()
-            .bodyToMono(TransactionResponse.class)
-            .map(TransactionResponse::transactionId);
-    }
-
-    private Mono<Boolean> insertData(String token, String transactionId, Data data) {
-        return webClient.post()
-            .uri("/data")
-            .header("Authorization", "Bearer " + token)
-            .header("X-Transaction-Id", transactionId)
-            .bodyValue(data)
-            .exchangeToMono(response -> {
-                if (response.statusCode().is2xxSuccessful()) {
-                    return Mono.just(true);
-                } else {
-                    return response.createException()
-                        .flatMap(ex -> Mono.just(false));
-                }
-            });
-    }
-
-    private Mono<Boolean> closeTransaction(String token, String transactionId) {
-        return webClient.post()
-            .uri("/transactions/" + transactionId + "/commit")
-            .header("Authorization", "Bearer " + token)
-            .retrieve()
-            .bodyToMono(TransactionResult.class)
-            .map(TransactionResult::success);
-    }
-
-    private Mono<Boolean> rollbackTransaction(String token, String transactionId) {
-        return webClient.post()
-            .uri("/transactions/" + transactionId + "/rollback")
-            .header("Authorization", "Bearer " + token)
-            .retrieve()
-            .bodyToMono(TransactionResult.class)
-            .map(TransactionResult::success);
-    }
-
-    // --- 辅助类 ---
-    private record TokenResponse(String token) {}
-    private record TransactionResponse(String transactionId) {}
-    private record TransactionResult(boolean success) {}
-    
-    public static class InsertionResult {
-        private final Data data;
-        private final boolean success;
-        private final String transactionId;
-
-        // 构造函数、getters 等
-    }
-}
-
-
-关键设计说明
-
-1. 事务模式标识
-
-  ◦ 在 getTransactionId 方法中添加 X-Batch-Mode 头，让第三方区分批量/独立事务
-
-  ◦ 批量模式使用同一个事务ID，单条模式每次获取新事务ID
-
-2. 错误恢复流程
-
-graph TD
-  A[开始批量处理] --> B[获取事务ID]
-  B --> C{所有插入成功?}
-  C -->|是| D[提交事务]
-  C -->|否| E[回滚批量事务]
-  E --> F[逐条插入数据]
-  F -->|获取新事务ID| G[单条插入]
-  G -->|成功| H[提交单条事务]
-  G -->|失败| I[回滚单条事务]
-  H --> J[记录结果]
-  I --> J
-
-
-3. 结果合并策略
-
-  ◦ 批量成功的数据：保留第一次插入结果
-
-  ◦ 批量失败的数据：在单条重试中更新结果
-
-  ◦ 最终返回合并后的结果列表
-
-4. 弹性控制
-
-  ◦ flatMap 用于并发控制（可添加参数控制并发量）
-
-  ◦ onErrorResume 确保单条失败不中断整个流程
-
-  ◦ WebClient 的响应处理考虑各种 HTTP 状态
-
-使用示例
-
-@RestController
-public class DataController {
-
-    private final BatchDataInserter inserter;
-
-    // 批量插入入口
-    @PostMapping("/batch-insert")
-    public Flux<BatchDataInserter.InsertionResult> batchInsert(@RequestBody List<Data> data) {
-        return inserter.processBatch(data);
-    }
-}
-
-
-注意事项
-
-1. API 适配
-
-  ◦ 替换方法中的 URI 和响应体结构为实际第三方 API
-
-  ◦ 根据 API 认证要求调整请求头
-
-2. 并发控制
-
-  ◦ 在 flatMap 中添加参数控制并发量（如 .flatMap(data -> ..., 5) 限制5并发）
-
-  ◦ 批量操作中考虑使用 buffer 分片处理超大列表
-
-3. Token 管理
-
-  ◦ 当前实现每个批次获取新 token，如需复用可添加缓存
-
-  ◦ 考虑添加 token 刷新机制处理过期
-
-4. 监控增强
-
-  ◦ 添加日志记录各阶段耗时
-
-  ◦ 集成 Metrics 监控成功/失败率
-
-  ◦ 使用 doOnError 记录详细错误信息
-
-此实现确保了在响应式环境下正确处理批量事务和失败重试，同时保持系统的弹性和可观察性。
+根据你的需求，当总行数为10、并发为4时，程序会分三批（4+4+2）执行，完全符合要求。
