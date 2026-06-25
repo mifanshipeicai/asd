@@ -1,3 +1,27 @@
+你可以这样跟客户老板说（英文，适合写在即时通讯或邮件里）：
+
+---
+
+对客户老板说的话：
+
+Hi [Boss's Name], to move forward with the permanent conversion, our outsourcing company needs an email from you (using your personal email) confirming the details. Could you please send a quick note to [Outsourcing Company Contact]? The email should include my full name, staff ID, and the planned transition timeline. Thank you!
+
+---
+
+给客户老板参考的邮件模板（可以一并发给他）：
+
+Subject: Confirmation – [Your Name], Staff ID [Your ID] – Permanent Conversion
+
+Dear [Outsourcing Company Contact],
+
+I’m writing to confirm that we would like to offer [Your Full Name] (Staff ID: [Your ID]) a permanent position at [Client Company]. Our target start date is [Date].
+
+Please let us know if you need any further information.
+
+Best regards,
+[Client Boss's Name]
+
+
 我来详细介绍Service层验证的设计，并展示几种常见的设计模式。
 
 一、Service层验证的必要性
