@@ -1,341 +1,139 @@
-对于根据路径变量动态调用不同Service的场景，可以考虑使用 策略模式 结合 工厂模式。以下是详细实现：
+下面是一个适合贴到 Confluence 的测试计划框架，已按类别整理好，你可以直接复制后补充具体测试详情和结果。
 
-方案一：策略模式 + 工厂模式
+---
 
-1. 定义策略接口
+ClickHouse 两种模型对比测试计划
 
-```java
-// 1. 定义策略接口
-public interface IProcessStrategy {
-    /**
-     * 处理请求
-     */
-    String process(String request);
-    
-    /**
-     * 支持的策略类型
-     */
-    String getType();
-}
+1. 测试背景与目标
 
-// 2. 创建策略上下文（非必需，用于统一管理）
-@Component
-public class StrategyContext {
-    
-    @Autowired
-    private final Map<String, IProcessStrategy> strategyMap = new ConcurrentHashMap<>();
-    
-    // Spring会自动注入所有IProcessStrategy实现
-    @Autowired
-    public StrategyContext(List<IProcessStrategy> strategies) {
-        for (IProcessStrategy strategy : strategies) {
-            strategyMap.put(strategy.getType(), strategy);
-        }
-    }
-    
-    public IProcessStrategy getStrategy(String type) {
-        IProcessStrategy strategy = strategyMap.get(type);
-        if (strategy == null) {
-            throw new IllegalArgumentException("Unknown strategy type: " + type);
-        }
-        return strategy;
-    }
-}
-```
+· 模型 A（宽表）：fact_array，fact 表内直接存储 scenario_dates 和 risk_values 数组。
+· 模型 B（窄表 + Zip 表）：fact_zip 存 fact 数据 + scenario_id 外键，scenario_zip 小表存 scenario 的数组数据。
+· 数据量：fact 表约 5000 万行，scenario_zip 表约 100 行。
+· 测试目标：对比两种模型在存储、查询、写入、更新、正确性、资源消耗等方面的差异，为选型提供依据。
 
-2. 实现具体策略
+---
 
-```java
-// 3. 具体策略实现
-@Service
-public class UserProcessStrategy implements IProcessStrategy {
-    
-    @Override
-    public String process(String request) {
-        return "Processing user request: " + request;
-    }
-    
-    @Override
-    public String getType() {
-        return "user";
-    }
-}
+2. 测试环境与数据准备
 
-@Service
-public class OrderProcessStrategy implements IProcessStrategy {
-    
-    @Override
-    public String process(String request) {
-        return "Processing order request: " + request;
-    }
-    
-    @Override
-    public String getType() {
-        return "order";
-    }
-}
+· 表结构定义（附 SQL）
+· 数据生成方式（附 SQL）
+· 测试数据量确认
+· ClickHouse 版本、服务器配置、并行度设置等
 
-@Service
-public class ProductProcessStrategy implements IProcessStrategy {
-    
-    @Override
-    public String process(String request) {
-        return "Processing product request: " + request;
-    }
-    
-    @Override
-    public String getType() {
-        return "product";
-    }
-}
-```
+---
 
-3. Controller实现
+3. 测试用例分类
 
-```java
-// 4. Controller层
-@RestController
-@RequestMapping("/api")
-public class ProcessController {
-    
-    @Autowired
-    private StrategyContext strategyContext;
-    
-    /**
-     * 根据类型动态调用不同策略
-     * @param type 路径变量：user/order/product等
-     * @param request 请求参数
-     */
-    @PostMapping("/process/{type}")
-    public ResponseEntity<?> process(
-            @PathVariable("type") String type,
-            @RequestBody String request) {
-        
-        IProcessStrategy strategy = strategyContext.getStrategy(type);
-        String result = strategy.process(request);
-        
-        return ResponseEntity.ok(result);
-    }
-}
-```
+3.1 存储空间对比
 
-方案二：使用ServiceLocator模式（更简洁）
+编号 测试项 目的 关键指标
+S1 整表磁盘占用 对比压缩后总大小 compressed_size
+S2 列级压缩情况 定位大字段和压缩率 data_compressed_bytes、data_uncompressed_bytes
+S3 未压缩数据量 了解写放大 data_uncompressed_bytes
 
-1. 创建服务定位器
+---
 
-```java
-@Component
-public class ServiceLocator {
-    
-    private final Map<String, IProcessService> serviceMap = new ConcurrentHashMap<>();
-    
-    @Autowired
-    public ServiceLocator(List<IProcessService> services) {
-        // 使用注解或约定获取服务标识
-        for (IProcessService service : services) {
-            if (service instanceof ProcessService) {
-                ProcessService processService = (ProcessService) service;
-                serviceMap.put(processService.getServiceType(), service);
-            }
-        }
-    }
-    
-    public IProcessService getService(String serviceType) {
-        IProcessService service = serviceMap.get(serviceType);
-        if (service == null) {
-            throw new ServiceNotFoundException("Service not found for type: " + serviceType);
-        }
-        return service;
-    }
-}
-```
+3.2 查询性能对比
 
-2. 定义服务接口和实现
+3.2.1 不涉及 scenario 的普通查询
 
-```java
-// 服务接口
-public interface IProcessService {
-    String handleRequest(String request);
-}
+编号 测试项 目的 关键指标
+Q1 按业务日期过滤 count/avg 比较窄表与宽表基础查询开销 耗时、扫描行数、扫描字节、内存
 
-// 基类（可选，用于规范）
-public abstract class ProcessService implements IProcessService {
-    public abstract String getServiceType();
-}
+3.2.2 展开数组聚合
 
-// 具体实现
-@Service
-public class UserService extends ProcessService {
-    
-    @Override
-    public String handleRequest(String request) {
-        return "User Service: " + request;
-    }
-    
-    @Override
-    public String getServiceType() {
-        return "user";
-    }
-}
+编号 测试项 目的 关键指标
+Q2 不展开，仅数组内求和再汇总 比较聚合数组值的成本 耗时、扫描字节、内存
+Q3 ARRAY JOIN 展开后按日期聚合 核心场景，比较展开成本 + join 成本 耗时、内存、中间结果行数
+Q4 展开到明细粒度并分组 验证最大展开场景下的性能和正确性 耗时、内存、结果一致性
 
-@Service
-public class OrderService extends ProcessService {
-    
-    @Override
-    public String handleRequest(String request) {
-        return "Order Service: " + request;
-    }
-    
-    @Override
-    public String getServiceType() {
-        return "order";
-    }
-}
-```
+3.2.3 按 scenario 过滤
 
-3. 使用枚举管理类型（推荐）
+编号 测试项 目的 关键指标
+Q5 过滤单个 scenario 后聚合 比较数组过滤 vs 外键过滤 耗时、扫描量、是否走索引
+Q6 过滤多个 scenario 同上，更贴近实际 耗时、内存
 
-```java
-// 5. 使用枚举定义类型（更规范）
-public enum ProcessType {
-    USER("user", "用户处理"),
-    ORDER("order", "订单处理"),
-    PRODUCT("product", "产品处理");
-    
-    private final String code;
-    private final String desc;
-    
-    ProcessType(String code, String desc) {
-        this.code = code;
-        this.desc = desc;
-    }
-    
-    public String getCode() {
-        return code;
-    }
-    
-    public static ProcessType fromCode(String code) {
-        for (ProcessType type : values()) {
-            if (type.code.equalsIgnoreCase(code)) {
-                return type;
-            }
-        }
-        throw new IllegalArgumentException("Unknown process type: " + code);
-    }
-}
+3.2.4 点查 / 主键查询
 
-// 策略工厂改进版
-@Component
-public class ProcessStrategyFactory {
-    
-    @Autowired
-    private Map<String, IProcessStrategy> strategyMap;
-    
-    public IProcessStrategy getStrategy(ProcessType type) {
-        return strategyMap.get(type.getCode());
-    }
-}
-```
+编号 测试项 目的 关键指标
+Q7 按主键 id 查询单行 比较点查性能 耗时、扫描行数
+Q8 按业务主键过滤少量行 比较过滤性能 耗时、扫描量
 
-4. 改进的Controller
+3.2.5 只查 scenario 维度数据
 
-```java
-@RestController
-@RequestMapping("/api/v2")
-public class ImprovedController {
-    
-    @Autowired
-    private ProcessStrategyFactory strategyFactory;
-    
-    @PostMapping("/process/{type}")
-    public ResponseEntity<?> process(
-            @PathVariable("type") String typeStr,
-            @RequestBody String request) {
-        
-        // 1. 验证和转换类型
-        ProcessType type;
-        try {
-            type = ProcessType.fromCode(typeStr);
-        } catch (IllegalArgumentException e) {
-            return ResponseEntity.badRequest()
-                    .body("Invalid process type: " + typeStr);
-        }
-        
-        // 2. 获取策略并执行
-        IProcessStrategy strategy = strategyFactory.getStrategy(type);
-        String result = strategy.process(request);
-        
-        // 3. 返回结果
-        return ResponseEntity.ok(result);
-    }
-}
-```
+编号 测试项 目的 关键指标
+Q9 直接获取某个 scenario 的曲线 体现小表优势 耗时、扫描量
 
-方案三：使用反射的动态调用（最灵活）
+---
 
-```java
-@Component
-public class DynamicServiceInvoker {
-    
-    @Autowired
-    private ApplicationContext applicationContext;
-    
-    /**
-     * 根据服务名动态调用
-     */
-    public Object invokeService(String serviceName, String methodName, Object... args) {
-        // 获取Bean名称（可以配置映射关系）
-        String beanName = serviceName + "ServiceImpl";
-        
-        Object service = applicationContext.getBean(beanName);
-        
-        try {
-            // 找到对应方法（可根据参数类型更精确匹配）
-            Method method = Arrays.stream(service.getClass().getMethods())
-                    .filter(m -> m.getName().equals(methodName))
-                    .findFirst()
-                    .orElseThrow(() -> new NoSuchMethodException(methodName));
-            
-            return method.invoke(service, args);
-            
-        } catch (Exception e) {
-            throw new RuntimeException("Service invocation failed", e);
-        }
-    }
-}
-```
+3.3 写入性能对比
 
-配置文件示例
+编号 测试项 目的 关键指标
+W1 批量写入 fact 窄表 测试模型 B 写入速度 写入行数、耗时、写入字节
+W2 批量写入 fact 宽表（含大数组） 测试模型 A 写放大情况 写入行数、耗时、写入字节
+W3 增量写入场景 模拟持续写入 吞吐量、资源消耗
 
-```yaml
-# application.yml
-strategy:
-  mappings:
-    user: userProcessStrategy
-    order: orderProcessStrategy
-    product: productProcessStrategy
+---
 
-# 如果需要配置映射
-@Component
-@ConfigurationProperties(prefix = "strategy")
-public class StrategyProperties {
-    private Map<String, String> mappings = new HashMap<>();
-    // getters and setters
-}
-```
+3.4 更新 / 变更成本对比
 
-优势总结
+编号 测试项 目的 关键指标
+U1 更新 zip 表中单个 scenario 的风险值 评估模型 B 变更成本 mutation 耗时、重写 part 数
+U2 更新宽表中对应 scenario 的所有 fact 行 评估模型 A 变更成本 mutation 耗时、重写行数、磁盘 IO
+U3 新增 / 删除 scenario 比较模型可维护性 操作复杂度、耗时
 
-1. 开闭原则：新增策略只需添加新实现类，无需修改现有代码
-2. 可维护性：代码结构清晰，职责分离
-3. 可测试性：每个策略可独立测试
-4. 灵活性：动态切换策略，便于扩展
+---
 
-使用建议
+3.5 正确性验证
 
-1. 策略类型较少时，使用方案一（策略模式+工厂）
-2. 需要严格类型管理时，使用方案二（枚举+工厂）
-3. 需要高度动态性时，考虑方案三（反射）
-4. 建议配合自定义注解，使配置更优雅
+编号 测试项 目的 关键指标
+V1 fact 表行数一致性 确保两模型 fact 行数相同 行数
+V2 展开后总元素数和总风险值一致性 验证数组展开结果一致 元素总数、sum 结果
+V3 抽样对比明细数据 随机抽 id 对比数组内容 是否完全一致
+V4 按 scenario 聚合结果一致性 验证分组聚合结果一致 分组结果
 
-选择哪种方案取决于你的具体需求和复杂度，通常方案二（枚举+工厂）在大多数Spring Boot项目中是最佳实践。
+---
+
+3.6 资源消耗与查询日志分析
+
+编号 测试项 目的 关键指标
+R1 查询执行指标采集 记录每次查询的资源开销 query_duration_ms、read_rows、read_bytes、memory_usage
+R2 并发测试 模拟生产并发，观察吞吐和延迟 QPS、平均延迟、P99
+R3 CPU / 内存监控 观察查询期间资源峰值 服务器监控数据
+
+---
+
+4. 测试记录模板
+
+建议每个测试项使用以下表格记录：
+
+字段 内容
+测试编号 如 Q3
+测试名称 展开数组按日期聚合
+测试目的 比较两种模型展开大数组的聚合成本
+测试 SQL 模型 A：...；模型 B：...
+预期 模型 B 可能因 join 略慢，但差距不大
+实际结果 模型 A：耗时 ___ ms，内存 ___，扫描 ___；模型 B：耗时 ___ ms，内存 ___，扫描 ___
+结论 哪个更优，原因
+备注 比如是否走索引、是否触发内存溢出等
+
+---
+
+5. 结论汇总
+
+维度 模型 A（宽表） 模型 B（窄表 + Zip） 优胜方
+存储空间   
+普通查询   
+数组聚合查询   
+scenario 过滤   
+点查   
+写入性能   
+更新成本   
+正确性   
+资源消耗   
+
+最终建议：根据测试结果填写。
+
+---
+
+这个结构可以直接复制到 Confluence，测试详情和结果留白，按编号补充即可。
